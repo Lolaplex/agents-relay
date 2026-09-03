@@ -93,6 +93,41 @@ class TestHttpTurn(unittest.TestCase):
             self.assertEqual(resp.status, 200)
             data = json.loads(resp.read().decode())
             self.assertEqual(data["reply"], "ok")
+            self.assertFalse(data["notified"])
+
+            # Test /v1/alert with notification mocking
+            with patch("agents_gateway.telegram_adapter.send_message") as mock_send:
+                cfg_with_tg = GatewayConfig(
+                    loop_cmd=("python", "-m", "runner.loop"),
+                    loop_provider="echo",
+                    gateway_secret="expected",
+                    telegram_bot_token="fake_bot_token",
+                    telegram_allowed_chat_ids=(12345,),
+                    gateway_host="127.0.0.1",
+                    gateway_port=0,
+                    telegram_poll_timeout=1,
+                )
+                tg_server = serve_http(cfg_with_tg, on_turn=fake_turn)
+                tg_host, tg_port = tg_server.server_address
+                tg_thread = __import__("threading").Thread(target=tg_server.serve_forever, daemon=True)
+                tg_thread.start()
+                try:
+                    alert_conn = HTTPConnection(tg_host, tg_port, timeout=5)
+                    alert_body = json.dumps({"text": "system alert"})
+                    alert_conn.request(
+                        "POST",
+                        "/v1/alert",
+                        body=alert_body,
+                        headers={"Content-Type": "application/json", "X-Gateway-Secret": "expected"},
+                    )
+                    alert_resp = alert_conn.getresponse()
+                    self.assertEqual(alert_resp.status, 200)
+                    alert_data = json.loads(alert_resp.read().decode())
+                    self.assertTrue(alert_data["notified"])
+                    mock_send.assert_called_once()
+                finally:
+                    tg_server.shutdown()
+                    tg_thread.join(timeout=2)
         finally:
             server.shutdown()
             server_thread.join(timeout=2)
@@ -100,3 +135,4 @@ class TestHttpTurn(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

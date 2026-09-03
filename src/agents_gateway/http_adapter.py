@@ -35,12 +35,14 @@ class _TurnHook:
 class TurnHandler(BaseHTTPRequestHandler):
     gateway_secret: str = ""
     turn_hook: _TurnHook | None = None
+    config: GatewayConfig | None = None
 
     def log_message(self, fmt: str, *args) -> None:
         log.info("%s - %s", self.address_string(), fmt % args)
 
     def do_POST(self) -> None:
-        if self.path.rstrip("/") != "/v1/turn":
+        path = self.path.rstrip("/")
+        if path not in ("/v1/turn", "/v1/alert", "/webhook/alert"):
             self.send_error(404)
             return
         if not _check_secret(self, self.gateway_secret):
@@ -53,12 +55,13 @@ class TurnHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             self.send_error(400, "invalid json")
             return
-        channel = str(body.get("channel") or "http")
-        user = str(body.get("user") or "anonymous")
+        channel = str(body.get("channel") or ("webhook" if path != "/v1/turn" else "http"))
+        user = str(body.get("user") or ("alert" if path != "/v1/turn" else "anonymous"))
         text = str(body.get("text") or body.get("message") or "")
         session = str(body.get("session") or "")
         user_id = str(body.get("user_id") or "")
         new_session = bool(body.get("new_session"))
+        notify = bool(path in ("/v1/alert", "/webhook/alert") or body.get("notify") or body.get("broadcast"))
 
         runner = (self.turn_hook.fn if self.turn_hook else None) or run_loop_turn
         try:
@@ -75,12 +78,25 @@ class TurnHandler(BaseHTTPRequestHandler):
             self.send_error(500, str(exc))
             return
 
+        notified = False
+        if notify and self.config and self.config.telegram_bot_token and self.config.telegram_allowed_chat_ids:
+            from .telegram_adapter import send_message
+            from .telegram_format import format_telegram_html
+            try:
+                primary_chat = self.config.telegram_allowed_chat_ids[0]
+                html = format_telegram_html(result.reply, ())
+                send_message(self.config.telegram_bot_token, primary_chat, html, parse_mode="HTML")
+                notified = True
+            except Exception as exc:
+                log.warning("failed to broadcast notification to telegram: %s", exc)
+
         payload = {
             "reply": result.reply,
             "session": result.session,
             "user_id": result.user_id,
             "alias": result.alias,
             "returncode": result.returncode,
+            "notified": notified,
         }
         data = json.dumps(payload).encode("utf-8")
         self.send_response(200 if result.returncode == 0 else 502)
@@ -102,7 +118,7 @@ class TurnHandler(BaseHTTPRequestHandler):
 
 
 def serve_http(config: GatewayConfig, *, on_turn: Callable[..., LoopTurnResult] | None = None) -> ThreadingHTTPServer:
-    attrs: dict = {"gateway_secret": config.gateway_secret}
+    attrs: dict = {"gateway_secret": config.gateway_secret, "config": config}
     if on_turn is not None:
         attrs["turn_hook"] = _TurnHook(on_turn)
     handler = type("ConfiguredTurnHandler", (TurnHandler,), attrs)
