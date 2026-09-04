@@ -13,9 +13,10 @@ _FENCE_RE = re.compile(
     re.IGNORECASE,
 )
 _TOOL_TAG_RE = re.compile(
-    r"<(tool_use|tool_call|tool_result|function_call|invoke)\b[^>]*>[\s\S]*?</\1>",
+    r"<(tool_use|tool_call|tool_result|function_call|invoke|ts|clock|timestamp)\b[^>]*>[\s\S]*?</\1>",
     re.IGNORECASE,
 )
+_BARE_TAGS_RE = re.compile(r"</?(?:ts|clock|timestamp)\b[^>]*>", re.IGNORECASE)
 _BLOB_KEYS = (
     "tool_call",
     "tool_calls",
@@ -36,6 +37,7 @@ def strip_model_dumps(text: str) -> str:
         return ""
     out = _FENCE_RE.sub(lambda m: "" if _looks_like_blob(m.group(0)) else m.group(0), text)
     out = _TOOL_TAG_RE.sub("", out)
+    out = _BARE_TAGS_RE.sub("", out)
     stripped = out.strip()
     if stripped.startswith("{") or stripped.startswith("["):
         if _looks_like_blob(stripped):
