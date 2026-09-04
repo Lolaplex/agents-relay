@@ -52,7 +52,7 @@ def visible_reply(text: str, traces: tuple[str, ...] = ()) -> str:
         return cleaned
     if traces:
         return "Fertig."
-    return (text or "").strip() or "(leere Antwort)"
+    return "(leere Antwort)"
 
 
 def status_html(text: str) -> str:
