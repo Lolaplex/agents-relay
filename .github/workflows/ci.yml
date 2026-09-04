@@ -43,7 +43,9 @@ jobs:
         run: python -m unittest discover -s tests -v
 
       - name: Verify CLI
-        run: python -m agents_gateway --help-json
+        run: |
+          python -m agents_relay --help-json
+          agents-relay --help-json
 
       - name: Build package distribution
         run: |
