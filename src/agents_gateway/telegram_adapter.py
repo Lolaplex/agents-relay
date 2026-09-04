@@ -31,7 +31,7 @@ def _post_json(url: str, payload: dict) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def send_message(token: str, chat_id: int, text: str, *, parse_mode: str = "HTML") -> None:
+def send_message(token: str, chat_id: int, text: str, *, parse_mode: str = "HTML") -> dict:
     body = {
         "chat_id": chat_id,
         "text": text[:4096],
@@ -40,13 +40,30 @@ def send_message(token: str, chat_id: int, text: str, *, parse_mode: str = "HTML
     if parse_mode:
         body["parse_mode"] = parse_mode
     try:
-        _post_json(_api_url(token, "sendMessage"), body)
+        return _post_json(_api_url(token, "sendMessage"), body)
     except urllib.error.HTTPError as exc:
         if parse_mode and exc.code == 400:
             body.pop("parse_mode", None)
-            _post_json(_api_url(token, "sendMessage"), body)
-        else:
-            raise
+            return _post_json(_api_url(token, "sendMessage"), body)
+        raise
+
+
+def edit_message(token: str, chat_id: int, message_id: int, text: str, *, parse_mode: str = "HTML") -> dict:
+    body = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text[:4096],
+        "disable_web_page_preview": True,
+    }
+    if parse_mode:
+        body["parse_mode"] = parse_mode
+    try:
+        return _post_json(_api_url(token, "editMessageText"), body)
+    except urllib.error.HTTPError as exc:
+        if parse_mode and exc.code == 400:
+            body.pop("parse_mode", None)
+            return _post_json(_api_url(token, "editMessageText"), body)
+        raise
 
 
 def _allowed(chat_id: int, allowed: tuple[int, ...]) -> bool:
@@ -76,10 +93,19 @@ def process_update(
     if not token:
         return
 
-    send_message(token, chat_id, status_html("thinking..."), parse_mode="HTML")
+    thinking_msg = send_message(token, chat_id, status_html("thinking..."), parse_mode="HTML")
+    thinking_id = (thinking_msg.get("result") or {}).get("message_id") if isinstance(thinking_msg, dict) else None
+
     runner = on_turn or run_loop_turn
     result = runner(channel="telegram", user=user, message=text)
     reply_html = format_telegram_html(result.reply, ())
+
+    if thinking_id:
+        try:
+            edit_message(token, chat_id, thinking_id, reply_html, parse_mode="HTML")
+            return
+        except Exception:
+            pass
     send_message(token, chat_id, reply_html, parse_mode="HTML")
 
 
