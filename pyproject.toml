@@ -3,16 +3,17 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "agents-gateway"
+name = "agents-relay"
 version = "0.1.0"
-description = "HTTP and Telegram gateway to agents-harness runner.loop (stdlib only)"
+description = "HTTP and Telegram relay to agents-harness runner.loop (stdlib only)"
 readme = "README.md"
 license = "MIT"
+authors = [{ name = "Lolaplex" }]
 requires-python = ">=3.10"
 dependencies = []
 
 [project.scripts]
-agents-gateway = "agents_gateway.__main__:main"
+agents-relay = "agents_relay.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

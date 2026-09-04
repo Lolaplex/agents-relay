@@ -1,12 +1,12 @@
-# agents-gateway
+# agents-relay
 
-Stdlib-only gateway: HTTP `/v1/turn` and optional Telegram long-poll. Spawns `runner.loop` per turn; no `~/.agents` writes.
+Stdlib-only relay: HTTP `/v1/turn` and optional Telegram long-poll. Spawns `runner.loop` per turn; no `~/.agents` writes.
 
 ## Commands
 
 ```bash
-python -m agents_gateway --help-json
-agents-gateway serve
+python -m agents_relay --help-json
+agents-relay serve
 ```
 
-Env: `LOOP_CMD`, `LOOP_PROVIDER`, `GATEWAY_SECRET`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_CHAT_IDS`, `GATEWAY_HOST`, `GATEWAY_PORT`, `TELEGRAM_POLL_TIMEOUT`.
+Env: `LOOP_CMD`, `LOOP_PROVIDER`, `RELAY_SECRET` (fallback `GATEWAY_SECRET`), `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_CHAT_IDS`, `RELAY_HOST`, `RELAY_PORT`, `TELEGRAM_POLL_TIMEOUT`.

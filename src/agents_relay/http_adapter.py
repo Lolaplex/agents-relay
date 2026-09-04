@@ -7,16 +7,22 @@ import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
 
-from .config import GatewayConfig
+from .config import RelayConfig
 from .loop_client import LoopTurnResult, run_loop_turn
 
-log = logging.getLogger("agents_gateway.http")
+log = logging.getLogger("agents_relay.http")
 
 
 def _check_secret(handler: BaseHTTPRequestHandler, expected: str) -> bool:
     if not expected:
         return True
-    got = handler.headers.get("X-Gateway-Secret") or handler.headers.get("Gateway-Secret") or ""
+    got = (
+        handler.headers.get("X-Relay-Secret")
+        or handler.headers.get("Relay-Secret")
+        or handler.headers.get("X-Gateway-Secret")
+        or handler.headers.get("Gateway-Secret")
+        or ""
+    )
     return got.strip() == expected
 
 
@@ -33,9 +39,9 @@ class _TurnHook:
 
 
 class TurnHandler(BaseHTTPRequestHandler):
-    gateway_secret: str = ""
+    relay_secret: str = ""
     turn_hook: _TurnHook | None = None
-    config: GatewayConfig | None = None
+    config: RelayConfig | None = None
 
     def log_message(self, fmt: str, *args) -> None:
         log.info("%s - %s", self.address_string(), fmt % args)
@@ -45,7 +51,7 @@ class TurnHandler(BaseHTTPRequestHandler):
         if path not in ("/v1/turn", "/v1/alert", "/webhook/alert"):
             self.send_error(404)
             return
-        if not _check_secret(self, self.gateway_secret):
+        if not _check_secret(self, self.relay_secret):
             self.send_error(401, "unauthorized")
             return
         length = int(self.headers.get("Content-Length") or "0")
@@ -117,11 +123,11 @@ class TurnHandler(BaseHTTPRequestHandler):
         self.send_error(404)
 
 
-def serve_http(config: GatewayConfig, *, on_turn: Callable[..., LoopTurnResult] | None = None) -> ThreadingHTTPServer:
-    attrs: dict = {"gateway_secret": config.gateway_secret, "config": config}
+def serve_http(config: RelayConfig, *, on_turn: Callable[..., LoopTurnResult] | None = None) -> ThreadingHTTPServer:
+    attrs: dict = {"relay_secret": config.relay_secret, "config": config}
     if on_turn is not None:
         attrs["turn_hook"] = _TurnHook(on_turn)
     handler = type("ConfiguredTurnHandler", (TurnHandler,), attrs)
-    server = ThreadingHTTPServer((config.gateway_host, config.gateway_port), handler)
-    log.info("HTTP listening on %s:%s", config.gateway_host, config.gateway_port)
+    server = ThreadingHTTPServer((config.relay_host, config.relay_port), handler)
+    log.info("HTTP listening on %s:%s", config.relay_host, config.relay_port)
     return server
