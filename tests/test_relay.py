@@ -133,6 +133,27 @@ class TestHttpTurn(unittest.TestCase):
             server_thread.join(timeout=2)
 
 
+class TestTelegramFormat(unittest.TestCase):
+    def test_format_with_traces_and_links(self):
+        from agents_relay.telegram_format import format_telegram_html
+
+        raw = (
+            "thinking...\n"
+            "[*] Running 'mcp.memory.search' (rests on: memory)...\n"
+            "    CMD: python -m agents_memory search ['Lolax']\n"
+            "[+] 'mcp.memory.search' OK (exit 0) in 0.28s\n"
+            "<ts>2026-09-05T01:24:15+00:00</ts>\n"
+            "Hier ist dein Status zu [Lolax](https://lolax.dev):\n"
+            "• Alles läuft auf **dev**!\n"
+        )
+        formatted = format_telegram_html(raw)
+        self.assertIn('<a href="https://lolax.dev">Lolax</a>', formatted)
+        self.assertIn("<b>dev</b>", formatted)
+        self.assertIn("<blockquote expandable><b>tools</b>", formatted)
+        self.assertNotIn("(leere Antwort)", formatted)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 

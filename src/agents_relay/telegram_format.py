@@ -8,6 +8,7 @@ import re
 TG_LIMIT = 4096
 _BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
 _CODE_RE = re.compile(r"`([^`]+)`")
+_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^\s\)]+)\)")
 _FENCE_RE = re.compile(
     r"```(?:json|xml|javascript|tool[\w_-]*)?\s*\n[\s\S]*?```",
     re.IGNORECASE,
@@ -29,7 +30,28 @@ _BLOB_KEYS = (
 
 def _looks_like_blob(text: str) -> bool:
     low = text.lower()
-    return any(key in low for key in _BLOB_KEYS) or len(text) > 400
+    return any(key in low for key in _BLOB_KEYS)
+
+
+def extract_traces(text: str) -> tuple[str, tuple[str, ...]]:
+    """Separate Cordis/runner loop trace lines from the user reply."""
+    traces: list[str] = []
+    clean_lines: list[str] = []
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if (
+            s.startswith("[*] Running")
+            or s.startswith("[+]")
+            or s.startswith("[-]")
+            or s.startswith("CMD:")
+            or s == "thinking..."
+        ):
+            traces.append(s)
+        elif s.startswith("<ts>") and s.endswith("</ts>"):
+            continue
+        else:
+            clean_lines.append(line)
+    return "\n".join(clean_lines).strip(), tuple(traces)
 
 
 def strip_model_dumps(text: str) -> str:
@@ -39,9 +61,24 @@ def strip_model_dumps(text: str) -> str:
     out = _TOOL_TAG_RE.sub("", out)
     out = _BARE_TAGS_RE.sub("", out)
     stripped = out.strip()
-    if stripped.startswith("{") or stripped.startswith("["):
-        if _looks_like_blob(stripped):
-            return ""
+    if (stripped.startswith("{") and stripped.endswith("}")) or (
+        stripped.startswith("[") and stripped.endswith("]")
+    ):
+        try:
+            val = json.loads(stripped)
+            if isinstance(val, dict) and any(
+                k in val for k in ("name", "tool", "tool_call", "function", "arguments")
+            ):
+                return ""
+            if (
+                isinstance(val, list)
+                and val
+                and isinstance(val[0], dict)
+                and any(k in val[0] for k in ("name", "tool", "tool_call", "function", "arguments"))
+            ):
+                return ""
+        except Exception:
+            pass
     out = re.sub(r"\n{3,}", "\n\n", out)
     return out.strip()
 
@@ -61,8 +98,10 @@ def status_html(text: str) -> str:
 
 
 def format_telegram_html(answer: str, traces: tuple[str, ...] = ()) -> str:
-    body = _light_md_html(visible_reply(answer, traces))
-    extra = _traces_block(traces)
+    cleaned_body, extracted_traces = extract_traces(answer)
+    all_traces = traces if traces else extracted_traces
+    body = _light_md_html(visible_reply(cleaned_body, all_traces))
+    extra = _traces_block(all_traces)
     out = body + extra
     if len(out) <= TG_LIMIT:
         return out
@@ -78,9 +117,6 @@ def _traces_block(traces: tuple[str, ...]) -> str:
         return ""
     inner = "\n".join(lines)
     return f"\n\n<blockquote expandable><b>tools</b>\n{inner}</blockquote>"
-
-
-_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^\s\)]+)\)")
 
 
 def _light_md_html(text: str) -> str:
