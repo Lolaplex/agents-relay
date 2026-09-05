@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import json
 import re
 
 TG_LIMIT = 4096
@@ -105,9 +106,9 @@ def format_telegram_html(answer: str, traces: tuple[str, ...] = ()) -> str:
     out = body + extra
     if len(out) <= TG_LIMIT:
         return out
-    budget = TG_LIMIT - len(extra) - 1
+    budget = TG_LIMIT - len(extra) - 3
     if budget < 80:
-        return body[: TG_LIMIT - 1] + "..."
+        return body[: TG_LIMIT - 3] + "..."
     return body[:budget] + "..." + extra
 
 

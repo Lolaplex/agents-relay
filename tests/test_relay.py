@@ -152,8 +152,89 @@ class TestTelegramFormat(unittest.TestCase):
         self.assertIn("<blockquote expandable><b>tools</b>", formatted)
         self.assertNotIn("(leere Antwort)", formatted)
 
+    def test_bracket_lists_not_stripped(self):
+        from agents_relay.telegram_format import format_telegram_html
+
+        text = (
+            "Hier sind die Optionen:\n"
+            "[1] Option eins mit ein bisschen Text drumherum\n"
+            "[2] Option zwei mit noch mehr Erklärung"
+        )
+        formatted = format_telegram_html(text)
+        self.assertIn("[1] Option eins", formatted)
+        self.assertIn("[2] Option zwei", formatted)
+        self.assertNotIn("(leere Antwort)", formatted)
+
+    def test_urls_with_query_params(self):
+        from agents_relay.telegram_format import format_telegram_html
+
+        text = "Check [API Docs](https://api.lolax.dev/v1/search?q=test&lang=de#intro) now!"
+        formatted = format_telegram_html(text)
+        self.assertIn('<a href="https://api.lolax.dev/v1/search?q=test&amp;lang=de#intro">API Docs</a>', formatted)
+
+    def test_model_json_dump_stripped(self):
+        from agents_relay.telegram_format import visible_reply
+
+        tool_json = '{"name": "call_job", "arguments": {"catalog": "mcp.memory.search", "query": "test"}}'
+        self.assertEqual(visible_reply(tool_json), "(leere Antwort)")
+
+        tool_fenced = '```json\n{"tool_call": "search", "arguments": {"q": "test"}}\n```'
+        self.assertEqual(visible_reply(tool_fenced), "(leere Antwort)")
+
+    def test_normal_json_in_text_preserved(self):
+        from agents_relay.telegram_format import visible_reply
+
+        user_code = 'In Python kannst du ein Dict definieren: `{"user": "Felix", "score": 10}`.'
+        self.assertIn('{"user": "Felix", "score": 10}', visible_reply(user_code))
+
+    def test_empty_with_traces_returns_fertig(self):
+        from agents_relay.telegram_format import visible_reply
+
+        self.assertEqual(visible_reply("", traces=("mcp.memory.search",)), "Fertig.")
+        self.assertEqual(visible_reply("", ()), "(leere Antwort)")
+
+    def test_long_message_budget(self):
+        from agents_relay.telegram_format import format_telegram_html
+
+        long_text = "A" * 5000
+        formatted = format_telegram_html(long_text)
+        self.assertLessEqual(len(formatted), 4096)
+        self.assertTrue(formatted.endswith("..."))
+
+    def test_html_entities_escaped_with_formatting(self):
+        from agents_relay.telegram_format import format_telegram_html
+
+        raw = "Condition: `x < 10 && y > 5` is **true**! Details: [Guide](https://example.com/docs?a=1&b=2)"
+        formatted = format_telegram_html(raw)
+        self.assertIn("<code>x &lt; 10 &amp;&amp; y &gt; 5</code>", formatted)
+        self.assertIn("<b>true</b>", formatted)
+        self.assertIn('<a href="https://example.com/docs?a=1&amp;b=2">Guide</a>', formatted)
+
+    def test_code_fence_preserved_if_not_tool_blob(self):
+        from agents_relay.telegram_format import visible_reply
+
+        code = "Hier ist die Funktion:\n```python\ndef hello():\n    return 'world'\n```\nFertig."
+        cleaned = visible_reply(code)
+        self.assertIn("def hello():", cleaned)
+        self.assertIn("return 'world'", cleaned)
+
+    def test_traces_escaping_in_blockquote(self):
+        from agents_relay.telegram_format import format_telegram_html
+
+        raw = (
+            "[*] Running 'tool' (check <stdin> & <stdout>)...\n"
+            "[+] OK in 0.1s\n"
+            "Done!"
+        )
+        formatted = format_telegram_html(raw)
+        self.assertIn("<blockquote expandable><b>tools</b>", formatted)
+        self.assertIn("&lt;stdin&gt; &amp; &lt;stdout&gt;", formatted)
+        self.assertIn("Done!", formatted)
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
 
 
