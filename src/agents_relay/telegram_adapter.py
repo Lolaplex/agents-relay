@@ -36,6 +36,7 @@ def send_message(token: str, chat_id: int, text: str, *, parse_mode: str = "HTML
         "chat_id": chat_id,
         "text": text[:4096],
         "disable_web_page_preview": True,
+        "link_preview_options": {"is_disabled": True},
     }
     if parse_mode:
         body["parse_mode"] = parse_mode
@@ -54,6 +55,7 @@ def edit_message(token: str, chat_id: int, message_id: int, text: str, *, parse_
         "message_id": message_id,
         "text": text[:4096],
         "disable_web_page_preview": True,
+        "link_preview_options": {"is_disabled": True},
     }
     if parse_mode:
         body["parse_mode"] = parse_mode

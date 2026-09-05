@@ -80,8 +80,12 @@ def _traces_block(traces: tuple[str, ...]) -> str:
     return f"\n\n<blockquote expandable><b>tools</b>\n{inner}</blockquote>"
 
 
+_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^\s\)]+)\)")
+
+
 def _light_md_html(text: str) -> str:
     escaped = html.escape(text, quote=False)
     escaped = _BOLD_RE.sub(r"<b>\1</b>", escaped)
     escaped = _CODE_RE.sub(r"<code>\1</code>", escaped)
+    escaped = _LINK_RE.sub(r'<a href="\2">\1</a>', escaped)
     return escaped
