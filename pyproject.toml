@@ -8,9 +8,28 @@ version = "0.0.1"
 description = "HTTP and Telegram relay to agents-harness runner.loop (stdlib only)"
 readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Lolaplex" }]
 requires-python = ">=3.10"
 dependencies = []
+keywords = ["agents", "relay", "gateway", "telegram", "http", "harness", "cli", "coding-assistant"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Chat",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/Lolaplex/agents-relay"
+Repository = "https://github.com/Lolaplex/agents-relay"
+"Bug Tracker" = "https://github.com/Lolaplex/agents-relay/issues"
 
 [project.scripts]
 agents-relay = "agents_relay.__main__:main"
