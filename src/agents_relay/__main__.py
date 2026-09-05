@@ -37,6 +37,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     args = build_parser().parse_args(argv)
+    if not getattr(args, "help_json", False):
+        try:
+            from .updates import check_for_updates
+            check_for_updates("agents-relay", __version__)
+        except Exception:
+            pass
     if getattr(args, "help_json", False):
         print(json.dumps(_help_json(), indent=2))
         return 0
