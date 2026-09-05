@@ -7,7 +7,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any
 
-from .config import GatewayConfig
+from .config import RelayConfig
 
 LOOP_TRAILER_MARKER = "---agents-loop-trailer---"
 
@@ -49,13 +49,13 @@ def run_loop_turn(
     channel: str,
     user: str,
     message: str,
-    config: GatewayConfig | None = None,
+    config: RelayConfig | None = None,
     session: str = "",
     user_id: str = "",
     new_session: bool = False,
     timeout_sec: int = 600,
 ) -> LoopTurnResult:
-    cfg = config or GatewayConfig.from_env()
+    cfg = config or RelayConfig.from_env()
     argv = list(cfg.loop_cmd)
     argv.extend(
         [

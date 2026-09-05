@@ -1,4 +1,4 @@
-"""Gateway unit tests."""
+"""Relay unit tests."""
 
 from __future__ import annotations
 
@@ -8,9 +8,9 @@ from dataclasses import dataclass
 from http.client import HTTPConnection
 from unittest.mock import patch
 
-from agents_gateway.config import GatewayConfig
-from agents_gateway.http_adapter import serve_http
-from agents_gateway.loop_client import LOOP_TRAILER_MARKER, parse_loop_stdout, run_loop_turn
+from agents_relay.config import RelayConfig
+from agents_relay.http_adapter import serve_http
+from agents_relay.loop_client import LOOP_TRAILER_MARKER, parse_loop_stdout, run_loop_turn
 
 
 class TestTrailerParse(unittest.TestCase):
@@ -36,17 +36,17 @@ class TestLoopSubprocess(unittest.TestCase):
             stdout: str = fake_stdout
             stderr: str = ""
 
-        cfg = GatewayConfig(
+        cfg = RelayConfig(
             loop_cmd=("python", "-c", "print('skip')"),
             loop_provider="echo",
-            gateway_secret="sekrit",
+            relay_secret="sekrit",
             telegram_bot_token="",
             telegram_allowed_chat_ids=(),
-            gateway_host="127.0.0.1",
-            gateway_port=0,
+            relay_host="127.0.0.1",
+            relay_port=0,
             telegram_poll_timeout=1,
         )
-        with patch("agents_gateway.loop_client.subprocess.run", return_value=FakeProc()):
+        with patch("agents_relay.loop_client.subprocess.run", return_value=FakeProc()):
             result = run_loop_turn(channel="http", user="u", message="ping", config=cfg)
         self.assertEqual(result.reply, "pong")
         self.assertEqual(result.session, "s1")
@@ -54,19 +54,19 @@ class TestLoopSubprocess(unittest.TestCase):
 
 class TestHttpTurn(unittest.TestCase):
     def test_v1_turn_auth(self):
-        cfg = GatewayConfig(
+        cfg = RelayConfig(
             loop_cmd=("python", "-m", "runner.loop"),
             loop_provider="echo",
-            gateway_secret="expected",
+            relay_secret="expected",
             telegram_bot_token="",
             telegram_allowed_chat_ids=(),
-            gateway_host="127.0.0.1",
-            gateway_port=0,
+            relay_host="127.0.0.1",
+            relay_port=0,
             telegram_poll_timeout=1,
         )
 
         def fake_turn(**kwargs):
-            from agents_gateway.loop_client import LoopTurnResult
+            from agents_relay.loop_client import LoopTurnResult
 
             return LoopTurnResult(reply="ok", session="", user_id="", alias="", returncode=0, stderr="")
 
@@ -87,7 +87,7 @@ class TestHttpTurn(unittest.TestCase):
                 "POST",
                 "/v1/turn",
                 body=body,
-                headers={"Content-Type": "application/json", "X-Gateway-Secret": "expected"},
+                headers={"Content-Type": "application/json", "X-Relay-Secret": "expected"},
             )
             resp = conn.getresponse()
             self.assertEqual(resp.status, 200)
@@ -96,15 +96,15 @@ class TestHttpTurn(unittest.TestCase):
             self.assertFalse(data["notified"])
 
             # Test /v1/alert with notification mocking
-            with patch("agents_gateway.telegram_adapter.send_message") as mock_send:
-                cfg_with_tg = GatewayConfig(
+            with patch("agents_relay.telegram_adapter.send_message") as mock_send:
+                cfg_with_tg = RelayConfig(
                     loop_cmd=("python", "-m", "runner.loop"),
                     loop_provider="echo",
-                    gateway_secret="expected",
+                    relay_secret="expected",
                     telegram_bot_token="fake_bot_token",
                     telegram_allowed_chat_ids=(12345,),
-                    gateway_host="127.0.0.1",
-                    gateway_port=0,
+                    relay_host="127.0.0.1",
+                    relay_port=0,
                     telegram_poll_timeout=1,
                 )
                 tg_server = serve_http(cfg_with_tg, on_turn=fake_turn)
@@ -118,7 +118,7 @@ class TestHttpTurn(unittest.TestCase):
                         "POST",
                         "/v1/alert",
                         body=alert_body,
-                        headers={"Content-Type": "application/json", "X-Gateway-Secret": "expected"},
+                        headers={"Content-Type": "application/json", "X-Relay-Secret": "expected"},
                     )
                     alert_resp = alert_conn.getresponse()
                     self.assertEqual(alert_resp.status, 200)

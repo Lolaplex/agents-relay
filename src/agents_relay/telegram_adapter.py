@@ -11,11 +11,11 @@ import urllib.parse
 import urllib.request
 from typing import Callable
 
-from .config import GatewayConfig
+from .config import RelayConfig
 from .loop_client import LoopTurnResult, run_loop_turn
 from .telegram_format import format_telegram_html, status_html
 
-log = logging.getLogger("agents_gateway.telegram")
+log = logging.getLogger("agents_relay.telegram")
 
 API_BASE = "https://api.telegram.org"
 
@@ -75,7 +75,7 @@ def _allowed(chat_id: int, allowed: tuple[int, ...]) -> bool:
 def process_update(
     update: dict,
     *,
-    config: GatewayConfig,
+    config: RelayConfig,
     on_turn: Callable[..., LoopTurnResult] | None = None,
 ) -> None:
     message = update.get("message") or update.get("edited_message")
@@ -110,7 +110,7 @@ def process_update(
 
 
 def telegram_poll_loop(
-    config: GatewayConfig,
+    config: RelayConfig,
     *,
     stop_event: threading.Event | None = None,
     on_turn: Callable[..., LoopTurnResult] | None = None,
@@ -144,7 +144,7 @@ def telegram_poll_loop(
 
 
 def start_telegram_thread(
-    config: GatewayConfig,
+    config: RelayConfig,
     *,
     on_turn: Callable[..., LoopTurnResult] | None = None,
 ) -> tuple[threading.Thread, threading.Event]:
