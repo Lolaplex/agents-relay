@@ -232,6 +232,61 @@ class TestTelegramFormat(unittest.TestCase):
         self.assertIn("Done!", formatted)
 
 
+class TestSendOutbound(unittest.TestCase):
+    def test_allowlist_reject(self):
+        from agents_relay.telegram_adapter import send_to_user
+
+        with self.assertRaises(PermissionError):
+            send_to_user(
+                token="fake-token",
+                chat_id=99,
+                text="hi",
+                allowed=(12345,),
+            )
+
+    def test_missing_token(self):
+        from agents_relay.telegram_adapter import send_to_user
+
+        with self.assertRaises(ValueError):
+            send_to_user(token="", chat_id=1, text="hi", allowed=(1,))
+
+    def test_send_calls_api_without_leaking_token(self):
+        from agents_relay.telegram_adapter import send_to_user
+
+        with patch("agents_relay.telegram_adapter.send_message", return_value={"ok": True}) as mock_send:
+            send_to_user(token="secret-token-value", chat_id=12345, text="hello", allowed=(12345,))
+            mock_send.assert_called_once()
+            args, kwargs = mock_send.call_args
+            self.assertEqual(args[0], "secret-token-value")
+            self.assertEqual(args[1], 12345)
+
+        from agents_relay.__main__ import main as relay_main
+
+        with patch("agents_relay.telegram_adapter.send_message", return_value={"ok": True}):
+            with patch(
+                "agents_relay.__main__.RelayConfig.from_env",
+                return_value=RelayConfig(
+                    loop_cmd=("python", "-m", "runner.loop"),
+                    loop_provider="echo",
+                    relay_secret="",
+                    telegram_bot_token="secret-token-value",
+                    telegram_allowed_chat_ids=(12345,),
+                    relay_host="127.0.0.1",
+                    relay_port=0,
+                    telegram_poll_timeout=1,
+                ),
+            ):
+                rc = relay_main(["send", "--user", "99", "--text", "nope"])
+        self.assertEqual(rc, 1)
+
+    def test_help_json_lists_send(self):
+        from agents_relay.__main__ import _help_json
+
+        blob = json.dumps(_help_json())
+        self.assertIn("send", blob)
+        self.assertNotIn("secret-token-value", blob)
+
+
 if __name__ == "__main__":
     unittest.main()
 

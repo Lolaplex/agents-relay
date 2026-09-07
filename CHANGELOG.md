@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `agents-relay send --user/--chat-id --text` one-shot Telegram outbound (allowlist + env token). Hosts can deliver reminders without a poll turn.
+
+### Changed
+- Telegram loop-failure copy is English (`Turn failed (...)`) instead of a hardcoded German apology.
+
 ## [0.0.1] - 2026-09-05
 
 ### Added

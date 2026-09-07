@@ -74,6 +74,24 @@ def _allowed(chat_id: int, allowed: tuple[int, ...]) -> bool:
     return chat_id in allowed
 
 
+def send_to_user(
+    *,
+    token: str,
+    chat_id: int,
+    text: str,
+    allowed: tuple[int, ...],
+) -> dict:
+    """One-shot outbound Telegram message. Enforces allowlist. No token in errors."""
+    if not token:
+        raise ValueError("TELEGRAM_BOT_TOKEN is not set")
+    if not chat_id:
+        raise ValueError("chat_id is required")
+    if not _allowed(chat_id, allowed):
+        raise PermissionError("chat_id not in TELEGRAM_ALLOWED_CHAT_IDS")
+    html = format_telegram_html(text, ())
+    return send_message(token, chat_id, html, parse_mode="HTML")
+
+
 def process_update(
     update: dict,
     *,
@@ -103,7 +121,7 @@ def process_update(
     if not (result.reply or "").strip() and result.returncode != 0:
         log.error("Loop turn failed (rc=%d): %s", result.returncode, result.stderr)
         err_msg = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else f"Code {result.returncode}"
-        reply_html = format_telegram_html(f"⚠️ Entschuldigung, beim Ausführen ist ein Fehler aufgetreten ({err_msg}).", ())
+        reply_html = format_telegram_html(f"Turn failed ({err_msg}).", ())
     else:
         reply_html = format_telegram_html(result.reply, ())
 
