@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Telegram loop-failure copy is English (`Turn failed (...)`) instead of a hardcoded German apology.
 
+### Removed
+- Committed `dist/` wheels. Build artifacts stay local; install from source or a release.
+
 ## [0.0.1] - 2026-09-05
 
 ### Added
