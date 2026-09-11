@@ -87,10 +87,11 @@ class TurnHandler(BaseHTTPRequestHandler):
         notified = False
         if notify and self.config and self.config.telegram_bot_token and self.config.telegram_allowed_chat_ids:
             from .telegram_adapter import send_message
-            from .telegram_format import format_telegram_html
+            from .telegram_format import extract_traces, format_telegram_html
             try:
                 primary_chat = self.config.telegram_allowed_chat_ids[0]
-                html = format_telegram_html(result.reply, ())
+                _, err_traces = extract_traces(result.stderr or "")
+                html = format_telegram_html(result.reply, err_traces)
                 send_message(self.config.telegram_bot_token, primary_chat, html, parse_mode="HTML")
                 notified = True
             except Exception as exc:

@@ -118,12 +118,13 @@ def process_update(
 
     runner = on_turn or run_loop_turn
     result = runner(channel="telegram", user=user, message=text)
+    _, err_traces = extract_traces(result.stderr or "")
     if not (result.reply or "").strip() and result.returncode != 0:
         log.error("Loop turn failed (rc=%d): %s", result.returncode, result.stderr)
         err_msg = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else f"Code {result.returncode}"
-        reply_html = format_telegram_html(f"Turn failed ({err_msg}).", ())
+        reply_html = format_telegram_html(f"Turn failed ({err_msg}).", err_traces)
     else:
-        reply_html = format_telegram_html(result.reply, ())
+        reply_html = format_telegram_html(result.reply, err_traces)
 
     if thinking_id:
         try:
