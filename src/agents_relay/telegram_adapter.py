@@ -116,9 +116,26 @@ def process_update(
     thinking_msg = send_message(token, chat_id, status_html("thinking..."), parse_mode="HTML")
     thinking_id = (thinking_msg.get("result") or {}).get("message_id") if isinstance(thinking_msg, dict) else None
 
+    last_status_time = [0.0]
+
+    def handle_status(status_text: str) -> None:
+        if not thinking_id:
+            return
+        now = time.monotonic()
+        if now - last_status_time[0] < 1.5:
+            return
+        last_status_time[0] = now
+        try:
+            edit_message(token, chat_id, thinking_id, status_html(status_text), parse_mode="HTML")
+        except Exception:
+            pass
+
     runner = on_turn or run_loop_turn
     try:
-        result = runner(channel="telegram", user=user, message=text)
+        try:
+            result = runner(channel="telegram", user=user, message=text, on_status=handle_status)
+        except TypeError:
+            result = runner(channel="telegram", user=user, message=text)
         _, err_traces = extract_traces(result.stderr or "")
         if not (result.reply or "").strip() and result.returncode != 0:
             log.error("Loop turn failed (rc=%d): %s", result.returncode, result.stderr)

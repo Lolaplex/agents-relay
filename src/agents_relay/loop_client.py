@@ -54,6 +54,7 @@ def run_loop_turn(
     user_id: str = "",
     new_session: bool = False,
     timeout_sec: int = 600,
+    on_status: Any = None,
 ) -> LoopTurnResult:
     cfg = config or RelayConfig.from_env()
     argv = list(cfg.loop_cmd)
@@ -79,19 +80,63 @@ def run_loop_turn(
     if new_session:
         argv.append("--new-session")
 
-    proc = subprocess.run(
+    if on_status is None:
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+            shell=False,
+        )
+        parsed = parse_loop_stdout(proc.stdout or "")
+        return LoopTurnResult(
+            reply=parsed["reply"],
+            session=parsed["session"],
+            user_id=parsed["user_id"],
+            alias=parsed["alias"],
+            returncode=int(proc.returncode),
+            stderr=proc.stderr or "",
+        )
+
+    import threading
+
+    proc = subprocess.Popen(
         argv,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=timeout_sec,
-        shell=False,
+        bufsize=1,
     )
-    parsed = parse_loop_stdout(proc.stdout or "")
+    stderr_lines: list[str] = []
+
+    def _read_err() -> None:
+        if proc.stderr:
+            for line in proc.stderr:
+                stderr_lines.append(line)
+                s = line.strip()
+                if s and on_status:
+                    try:
+                        on_status(s)
+                    except Exception:
+                        pass
+
+    t = threading.Thread(target=_read_err, daemon=True)
+    t.start()
+    try:
+        stdout, _ = proc.communicate(timeout=timeout_sec)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        raise
+    finally:
+        t.join(timeout=2)
+
+    parsed = parse_loop_stdout(stdout or "")
     return LoopTurnResult(
         reply=parsed["reply"],
         session=parsed["session"],
         user_id=parsed["user_id"],
         alias=parsed["alias"],
         returncode=int(proc.returncode),
-        stderr=proc.stderr or "",
+        stderr="".join(stderr_lines),
     )

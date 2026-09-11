@@ -156,6 +156,8 @@ class TestHttpTurn(unittest.TestCase):
         with patch("agents_relay.telegram_adapter.send_message", return_value={"result": {"message_id": 99}}) as mock_send:
             with patch("agents_relay.telegram_adapter.edit_message") as mock_edit:
                 def fake_turn(*args, **kwargs):
+                    if "on_status" in kwargs and kwargs["on_status"]:
+                        kwargs["on_status"]("running mcp.terminal...")
                     return LoopTurnResult(
                         reply="Echo: test message",
                         session="ses_123",
@@ -167,7 +169,7 @@ class TestHttpTurn(unittest.TestCase):
 
                 process_update(fake_update, config=cfg, on_turn=fake_turn)
                 mock_send.assert_called_once()
-                mock_edit.assert_called_once()
+                self.assertGreaterEqual(mock_edit.call_count, 1)
                 self.assertIn("Echo: test message", mock_edit.call_args[0][3])
 
 
