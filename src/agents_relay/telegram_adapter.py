@@ -13,7 +13,7 @@ from typing import Callable
 
 from .config import RelayConfig
 from .loop_client import LoopTurnResult, run_loop_turn
-from .telegram_format import format_telegram_html, status_html
+from .telegram_format import extract_traces, format_telegram_html, status_html
 
 log = logging.getLogger("agents_relay.telegram")
 
@@ -117,14 +117,18 @@ def process_update(
     thinking_id = (thinking_msg.get("result") or {}).get("message_id") if isinstance(thinking_msg, dict) else None
 
     runner = on_turn or run_loop_turn
-    result = runner(channel="telegram", user=user, message=text)
-    _, err_traces = extract_traces(result.stderr or "")
-    if not (result.reply or "").strip() and result.returncode != 0:
-        log.error("Loop turn failed (rc=%d): %s", result.returncode, result.stderr)
-        err_msg = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else f"Code {result.returncode}"
-        reply_html = format_telegram_html(f"Turn failed ({err_msg}).", err_traces)
-    else:
-        reply_html = format_telegram_html(result.reply, err_traces)
+    try:
+        result = runner(channel="telegram", user=user, message=text)
+        _, err_traces = extract_traces(result.stderr or "")
+        if not (result.reply or "").strip() and result.returncode != 0:
+            log.error("Loop turn failed (rc=%d): %s", result.returncode, result.stderr)
+            err_msg = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else f"Code {result.returncode}"
+            reply_html = format_telegram_html(f"Turn failed ({err_msg}).", err_traces)
+        else:
+            reply_html = format_telegram_html(result.reply, err_traces)
+    except Exception as exc:
+        log.exception("Loop turn error: %s", exc)
+        reply_html = format_telegram_html(f"Turn error: {exc}", ())
 
     if thinking_id:
         try:

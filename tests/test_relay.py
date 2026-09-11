@@ -132,6 +132,45 @@ class TestHttpTurn(unittest.TestCase):
             server.shutdown()
             server_thread.join(timeout=2)
 
+    def test_process_update_edits_message(self):
+        from agents_relay.telegram_adapter import process_update
+        from agents_relay.loop_client import LoopTurnResult
+
+        cfg = RelayConfig(
+            loop_cmd=("python", "-m", "runner.loop"),
+            loop_provider="echo",
+            relay_secret="",
+            telegram_bot_token="fake_bot_token",
+            telegram_allowed_chat_ids=(12345,),
+            relay_host="127.0.0.1",
+            relay_port=8787,
+            telegram_poll_timeout=1,
+        )
+        fake_update = {
+            "message": {
+                "chat": {"id": 12345},
+                "text": "test message",
+                "from": {"username": "felix"},
+            }
+        }
+        with patch("agents_relay.telegram_adapter.send_message", return_value={"result": {"message_id": 99}}) as mock_send:
+            with patch("agents_relay.telegram_adapter.edit_message") as mock_edit:
+                def fake_turn(*args, **kwargs):
+                    return LoopTurnResult(
+                        reply="Echo: test message",
+                        session="ses_123",
+                        user_id="u_123",
+                        alias="telegram:felix",
+                        returncode=0,
+                        stderr="[*] Running 'mcp.terminal'...\n[+] 'mcp.terminal' OK (exit 0)",
+                    )
+
+                process_update(fake_update, config=cfg, on_turn=fake_turn)
+                mock_send.assert_called_once()
+                mock_edit.assert_called_once()
+                self.assertIn("Echo: test message", mock_edit.call_args[0][3])
+
+
 
 class TestTelegramFormat(unittest.TestCase):
     def test_format_with_traces_and_links(self):
