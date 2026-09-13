@@ -328,8 +328,80 @@ class TestSendOutbound(unittest.TestCase):
         self.assertNotIn("secret-token-value", blob)
 
 
+class TestTelegramAdapterResilience(unittest.TestCase):
+    def test_edit_message_ignores_message_not_modified(self):
+        import io
+        import urllib.error
+        from agents_relay.telegram_adapter import edit_message
+
+        err_fp = io.BytesIO(b'{"ok": false, "error_code": 400, "description": "Bad Request: message is not modified"}')
+        http_err = urllib.error.HTTPError("http://example.com", 400, "Bad Request", {}, err_fp)
+
+        with patch("agents_relay.telegram_adapter._post_json", side_effect=http_err):
+            res = edit_message("token", 12345, 99, "<i>thinking...</i>", parse_mode="HTML")
+            self.assertTrue(res.get("ok"))
+            self.assertEqual(res["result"]["message_id"], 99)
+
+    def test_edit_message_strips_html_on_entity_error(self):
+        import io
+        import urllib.error
+        from agents_relay.telegram_adapter import edit_message
+
+        err_fp = io.BytesIO(b'{"ok": false, "error_code": 400, "description": "Bad Request: can\'t parse entities"}')
+        http_err = urllib.error.HTTPError("http://example.com", 400, "Bad Request", {}, err_fp)
+
+        calls = []
+
+        def fake_post(url, body):
+            calls.append(body)
+            if len(calls) == 1:
+                raise http_err
+            return {"ok": True, "result": {"message_id": 99}}
+
+        with patch("agents_relay.telegram_adapter._post_json", side_effect=fake_post):
+            res = edit_message("token", 12345, 99, "<b>hello</b> <i>world</i>", parse_mode="HTML")
+            self.assertTrue(res.get("ok"))
+            self.assertEqual(len(calls), 2)
+            self.assertNotIn("parse_mode", calls[1])
+            self.assertEqual(calls[1]["text"], "hello world")
+
+    def test_process_update_accepts_caption_without_text(self):
+        from agents_relay.telegram_adapter import process_update
+        from agents_relay.loop_client import LoopTurnResult
+
+        cfg = RelayConfig(
+            loop_cmd=("python", "-m", "runner.loop"),
+            loop_provider="echo",
+            relay_secret="",
+            telegram_bot_token="fake_bot_token",
+            telegram_allowed_chat_ids=(12345,),
+            relay_host="127.0.0.1",
+            relay_port=8787,
+            telegram_poll_timeout=1,
+        )
+        fake_update = {
+            "message": {
+                "chat": {"id": 12345},
+                "caption": "Photo caption question",
+                "from": {"username": "felix"},
+            }
+        }
+        received_msg = []
+
+        def fake_turn(*args, **kwargs):
+            received_msg.append(kwargs.get("message"))
+            return LoopTurnResult(reply="Answer", session="s", user_id="u", alias="a", returncode=0, stderr="")
+
+        with patch("agents_relay.telegram_adapter.send_message", return_value={"result": {"message_id": 99}}):
+            with patch("agents_relay.telegram_adapter.edit_message"):
+                process_update(fake_update, config=cfg, on_turn=fake_turn)
+
+        self.assertEqual(received_msg, ["Photo caption question"])
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 

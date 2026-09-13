@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
+from pathlib import Path
 from typing import Callable
 
 from .config import RelayConfig
@@ -31,6 +35,10 @@ def _post_json(url: str, payload: dict) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _strip_html_tags(text: str) -> str:
+    return re.sub(r"<[^>]+>", "", text or "").strip()
+
+
 def send_message(token: str, chat_id: int, text: str, *, parse_mode: str = "HTML") -> dict:
     body = {
         "chat_id": chat_id,
@@ -45,6 +53,7 @@ def send_message(token: str, chat_id: int, text: str, *, parse_mode: str = "HTML
     except urllib.error.HTTPError as exc:
         if parse_mode and exc.code == 400:
             body.pop("parse_mode", None)
+            body["text"] = _strip_html_tags(text)[:4096] or "(empty)"
             return _post_json(_api_url(token, "sendMessage"), body)
         raise
 
@@ -62,8 +71,16 @@ def edit_message(token: str, chat_id: int, message_id: int, text: str, *, parse_
     try:
         return _post_json(_api_url(token, "editMessageText"), body)
     except urllib.error.HTTPError as exc:
+        err_msg = ""
+        try:
+            err_msg = exc.read().decode("utf-8")
+        except Exception:
+            pass
+        if "message is not modified" in err_msg.lower():
+            return {"ok": True, "result": {"message_id": message_id}}
         if parse_mode and exc.code == 400:
             body.pop("parse_mode", None)
+            body["text"] = _strip_html_tags(text)[:4096] or "(empty)"
             return _post_json(_api_url(token, "editMessageText"), body)
         raise
 
@@ -92,6 +109,25 @@ def send_to_user(
     return send_message(token, chat_id, html, parse_mode="HTML")
 
 
+def _download_telegram_file(token: str, file_id: str, dest_dir: Path) -> Path | None:
+    try:
+        info = _post_json(_api_url(token, "getFile"), {"file_id": file_id})
+        file_path = (info.get("result") or {}).get("file_path")
+        if not file_path:
+            return None
+        file_url = f"{API_BASE}/file/bot{token}/{file_path}"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        ext = Path(file_path).suffix or ".jpg"
+        target = dest_dir / f"photo_{int(time.time())}_{uuid.uuid4().hex[:6]}{ext}"
+        req = urllib.request.Request(file_url)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            target.write_bytes(resp.read())
+        return target
+    except Exception as exc:
+        log.warning("Failed to download photo %s: %s", file_id, exc)
+        return None
+
+
 def process_update(
     update: dict,
     *,
@@ -105,11 +141,31 @@ def process_update(
     chat_id = int(chat.get("id") or 0)
     if not chat_id or not _allowed(chat_id, config.telegram_allowed_chat_ids):
         return
-    text = str(message.get("text") or "").strip()
-    if not text:
-        return
-    user = str((message.get("from") or {}).get("username") or chat_id)
+
+    text = str(message.get("text") or message.get("caption") or "").strip()
+    photo_list = message.get("photo") or []
+    image_path: str | None = None
     token = config.telegram_bot_token
+
+    if photo_list and isinstance(photo_list, list) and token:
+        largest = photo_list[-1]
+        file_id = largest.get("file_id") if isinstance(largest, dict) else None
+        if file_id:
+            override_home = os.environ.get("AGENTS_HOME")
+            inbox_dir = (Path(override_home) if override_home else (Path.home() / ".agents")) / "inbox"
+            saved = _download_telegram_file(token, file_id, inbox_dir)
+            if saved:
+                image_path = str(saved)
+
+    if not text and not image_path:
+        return
+
+    if not text and image_path:
+        text = f"[Photo received: {image_path}]"
+    elif image_path:
+        text = f"{text}\n\n[Photo attached: {image_path}]"
+
+    user = str((message.get("from") or {}).get("username") or chat_id)
     if not token:
         return
 
@@ -117,16 +173,21 @@ def process_update(
     thinking_id = (thinking_msg.get("result") or {}).get("message_id") if isinstance(thinking_msg, dict) else None
 
     last_status_time = [0.0]
+    last_status_val = [""]
 
     def handle_status(status_text: str) -> None:
         if not thinking_id:
+            return
+        cleaned = status_text.strip()
+        if not cleaned or cleaned == last_status_val[0]:
             return
         now = time.monotonic()
         if now - last_status_time[0] < 1.5:
             return
         last_status_time[0] = now
+        last_status_val[0] = cleaned
         try:
-            edit_message(token, chat_id, thinking_id, status_html(status_text), parse_mode="HTML")
+            edit_message(token, chat_id, thinking_id, status_html(cleaned), parse_mode="HTML")
         except Exception:
             pass
 
