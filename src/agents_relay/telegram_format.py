@@ -8,8 +8,10 @@ import re
 
 TG_LIMIT = 4096
 _BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+_ITALIC_STAR_RE = re.compile(r"(?<!\*)\*([^\*\n]+?)\*(?!\*)")
 _CODE_RE = re.compile(r"`([^`]+)`")
 _LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^\s\)]+)\)")
+_TABLE_SEP_CELL_RE = re.compile(r"^:?-+:?$")
 _FENCE_RE = re.compile(
     r"```(?:json|xml|javascript|tool[\w_-]*)?\s*\n[\s\S]*?```",
     re.IGNORECASE,
@@ -32,6 +34,80 @@ _BLOB_KEYS = (
 def _looks_like_blob(text: str) -> bool:
     low = text.lower()
     return any(key in low for key in _BLOB_KEYS)
+
+
+def _is_separator_row(row_str: str) -> bool:
+    cells = [c.strip() for c in row_str.strip().strip("|").split("|")]
+    if not cells:
+        return False
+    return all(_TABLE_SEP_CELL_RE.match(c) for c in cells if c)
+
+
+def _split_table_row(row_str: str) -> list[str]:
+    return [c.strip() for c in row_str.strip().strip("|").split("|")]
+
+
+def _format_table_block(headers: list[str], rows: list[list[str]]) -> list[str]:
+    formatted: list[str] = []
+    num_cols = len(headers)
+    for row in rows:
+        if len(row) < num_cols:
+            row.extend([""] * (num_cols - len(row)))
+        if not any(row):
+            continue
+        c1 = row[0]
+        if num_cols == 1:
+            formatted.append(f"• {c1}")
+        elif num_cols == 2:
+            c2 = row[1]
+            formatted.append(f"• **{c1}** — {c2}" if c2 else f"• **{c1}**")
+        elif num_cols == 3:
+            c2 = row[1]
+            c3 = row[2]
+            if c2 and c3:
+                formatted.append(f"• **{c1}** (*{c2}*) — {c3}")
+            elif c3:
+                formatted.append(f"• **{c1}** — {c3}")
+            elif c2:
+                formatted.append(f"• **{c1}** (*{c2}*)")
+            else:
+                formatted.append(f"• **{c1}**")
+        else:
+            extra_parts = [f"*{h}*: {v}" for h, v in zip(headers[1:], row[1:]) if v]
+            extra_str = " · ".join(extra_parts)
+            formatted.append(f"• **{c1}**: {extra_str}" if extra_str else f"• **{c1}**")
+    return formatted
+
+
+def _transform_markdown_tables(text: str) -> str:
+    if "|" not in text:
+        return text
+    lines = text.splitlines()
+    out_lines: list[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        if (
+            "|" in line
+            and i + 1 < n
+            and "|" in lines[i + 1]
+            and _is_separator_row(lines[i + 1])
+        ):
+            headers = _split_table_row(line)
+            i += 2
+            table_rows: list[list[str]] = []
+            while i < n and "|" in lines[i] and not _is_separator_row(lines[i]):
+                row_cells = _split_table_row(lines[i])
+                if any(row_cells):
+                    table_rows.append(row_cells)
+                i += 1
+            transformed = _format_table_block(headers, table_rows)
+            out_lines.extend(transformed)
+        else:
+            out_lines.append(line)
+            i += 1
+    return "\n".join(out_lines)
 
 
 def extract_traces(text: str) -> tuple[str, tuple[str, ...]]:
@@ -101,7 +177,9 @@ def status_html(text: str) -> str:
 def format_telegram_html(answer: str, traces: tuple[str, ...] = ()) -> str:
     cleaned_body, extracted_traces = extract_traces(answer)
     all_traces = traces if traces else extracted_traces
-    body = _light_md_html(visible_reply(cleaned_body, all_traces))
+    reply = visible_reply(cleaned_body, all_traces)
+    reply = _transform_markdown_tables(reply)
+    body = _light_md_html(reply)
     extra = _traces_block(all_traces)
     out = body + extra
     if len(out) <= TG_LIMIT:
@@ -122,7 +200,9 @@ def _traces_block(traces: tuple[str, ...]) -> str:
 
 def _light_md_html(text: str) -> str:
     escaped = html.escape(text, quote=False)
-    escaped = _BOLD_RE.sub(r"<b>\1</b>", escaped)
     escaped = _CODE_RE.sub(r"<code>\1</code>", escaped)
+    escaped = _BOLD_RE.sub(r"<b>\1</b>", escaped)
+    escaped = _ITALIC_STAR_RE.sub(r"<i>\1</i>", escaped)
     escaped = _LINK_RE.sub(r'<a href="\2">\1</a>', escaped)
     return escaped
+

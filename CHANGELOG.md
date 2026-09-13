@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Forward loop tool execution traces from stderr to Telegram and HTTP alert HTML formatting.
 - Real-time Telegram message editing during tool runs with throttled status streaming.
 - Photo and caption support in Telegram long-poll adapter (downloads incoming images to local inbox and attaches path to turn).
+- Automatic Markdown table transformation to mobile-readable Telegram bullet lists with inline formatting.
 
 ### Changed
 - Telegram loop-failure copy is English (`Turn failed (...)`) instead of a hardcoded German apology.

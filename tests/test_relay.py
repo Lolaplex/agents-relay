@@ -272,6 +272,26 @@ class TestTelegramFormat(unittest.TestCase):
         self.assertIn("&lt;stdin&gt; &amp; &lt;stdout&gt;", formatted)
         self.assertIn("Done!", formatted)
 
+    def test_markdown_table_transformation(self):
+        from agents_relay.telegram_format import format_telegram_html
+
+        table = (
+            "Hier ist der Status:\n"
+            "| Repo | Letzter Push | Was drin ist |\n"
+            "|---|---|---|\n"
+            '| klanker (dev) | heute 13:28 | echter Content: *"workspace grounding"* |\n'
+            "| agents-harness | heute 13:28 | 1 Commit seit 04.09 |\n"
+            "| agents-terminal | heute 13:27 | 1 Commit seit 05.09 |\n"
+            "Fertig."
+        )
+        formatted = format_telegram_html(table)
+        self.assertNotIn("|---|---|---|", formatted)
+        self.assertIn('• <b>klanker (dev)</b> (<i>heute 13:28</i>) — echter Content: <i>"workspace grounding"</i>', formatted)
+        self.assertIn("• <b>agents-harness</b> (<i>heute 13:28</i>) — 1 Commit seit 04.09", formatted)
+        self.assertIn("• <b>agents-terminal</b> (<i>heute 13:27</i>) — 1 Commit seit 05.09", formatted)
+
+
+
 
 class TestSendOutbound(unittest.TestCase):
     def test_allowlist_reject(self):
