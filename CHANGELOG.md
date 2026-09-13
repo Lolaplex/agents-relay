@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Automatic Markdown table transformation to mobile-readable Telegram bullet lists with inline formatting.
 
 ### Changed
+- CI runs only on pull requests to `main`.
 - README now documents install, the real CLI (`serve` / `send` / `--help-json`), env, and the verify command.
 - CI runs only on pull requests to `dev`/`main` and on manual dispatch, not on branch pushes or GitHub release events.
 - Telegram loop-failure copy is English (`Turn failed (...)`) instead of a hardcoded German apology.
