@@ -15,12 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Automatic Markdown table transformation to mobile-readable Telegram bullet lists with inline formatting.
 
 ### Changed
+- CI runs only on pull requests to `dev`/`main` and on manual dispatch, not on branch pushes or GitHub release events.
 - Telegram loop-failure copy is English (`Turn failed (...)`) instead of a hardcoded German apology.
 
 ### Fixed
 - Fixed raw HTML formatting tags appearing in Telegram when `editMessageText` returned 400 (message is not modified ignored; HTML tags stripped on entity errors).
 
 ### Removed
+- Automatic PyPI Trusted Publishing and GitHub Release creation from Actions (no tag-triggered upload).
 - Committed `dist/` wheels. Build artifacts stay local; install from source or a release.
 
 ## [0.0.1] - 2026-09-05
