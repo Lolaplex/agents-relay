@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Telegram loop-failure copy is English (`Turn failed (...)`) instead of a hardcoded German apology.
 
 ### Fixed
-- Fixed raw HTML formatting tags appearing in Telegram when `editMessageText` returned 400 (message is not modified ignored; HTML tags stripped on entity errors).
+- Raw HTML tags no longer leak into Telegram when `editMessageText` returns 400 (`message is not modified` ignored; HTML stripped on entity errors).
 
 ### Removed
 - Automatic PyPI Trusted Publishing and GitHub Release creation from Actions (no tag-triggered upload).
@@ -28,7 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.0.1] - 2026-09-05
 
 ### Added
-- Initial release of `agents-relay` (stdlib-only HTTP `/v1/turn` & Telegram long-poll relay for `agents-harness`).
-- Buffered subprocess execution of `runner.loop` with trailer parsing.
-- Dynamic Telegram message update lifecycle (`thinking...` to formatted HTML answer).
-- Zero-dependency architecture using standard library HTTP & urllib.
+- Stdlib-only HTTP `/v1/turn` and Telegram long-poll relay for `agents-harness`.
+- Buffered `runner.loop` subprocess with trailer parsing.
+- Telegram message lifecycle from `thinking...` to formatted HTML answer.
+
+[Unreleased]: https://github.com/Lolaplex/agents-relay/compare/v0.0.1...HEAD
+[0.0.1]: https://github.com/Lolaplex/agents-relay/releases/tag/v0.0.1
