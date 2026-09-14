@@ -472,6 +472,191 @@ class TestTelegramAdapterResilience(unittest.TestCase):
         self.assertEqual(received_msg, ["Photo caption question"])
 
 
+class TestInject(unittest.TestCase):
+    def _cfg(self, *, allowed=(12345,), secret="expected"):
+        return RelayConfig(
+            loop_cmd=("python", "-m", "runner.loop"),
+            loop_provider="echo",
+            relay_secret=secret,
+            telegram_bot_token="fake_bot_token",
+            telegram_allowed_chat_ids=allowed,
+            relay_host="127.0.0.1",
+            relay_port=0,
+            telegram_poll_timeout=1,
+        )
+
+    def test_inject_and_poll_call_same_handler(self):
+        from agents_relay.loop_client import LoopTurnResult
+        from agents_relay.telegram_adapter import inject_text, process_update
+
+        cfg = self._cfg()
+        fake_result = LoopTurnResult(
+            reply="pong", session="s", user_id="u", alias="a", returncode=0, stderr=""
+        )
+        fake_update = {
+            "message": {
+                "chat": {"id": 12345},
+                "text": "hello from poll",
+                "from": {"username": "felix"},
+            }
+        }
+        with patch(
+            "agents_relay.telegram_adapter.handle_inbound_text",
+            return_value=fake_result,
+        ) as mock_h:
+            process_update(fake_update, config=cfg)
+            inject_text(chat_id=12345, text="hello from inject", config=cfg)
+
+        self.assertEqual(mock_h.call_count, 2)
+        poll_kw = mock_h.call_args_list[0].kwargs
+        inj_kw = mock_h.call_args_list[1].kwargs
+        self.assertEqual(poll_kw["chat_id"], 12345)
+        self.assertEqual(poll_kw["text"], "hello from poll")
+        self.assertEqual(inj_kw["chat_id"], 12345)
+        self.assertEqual(inj_kw["text"], "hello from inject")
+
+    def test_inject_edits_thinking_then_final(self):
+        from agents_relay.loop_client import LoopTurnResult
+        from agents_relay.telegram_adapter import inject_text
+
+        cfg = self._cfg()
+        seen = []
+
+        def fake_turn(*args, **kwargs):
+            seen.append(kwargs)
+            if kwargs.get("on_status"):
+                kwargs["on_status"]("running mcp.calendar.list...")
+            return LoopTurnResult(
+                reply="Kalender leer.",
+                session="ses_1",
+                user_id="u_1",
+                alias="telegram:12345",
+                returncode=0,
+                stderr="[*] Running 'mcp.calendar.list'...\n[+] 'mcp.calendar.list' OK (exit 0)",
+            )
+
+        with patch(
+            "agents_relay.telegram_adapter.send_message",
+            return_value={"result": {"message_id": 77}},
+        ) as mock_send:
+            with patch("agents_relay.telegram_adapter.edit_message") as mock_edit:
+                result = inject_text(
+                    chat_id=12345, text="was steht diese woche an?", config=cfg, on_turn=fake_turn
+                )
+
+        self.assertEqual(result.reply, "Kalender leer.")
+        self.assertEqual(seen[0]["channel"], "telegram")
+        self.assertEqual(seen[0]["user"], "12345")
+        mock_send.assert_called_once()
+        self.assertGreaterEqual(mock_edit.call_count, 1)
+        self.assertIn("Kalender leer.", mock_edit.call_args[0][3])
+
+    def test_inject_denylist(self):
+        from agents_relay.telegram_adapter import inject_text
+
+        with self.assertRaises(PermissionError):
+            inject_text(chat_id=99, text="hi", config=self._cfg())
+
+    def test_inject_empty_text(self):
+        from agents_relay.telegram_adapter import inject_text
+
+        with self.assertRaises(ValueError):
+            inject_text(chat_id=12345, text="   ", config=self._cfg())
+
+    def test_v1_inject_http(self):
+        from agents_relay.loop_client import LoopTurnResult
+
+        cfg = self._cfg()
+
+        def fake_turn(**kwargs):
+            return LoopTurnResult(
+                reply="ok from inject",
+                session="ses_i",
+                user_id="u_i",
+                alias="telegram:12345",
+                returncode=0,
+                stderr="[+] 'mcp.memory.search' OK (exit 0)",
+            )
+
+        server = serve_http(cfg, on_turn=fake_turn)
+        host, port = server.server_address
+        thread = __import__("threading").Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with patch(
+                "agents_relay.telegram_adapter.send_message",
+                return_value={"result": {"message_id": 1}},
+            ):
+                with patch("agents_relay.telegram_adapter.edit_message"):
+                    conn = HTTPConnection(host, port, timeout=5)
+                    body = json.dumps({"user": 12345, "text": "hi"})
+                    conn.request("POST", "/v1/inject", body=body, headers={"Content-Type": "application/json"})
+                    self.assertEqual(conn.getresponse().status, 401)
+
+                    conn = HTTPConnection(host, port, timeout=5)
+                    conn.request(
+                        "POST",
+                        "/v1/inject",
+                        body=json.dumps({"user": 99, "text": "hi"}),
+                        headers={"Content-Type": "application/json", "X-Relay-Secret": "expected"},
+                    )
+                    self.assertEqual(conn.getresponse().status, 403)
+
+                    conn = HTTPConnection(host, port, timeout=5)
+                    conn.request(
+                        "POST",
+                        "/v1/inject",
+                        body=json.dumps({"user": 12345, "text": "  "}),
+                        headers={"Content-Type": "application/json", "X-Relay-Secret": "expected"},
+                    )
+                    self.assertEqual(conn.getresponse().status, 400)
+
+                    conn = HTTPConnection(host, port, timeout=5)
+                    conn.request(
+                        "POST",
+                        "/v1/inject",
+                        body=json.dumps({"chat_id": 12345, "text": "hi"}),
+                        headers={"Content-Type": "application/json", "X-Relay-Secret": "expected"},
+                    )
+                    resp = conn.getresponse()
+                    self.assertEqual(resp.status, 200)
+                    data = json.loads(resp.read().decode())
+                    self.assertEqual(data["reply"], "ok from inject")
+                    self.assertEqual(data["session"], "ses_i")
+                    self.assertTrue(any("Memory" in t for t in data["traces"]))
+        finally:
+            server.shutdown()
+            thread.join(timeout=2)
+
+    def test_cli_inject_and_help_json(self):
+        import io
+        from agents_relay.__main__ import _help_json
+        from agents_relay.__main__ import main as relay_main
+        from agents_relay.loop_client import LoopTurnResult
+
+        blob = json.dumps(_help_json())
+        self.assertIn("inject", blob)
+        self.assertIn("/v1/inject", blob)
+
+        fake = LoopTurnResult(
+            reply="cli pong", session="s", user_id="u", alias="a", returncode=0, stderr=""
+        )
+        buf = io.StringIO()
+        with patch("agents_relay.__main__.inject_text", return_value=fake) as mock_inj:
+            with patch(
+                "agents_relay.__main__.RelayConfig.from_env",
+                return_value=self._cfg(),
+            ):
+                with patch("sys.stdout", buf):
+                    rc = relay_main(["inject", "--user", "12345", "--text", "hi"])
+        self.assertEqual(rc, 0)
+        mock_inj.assert_called_once()
+        self.assertEqual(mock_inj.call_args.kwargs["chat_id"], 12345)
+        self.assertEqual(mock_inj.call_args.kwargs["text"], "hi")
+        payload = json.loads(buf.getvalue())
+        self.assertEqual(payload["reply"], "cli pong")
+
+
 if __name__ == "__main__":
     unittest.main()
 

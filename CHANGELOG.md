@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `POST /v1/inject` and `agents-relay inject --user/--chat-id --text` run one turn as an allowlisted Telegram `chat_id` through the same thinking-edit handler as long-poll. Caller gets JSON (`reply`, `traces`, session). Telegram still shows the live bubble. Denylist and empty text are rejected.
 - `agents-relay send --user/--chat-id --text` one-shot Telegram outbound (allowlist + env token). Hosts can deliver reminders without a poll turn.
 - Forward loop tool execution traces from stderr to Telegram and HTTP alert HTML formatting.
 - Real-time Telegram message editing during tool runs with throttled status streaming.

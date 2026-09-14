@@ -16,9 +16,10 @@ Machine catalog: `python -m agents_relay --help-json` (do not scrape `--help`).
 
 | Command | Purpose |
 |---------|---------|
-| `agents-relay serve` | HTTP `/v1/turn` (and `/v1/alert`, `/webhook/alert`). Telegram long-poll if `TELEGRAM_BOT_TOKEN` is set |
+| `agents-relay serve` | HTTP `/v1/turn`, `/v1/inject` (and `/v1/alert`, `/webhook/alert`). Telegram long-poll if `TELEGRAM_BOT_TOKEN` is set |
 | `agents-relay serve --no-telegram` | HTTP only |
 | `agents-relay send --user <chat_id> --text "..."` | One outbound Telegram message (`--chat-id` alias). Allowlist + token from env |
+| `agents-relay inject --user <chat_id> --text "..."` | Same inbound handler as poll (thinking edits + final). JSON on stdout. Allowlist + token from env |
 
 ## Env
 
