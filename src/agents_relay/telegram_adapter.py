@@ -17,7 +17,7 @@ from typing import Callable
 
 from .config import RelayConfig
 from .loop_client import LoopTurnResult, run_loop_turn
-from .telegram_format import extract_traces, format_telegram_html, status_html
+from .telegram_format import extract_traces, format_telegram_html, humanize_status, status_html
 
 log = logging.getLogger("agents_relay.telegram")
 
@@ -178,7 +178,7 @@ def process_update(
     def handle_status(status_text: str) -> None:
         if not thinking_id:
             return
-        cleaned = status_text.strip()
+        cleaned = humanize_status(status_text)
         if not cleaned or cleaned == last_status_val[0]:
             return
         now = time.monotonic()
@@ -204,6 +204,8 @@ def process_update(
             reply_html = format_telegram_html(f"Turn failed ({err_msg}).", err_traces)
         else:
             reply_html = format_telegram_html(result.reply, err_traces)
+        if not _strip_html_tags(reply_html):
+            reply_html = format_telegram_html("", err_traces)
     except Exception as exc:
         log.exception("Loop turn error: %s", exc)
         reply_html = format_telegram_html(f"Turn error: {exc}", ())

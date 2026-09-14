@@ -29,6 +29,35 @@ _BLOB_KEYS = (
     "tool_result",
     '"arguments"',
 )
+_JOB_LABELS = {
+    "mcp.calendar.list": "Kalender",
+    "mcp.calendar.add": "Kalender",
+    "mcp.calendar.update": "Kalender",
+    "mcp.calendar.delete": "Kalender",
+    "mcp.calendar.calendars": "Kalender",
+    "mcp.memory.search": "Memory",
+    "mcp.memory.add": "Memory",
+    "mcp.docs.search": "Docs",
+    "mcp.docs.write": "Docs",
+    "mcp.terminal": "Terminal",
+    "mcp.schedule.add": "Erinnerung",
+    "mcp.schedule.list": "Erinnerungen",
+    "mcp.schedule.remove": "Erinnerung",
+    "mcp.browser": "Browser",
+    "list_catalog": "Katalog",
+    "load_schema": "Schema",
+    "call_job": "Job",
+}
+_JOB_RE = re.compile(r"'([^']+)'")
+_RUNNING_RE = re.compile(r"^running\s+(.+?)(?:\.{3}|\u2026)$", re.I)
+_OK_RE = re.compile(r"^\[\+\]\s+'([^']+)'\s+OK\b", re.I)
+_FAIL_RE = re.compile(
+    r"^\[\-\]\s+'([^']+)'\s+(FAILED|TIMEOUT|ERROR)(?::\s*(.*))?$",
+    re.I,
+)
+_EXIT_RE = re.compile(r"got\s+(\d+)", re.I)
+_MACHINE_ONLY_RE = re.compile(r"^[\s\-_=*~.]{3,}$")
+_MARK_RE = re.compile("[\u2705\u2713\u2714\u2717\u2718\u274c]")
 
 
 def _looks_like_blob(text: str) -> bool:
@@ -110,19 +139,91 @@ def _transform_markdown_tables(text: str) -> str:
     return "\n".join(out_lines)
 
 
+def _job_label(job: str) -> str:
+    name = (job or "").strip().strip("'\"")
+    if name in _JOB_LABELS:
+        return _JOB_LABELS[name]
+    if name.startswith("mcp.") and "." in name:
+        return name.rsplit(".", 1)[-1]
+    return name or "Schritt"
+
+
+def _job_from_running(payload: str) -> str:
+    raw = (payload or "").strip().strip("'\"").rstrip(".").rstrip("\u2026").strip()
+    if raw.startswith("call_job"):
+        inner = raw[len("call_job") :].strip()
+        inner = inner[1:-1] if inner.startswith("(") and inner.endswith(")") else inner
+        inner = inner.strip().strip("'\"")
+        if inner:
+            return inner.split()[0]
+    return raw.split()[0] if raw else ""
+
+
+def humanize_status(text: str) -> str:
+    """Turn executor/loop stderr into a short person-mid-work line. Empty = skip."""
+    s = (text or "").strip()
+    if not s:
+        return ""
+    if s.startswith("CMD:") or s.startswith("STDERR:"):
+        return ""
+    if s in ("thinking...", "tools"):
+        return "Einen Moment …"
+    fail = _FAIL_RE.match(s)
+    if fail:
+        job, kind, detail = fail.group(1), fail.group(2).upper(), fail.group(3) or ""
+        lab = _job_label(job)
+        extra = ""
+        if kind == "FAILED":
+            got = _EXIT_RE.search(detail)
+            extra = f" (exit {got.group(1)})" if got else ""
+        elif kind == "TIMEOUT":
+            extra = " (Timeout)"
+        elif detail.strip():
+            extra = f" ({detail.strip()[:80]})"
+        return f"{lab} fehlgeschlagen{extra}."
+    ok = _OK_RE.match(s)
+    if ok:
+        job = ok.group(1)
+        return f"{_job_label(job)} fertig."
+    if s.startswith("[*] Running"):
+        m = _JOB_RE.search(s)
+        job = m.group(1) if m else ""
+        lab = _job_label(job)
+        return f"{lab} ({job}) …" if job and lab != job else f"{lab} …"
+    run = _RUNNING_RE.match(s)
+    if run:
+        job = _job_from_running(run.group(1))
+        lab = _job_label(job)
+        return f"{lab} ({job}) …" if job and lab != job else f"{lab} …"
+    return re.sub(r"[*_`]", "", s)
+
+
+def _is_trace_line(s: str) -> bool:
+    if (
+        s.startswith("[*] Running")
+        or s.startswith("[+]")
+        or s.startswith("[-]")
+        or s.startswith("CMD:")
+        or s.startswith("STDERR:")
+        or s in ("thinking...", "tools")
+    ):
+        return True
+    if s.lower().startswith("running ") and s.endswith("..."):
+        return True
+    return False
+
+
+def _is_failure_trace(s: str) -> bool:
+    return s.startswith("[-]") or " FAILED" in s or s.endswith("TIMEOUT") or " ERROR:" in s
+
+
 def extract_traces(text: str) -> tuple[str, tuple[str, ...]]:
     """Separate Cordis/runner loop trace lines from the user reply."""
     traces: list[str] = []
     clean_lines: list[str] = []
     for line in (text or "").splitlines():
         s = line.strip()
-        if (
-            s.startswith("[*] Running")
-            or s.startswith("[+]")
-            or s.startswith("[-]")
-            or s.startswith("CMD:")
-            or s == "thinking..."
-        ):
+        if _is_trace_line(s):
             traces.append(s)
         elif s.startswith("<ts>") and s.endswith("</ts>"):
             continue
@@ -157,45 +258,83 @@ def strip_model_dumps(text: str) -> str:
         except Exception:
             pass
     out = re.sub(r"\n{3,}", "\n\n", out)
-    return out.strip()
+    return _scrub_model_glue(out)
+
+
+def _scrub_model_glue(text: str) -> str:
+    kept: list[str] = []
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if not s:
+            kept.append("")
+            continue
+        if _MACHINE_ONLY_RE.match(s) or s.startswith("CMD:"):
+            continue
+        kept.append(_MARK_RE.sub("", line).rstrip())
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+
+
+def fallback_from_traces(traces: tuple[str, ...]) -> str:
+    lines: list[str] = []
+    seen: set[str] = set()
+    for raw in traces:
+        h = humanize_status(str(raw))
+        if not h or h in seen:
+            continue
+        seen.add(h)
+        lines.append(h)
+    if not lines:
+        return "Keine sichtbare Antwort."
+    return "\n".join(lines[-8:])
 
 
 def visible_reply(text: str, traces: tuple[str, ...] = ()) -> str:
-    cleaned = strip_model_dumps(text)
+    cleaned = strip_model_dumps(text).strip()
     if cleaned:
         return cleaned
     if traces:
-        return "Fertig."
+        return fallback_from_traces(traces)
     return "(leere Antwort)"
 
 
 def status_html(text: str) -> str:
-    plain = re.sub(r"[*_`]", "", text or "").strip() or "..."
+    plain = humanize_status(text) or "Einen Moment …"
+    plain = re.sub(r"[*_`]", "", plain).strip() or "Einen Moment …"
     return f"<i>{html.escape(plain)}</i>"
 
 
 def format_telegram_html(answer: str, traces: tuple[str, ...] = ()) -> str:
     cleaned_body, extracted_traces = extract_traces(answer)
     all_traces = traces if traces else extracted_traces
+    had_body = bool(strip_model_dumps(cleaned_body).strip())
     reply = visible_reply(cleaned_body, all_traces)
+    if not reply.strip():
+        reply = fallback_from_traces(all_traces) if all_traces else "(leere Antwort)"
     reply = _transform_markdown_tables(reply)
     body = _light_md_html(reply)
-    extra = _traces_block(all_traces)
+    extra = _failure_notes(all_traces) if had_body else ""
     out = body + extra
     if len(out) <= TG_LIMIT:
         return out
-    budget = TG_LIMIT - len(extra) - 3
-    if budget < 80:
-        return body[: TG_LIMIT - 3] + "..."
-    return body[:budget] + "..." + extra
+    if extra and len(body) <= TG_LIMIT:
+        return body
+    return body[: TG_LIMIT - 3] + "..."
 
 
-def _traces_block(traces: tuple[str, ...]) -> str:
-    lines = [html.escape(line) for line in traces if str(line).strip()]
-    if not lines:
+def _failure_notes(traces: tuple[str, ...]) -> str:
+    notes: list[str] = []
+    seen: set[str] = set()
+    for raw in traces:
+        if not _is_failure_trace(str(raw)):
+            continue
+        h = humanize_status(str(raw))
+        if not h or h in seen:
+            continue
+        seen.add(h)
+        notes.append(html.escape(h))
+    if not notes:
         return ""
-    inner = "\n".join(lines)
-    return f"\n\n<blockquote expandable><b>tools</b>\n{inner}</blockquote>"
+    return "\n\n<i>" + "\n".join(notes) + "</i>"
 
 
 def _light_md_html(text: str) -> str:

@@ -190,7 +190,8 @@ class TestTelegramFormat(unittest.TestCase):
         formatted = format_telegram_html(raw)
         self.assertIn('<a href="https://lolax.dev">Lolax</a>', formatted)
         self.assertIn("<b>dev</b>", formatted)
-        self.assertIn("<blockquote expandable><b>tools</b>", formatted)
+        self.assertNotIn("<blockquote expandable><b>tools</b>", formatted)
+        self.assertNotIn("[*] Running", formatted)
         self.assertNotIn("(leere Antwort)", formatted)
 
     def test_bracket_lists_not_stripped(self):
@@ -228,10 +229,17 @@ class TestTelegramFormat(unittest.TestCase):
         user_code = 'In Python kannst du ein Dict definieren: `{"user": "Felix", "score": 10}`.'
         self.assertIn('{"user": "Felix", "score": 10}', visible_reply(user_code))
 
-    def test_empty_with_traces_returns_fertig(self):
+    def test_empty_with_traces_synthesizes_progress(self):
         from agents_relay.telegram_format import visible_reply
 
-        self.assertEqual(visible_reply("", traces=("mcp.memory.search",)), "Fertig.")
+        traces = (
+            "[*] Running 'mcp.memory.search' (rests on: memory)...",
+            "[+] 'mcp.memory.search' OK (exit 0) in 0.28s",
+        )
+        out = visible_reply("", traces=traces)
+        self.assertIn("Memory", out)
+        self.assertNotEqual(out.strip(), "")
+        self.assertNotEqual(out, "Fertig.")
         self.assertEqual(visible_reply("", ()), "(leere Antwort)")
 
     def test_long_message_budget(self):
@@ -259,18 +267,63 @@ class TestTelegramFormat(unittest.TestCase):
         self.assertIn("def hello():", cleaned)
         self.assertIn("return 'world'", cleaned)
 
-    def test_traces_escaping_in_blockquote(self):
+    def test_failure_notes_humanized_not_cli(self):
         from agents_relay.telegram_format import format_telegram_html
 
         raw = (
             "[*] Running 'tool' (check <stdin> & <stdout>)...\n"
-            "[+] OK in 0.1s\n"
+            "[-] 'mcp.memory.add' FAILED: expected exit 0, got 2\n"
             "Done!"
         )
         formatted = format_telegram_html(raw)
-        self.assertIn("<blockquote expandable><b>tools</b>", formatted)
-        self.assertIn("&lt;stdin&gt; &amp; &lt;stdout&gt;", formatted)
+        self.assertNotIn("<blockquote expandable><b>tools</b>", formatted)
+        self.assertNotIn("[*] Running", formatted)
+        self.assertIn("Memory fehlgeschlagen (exit 2).", formatted)
         self.assertIn("Done!", formatted)
+
+    def test_humanize_status_calendar_progress(self):
+        from agents_relay.telegram_format import humanize_status, status_html
+
+        running = (
+            "[*] Running 'mcp.calendar.list' (rests on: agents-calendar CLI list "
+            "VEVENTs; extra argv is --from/--to ISO; exit 0 = listed)..."
+        )
+        self.assertEqual(humanize_status(running), "Kalender (mcp.calendar.list) …")
+        self.assertEqual(
+            humanize_status("[+] 'mcp.calendar.list' OK (exit 0) in 2.21s"),
+            "Kalender fertig.",
+        )
+        self.assertEqual(
+            humanize_status("[-] 'mcp.memory.add' FAILED: expected exit 0, got 2"),
+            "Memory fehlgeschlagen (exit 2).",
+        )
+        self.assertEqual(humanize_status("CMD: python -m agents_calendar list"), "")
+        self.assertEqual(humanize_status("thinking..."), "Einen Moment …")
+        self.assertIn("Einen Moment", status_html("thinking..."))
+        self.assertNotIn("[*]", status_html(running))
+
+    def test_empty_final_never_whitespace(self):
+        from agents_relay.telegram_format import format_telegram_html
+
+        formatted = format_telegram_html(
+            "thinking...\n[*] Running 'mcp.calendar.list'...\n",
+            (
+                "[*] Running 'mcp.calendar.list'...",
+                "[+] 'mcp.calendar.list' OK (exit 0) in 2.21s",
+            ),
+        )
+        self.assertTrue(formatted.strip())
+        self.assertNotIn("(leere Antwort)", formatted)
+        self.assertIn("Kalender", formatted)
+
+    def test_long_body_not_truncated_for_traces(self):
+        from agents_relay.telegram_format import format_telegram_html, TG_LIMIT
+
+        body = "A" * 4000
+        traces = ("[-] 'mcp.memory.add' FAILED: expected exit 0, got 2",) * 20
+        formatted = format_telegram_html(body, traces)
+        self.assertLessEqual(len(formatted), TG_LIMIT)
+        self.assertIn("A" * 80, formatted)
 
     def test_markdown_table_transformation(self):
         from agents_relay.telegram_format import format_telegram_html
