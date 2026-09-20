@@ -17,7 +17,13 @@ from typing import Callable
 
 from .config import RelayConfig
 from .loop_client import LoopTurnResult, run_loop_turn
-from .telegram_format import extract_traces, format_telegram_html, status_html
+from .telegram_format import (
+    extract_traces,
+    format_telegram_html,
+    humanize_status,
+    status_html,
+    visible_reply,
+)
 
 log = logging.getLogger("agents_relay.telegram")
 
@@ -128,6 +134,126 @@ def _download_telegram_file(token: str, file_id: str, dest_dir: Path) -> Path | 
         return None
 
 
+def inbound_payload(result: LoopTurnResult) -> dict:
+    """Caller JSON: visible answer + humanized traces. No tokens, no raw CLI dump."""
+    _, err_traces = extract_traces(result.stderr or "")
+    traces: list[str] = []
+    seen: set[str] = set()
+    for raw in err_traces:
+        h = humanize_status(str(raw))
+        if h and h not in seen:
+            seen.add(h)
+            traces.append(h)
+    reply = visible_reply(result.reply or "", err_traces)
+    return {
+        "reply": reply,
+        "traces": traces,
+        "session": result.session,
+        "user_id": result.user_id,
+        "alias": result.alias,
+        "returncode": result.returncode,
+    }
+
+
+def handle_inbound_text(
+    *,
+    chat_id: int,
+    text: str,
+    config: RelayConfig,
+    on_turn: Callable[..., LoopTurnResult] | None = None,
+    user: str | None = None,
+) -> LoopTurnResult:
+    """Same Telegram lifecycle as a poll text update: thinking edit, then final."""
+    token = config.telegram_bot_token
+    if not token:
+        raise ValueError("TELEGRAM_BOT_TOKEN is not set")
+    loop_user = (user or str(chat_id)).strip() or str(chat_id)
+
+    thinking_msg = send_message(token, chat_id, status_html("thinking..."), parse_mode="HTML")
+    thinking_id = (thinking_msg.get("result") or {}).get("message_id") if isinstance(thinking_msg, dict) else None
+
+    last_status_time = [0.0]
+    last_status_val = [""]
+
+    def handle_status(status_text: str) -> None:
+        if not thinking_id:
+            return
+        cleaned = humanize_status(status_text)
+        if not cleaned or cleaned == last_status_val[0]:
+            return
+        now = time.monotonic()
+        if now - last_status_time[0] < 1.5:
+            return
+        last_status_time[0] = now
+        last_status_val[0] = cleaned
+        try:
+            edit_message(token, chat_id, thinking_id, status_html(cleaned), parse_mode="HTML")
+        except Exception:
+            pass
+
+    runner = on_turn or run_loop_turn
+    result = LoopTurnResult(reply="", session="", user_id="", alias="", returncode=1, stderr="")
+    try:
+        try:
+            result = runner(channel="telegram", user=loop_user, message=text, on_status=handle_status)
+        except TypeError:
+            result = runner(channel="telegram", user=loop_user, message=text)
+        _, err_traces = extract_traces(result.stderr or "")
+        if not (result.reply or "").strip() and result.returncode != 0:
+            log.error("Loop turn failed (rc=%d): %s", result.returncode, result.stderr)
+            err_msg = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else f"Code {result.returncode}"
+            reply_html = format_telegram_html(f"Turn failed ({err_msg}).", err_traces)
+        else:
+            reply_html = format_telegram_html(result.reply, err_traces)
+        if not _strip_html_tags(reply_html):
+            reply_html = format_telegram_html("", err_traces)
+    except Exception as exc:
+        log.exception("Loop turn error: %s", exc)
+        reply_html = format_telegram_html(f"Turn error: {exc}", ())
+        result = LoopTurnResult(
+            reply=f"Turn error: {exc}",
+            session="",
+            user_id="",
+            alias="",
+            returncode=1,
+            stderr="",
+        )
+
+    if thinking_id:
+        try:
+            edit_message(token, chat_id, thinking_id, reply_html, parse_mode="HTML")
+            return result
+        except Exception:
+            pass
+    send_message(token, chat_id, reply_html, parse_mode="HTML")
+    return result
+
+
+def inject_text(
+    *,
+    chat_id: int,
+    text: str,
+    config: RelayConfig,
+    on_turn: Callable[..., LoopTurnResult] | None = None,
+    user: str | None = None,
+) -> LoopTurnResult:
+    """Allowlisted synthetic inbound: same handler as poll, plus caller payload."""
+    if not chat_id:
+        raise ValueError("chat_id is required")
+    if not _allowed(chat_id, config.telegram_allowed_chat_ids):
+        raise PermissionError("chat_id not in TELEGRAM_ALLOWED_CHAT_IDS")
+    stripped = (text or "").strip()
+    if not stripped:
+        raise ValueError("text is required")
+    return handle_inbound_text(
+        chat_id=chat_id,
+        text=stripped,
+        config=config,
+        on_turn=on_turn,
+        user=user or str(chat_id),
+    )
+
+
 def process_update(
     update: dict,
     *,
@@ -168,53 +294,7 @@ def process_update(
     user = str((message.get("from") or {}).get("username") or chat_id)
     if not token:
         return
-
-    thinking_msg = send_message(token, chat_id, status_html("thinking..."), parse_mode="HTML")
-    thinking_id = (thinking_msg.get("result") or {}).get("message_id") if isinstance(thinking_msg, dict) else None
-
-    last_status_time = [0.0]
-    last_status_val = [""]
-
-    def handle_status(status_text: str) -> None:
-        if not thinking_id:
-            return
-        cleaned = status_text.strip()
-        if not cleaned or cleaned == last_status_val[0]:
-            return
-        now = time.monotonic()
-        if now - last_status_time[0] < 1.5:
-            return
-        last_status_time[0] = now
-        last_status_val[0] = cleaned
-        try:
-            edit_message(token, chat_id, thinking_id, status_html(cleaned), parse_mode="HTML")
-        except Exception:
-            pass
-
-    runner = on_turn or run_loop_turn
-    try:
-        try:
-            result = runner(channel="telegram", user=user, message=text, on_status=handle_status)
-        except TypeError:
-            result = runner(channel="telegram", user=user, message=text)
-        _, err_traces = extract_traces(result.stderr or "")
-        if not (result.reply or "").strip() and result.returncode != 0:
-            log.error("Loop turn failed (rc=%d): %s", result.returncode, result.stderr)
-            err_msg = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else f"Code {result.returncode}"
-            reply_html = format_telegram_html(f"Turn failed ({err_msg}).", err_traces)
-        else:
-            reply_html = format_telegram_html(result.reply, err_traces)
-    except Exception as exc:
-        log.exception("Loop turn error: %s", exc)
-        reply_html = format_telegram_html(f"Turn error: {exc}", ())
-
-    if thinking_id:
-        try:
-            edit_message(token, chat_id, thinking_id, reply_html, parse_mode="HTML")
-            return
-        except Exception:
-            pass
-    send_message(token, chat_id, reply_html, parse_mode="HTML")
+    handle_inbound_text(chat_id=chat_id, text=text, config=config, on_turn=on_turn, user=user)
 
 
 def telegram_poll_loop(

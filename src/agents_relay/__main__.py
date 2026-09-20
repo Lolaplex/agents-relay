@@ -11,20 +11,26 @@ import sys
 from . import __version__
 from .config import RelayConfig
 from .http_adapter import serve_http
-from .telegram_adapter import send_to_user, start_telegram_thread
+from .telegram_adapter import inbound_payload, inject_text, send_to_user, start_telegram_thread
 
 log = logging.getLogger("agents_relay")
 
 
-def _cmd_send(args: argparse.Namespace) -> int:
+def _chat_id_from_args(args: argparse.Namespace) -> int | None:
     raw = str(getattr(args, "user", "") or getattr(args, "chat_id", "") or "").strip()
     if not raw:
         print("Error: --user or --chat-id is required", file=sys.stderr)
-        return 2
+        return None
     try:
-        chat_id = int(raw)
+        return int(raw)
     except ValueError:
         print("Error: --user must be a numeric chat id", file=sys.stderr)
+        return None
+
+
+def _cmd_send(args: argparse.Namespace) -> int:
+    chat_id = _chat_id_from_args(args)
+    if chat_id is None:
         return 2
     config = RelayConfig.from_env()
     try:
@@ -46,19 +52,49 @@ def _cmd_send(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_inject(args: argparse.Namespace) -> int:
+    chat_id = _chat_id_from_args(args)
+    if chat_id is None:
+        return 2
+    config = RelayConfig.from_env()
+    try:
+        result = inject_text(chat_id=chat_id, text=str(args.text), config=config)
+    except PermissionError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"Error: inject failed ({exc})", file=sys.stderr)
+        return 1
+    print(json.dumps(inbound_payload(result), ensure_ascii=False))
+    return 0 if result.returncode == 0 else 1
+
+
 def _help_json() -> dict:
     return {
         "name": "agents-relay",
         "version": __version__,
         "commands": {
-            "serve": {"description": "Start HTTP /v1/turn and optional Telegram polling"},
+            "serve": {"description": "Start HTTP /v1/turn, /v1/inject, and optional Telegram polling"},
             "send": {
                 "description": "Send one Telegram message to an allowlisted chat id",
+                "flags": ["--user", "--chat-id", "--text"],
+            },
+            "inject": {
+                "description": "Run one turn as an allowlisted Telegram chat (thinking edits + JSON reply)",
                 "flags": ["--user", "--chat-id", "--text"],
             },
         },
         "flags": ["--help-json"],
     }
+
+
+def _add_chat_text_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--user", dest="user", default="", help="Target chat id")
+    parser.add_argument("--chat-id", dest="chat_id", default="", help="Alias for --user")
+    parser.add_argument("--text", required=True, help="Message body")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -68,9 +104,12 @@ def build_parser() -> argparse.ArgumentParser:
     serve_p = sub.add_parser("serve", help="Run relay")
     serve_p.add_argument("--no-telegram", action="store_true", help="Disable Telegram polling")
     send_p = sub.add_parser("send", help="Send one Telegram message to an allowlisted chat id")
-    send_p.add_argument("--user", dest="user", default="", help="Target chat id")
-    send_p.add_argument("--chat-id", dest="chat_id", default="", help="Alias for --user")
-    send_p.add_argument("--text", required=True, help="Message body")
+    _add_chat_text_flags(send_p)
+    inject_p = sub.add_parser(
+        "inject",
+        help="Run one turn as an allowlisted Telegram chat (thinking edits + JSON reply)",
+    )
+    _add_chat_text_flags(inject_p)
     return parser
 
 
@@ -88,6 +127,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "send":
         return _cmd_send(args)
+    if args.command == "inject":
+        return _cmd_inject(args)
     if args.command != "serve":
         build_parser().print_help()
         return 0
