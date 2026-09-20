@@ -9,6 +9,7 @@ import signal
 import sys
 
 from . import __version__
+from .client import ReayClient
 from .config import RelayConfig
 from .http_adapter import serve_http
 from .telegram_adapter import start_telegram_thread
@@ -20,7 +21,13 @@ def _help_json() -> dict:
     return {
         "name": "agents-relay",
         "version": __version__,
-        "commands": {"serve": {"description": "Start HTTP /v1/turn and optional Telegram polling"}},
+        "commands": {
+            "serve": {"description": "Start HTTP /v1/turn and optional Telegram polling"},
+            "client": {
+                "description": "Smoke-test gateway turn/stream",
+                "subcommands": ["turn", "health"],
+            },
+        },
         "flags": ["--help-json"],
     }
 
@@ -31,7 +38,42 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command")
     serve_p = sub.add_parser("serve", help="Run relay")
     serve_p.add_argument("--no-telegram", action="store_true", help="Disable Telegram polling")
+    client_p = sub.add_parser("client", help="Relay client smoke tests")
+    client_sub = client_p.add_subparsers(dest="client_cmd")
+    turn_p = client_sub.add_parser("turn", help="POST /v1/turn")
+    turn_p.add_argument("message", help="User message")
+    turn_p.add_argument("--url", default="http://127.0.0.1:8787")
+    turn_p.add_argument("--secret", default="")
+    turn_p.add_argument("--channel", default="cli")
+    turn_p.add_argument("--user", default="local")
+    turn_p.add_argument("--provider", default="")
+    turn_p.add_argument("--stream", action="store_true")
+    health_p = client_sub.add_parser("health", help="GET /health")
+    health_p.add_argument("--url", default="http://127.0.0.1:8787")
     return parser
+
+
+def _client_main(args: argparse.Namespace) -> int:
+    if args.client_cmd == "health":
+        client = RelayClient(base_url=args.url)
+        print(json.dumps(client.health(), indent=2))
+        return 0
+    if args.client_cmd == "turn":
+        client = RelayClient(
+            base_url=args.url,
+            secret=args.secret,
+            channel=args.channel,
+            user=args.user,
+            provider=args.provider,
+        )
+        if args.stream:
+            for event in client.stream(args.message):
+                print(json.dumps(event, ensure_ascii=False))
+            return 0
+        data = client.turn(args.message)
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+        return 0 if int(data.get("returncode", 1)) == 0 else 1
+    return 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -40,6 +82,8 @@ def main(argv: list[str] | None = None) -> int:
     if getattr(args, "help_json", False):
         print(json.dumps(_help_json(), indent=2))
         return 0
+    if args.command == "client":
+        return _client_main(args)
     if args.command != "serve":
         build_parser().print_help()
         return 0

@@ -43,6 +43,10 @@ class RelayConfig:
     relay_host: str
     relay_port: int
     telegram_poll_timeout: int
+    webhook_secret: str
+    board_url: str
+    board_project: str
+    board_key_slug: str
 
     @classmethod
     def from_env(cls) -> "RelayConfig":
@@ -59,6 +63,10 @@ class RelayConfig:
             relay_host=_clean(os.environ.get("RELAY_HOST", os.environ.get("GATEWAY_HOST", "127.0.0.1"))) or "127.0.0.1",
             relay_port=_int(os.environ.get("RELAY_PORT", os.environ.get("GATEWAY_PORT", "8787")), 8787),
             telegram_poll_timeout=max(1, min(50, _int(os.environ.get("TELEGRAM_POLL_TIMEOUT", "50"), 50))),
+            webhook_secret=_clean(os.environ.get("WEBHOOK_SECRET", "")),
+            board_url=_clean(os.environ.get("BOARD_URL", "")).rstrip("/"),
+            board_project=_clean(os.environ.get("BOARD_PROJECT", "")),
+            board_key_slug=_clean(os.environ.get("BOARD_KEY_SLUG", "gateway")),
         )
 
 
