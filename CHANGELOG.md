@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Telegram loop-failure copy is English (`Turn failed (...)`) instead of a hardcoded German apology.
 
 ### Fixed
+- A turn is no longer killed after 10 minutes. The relay waits until the loop exits; each model call still stops on the provider first-byte and idle limits. A configured turn limit that does fire returns one sentence and does not include the process command.
 - Raw HTML tags no longer leak into Telegram when `editMessageText` returns 400 (`message is not modified` ignored; HTML stripped on entity errors).
 
 ### Removed

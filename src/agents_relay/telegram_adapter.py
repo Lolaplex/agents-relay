@@ -208,10 +208,13 @@ def handle_inbound_text(
         if not _strip_html_tags(reply_html):
             reply_html = format_telegram_html("", err_traces)
     except Exception as exc:
-        log.exception("Loop turn error: %s", exc)
-        reply_html = format_telegram_html(f"Turn error: {exc}", ())
+        log.exception("Loop turn error")
+        line = str(exc).splitlines()[0].strip() if str(exc).strip() else exc.__class__.__name__
+        if len(line) > 200:
+            line = line[:200] + "..."
+        reply_html = format_telegram_html(f"Turn error: {line}", ())
         result = LoopTurnResult(
-            reply=f"Turn error: {exc}",
+            reply=f"Turn error: {line}",
             session="",
             user_id="",
             alias="",
