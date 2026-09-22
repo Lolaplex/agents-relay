@@ -51,6 +51,30 @@ class TestLoopSubprocess(unittest.TestCase):
         self.assertEqual(result.reply, "pong")
         self.assertEqual(result.session, "s1")
 
+    def test_timeout_reply_hides_command(self):
+        cfg = RelayConfig(
+            loop_cmd=("python", "-c", "import time; time.sleep(30)"),
+            loop_provider="echo",
+            relay_secret="",
+            telegram_bot_token="",
+            telegram_allowed_chat_ids=(),
+            relay_host="127.0.0.1",
+            relay_port=0,
+            telegram_poll_timeout=1,
+        )
+        result = run_loop_turn(
+            channel="telegram",
+            user="u",
+            message="Hi",
+            config=cfg,
+            timeout_sec=1,
+            on_status=lambda _status: None,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.reply, "Turn stopped before a final answer.")
+        self.assertNotIn("runner.loop", result.reply)
+        self.assertNotIn("sleep", result.reply)
+
 
 class TestHttpTurn(unittest.TestCase):
     def test_v1_turn_auth(self):
