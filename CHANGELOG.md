@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.2] - 2026-09-27
+
 ### Added
 - `POST /v1/inject` and `agents-relay inject --user/--chat-id --text` run one turn as an allowlisted Telegram `chat_id` through the same thinking-edit handler as long-poll. Caller gets JSON (`reply`, `traces`, session). Telegram still shows the live bubble. Denylist and empty text are rejected.
 - `agents-relay send --user/--chat-id --text` one-shot Telegram outbound (allowlist + env token). Hosts can deliver reminders without a poll turn.
@@ -37,5 +39,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Buffered `runner.loop` subprocess with trailer parsing.
 - Telegram message lifecycle from `thinking...` to formatted HTML answer.
 
-[Unreleased]: https://github.com/Lolaplex/agents-relay/compare/v0.0.1...HEAD
+[Unreleased]: https://github.com/Lolaplex/agents-relay/compare/v0.0.2...HEAD
+[0.0.2]: https://github.com/Lolaplex/agents-relay/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/Lolaplex/agents-relay/releases/tag/v0.0.1

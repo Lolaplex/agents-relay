@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agents-relay"
-version = "0.0.1"
+version = "0.0.2"
 description = "HTTP and Telegram relay to agents-harness runner.loop (stdlib only)"
 readme = "README.md"
 license = "MIT"
