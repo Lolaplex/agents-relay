@@ -44,6 +44,27 @@ Needs `runner.loop` on `PATH` (`LOOP_CMD`, default `python -m runner.loop`). Tha
 
 ---
 
+## Capabilities & Roadmap
+
+### Core Capabilities (Implemented)
+
+- [x] **HTTP Turn Endpoints (`/v1/turn`, `/v1/inject`)**: Buffered turn execution with secret header validation.
+- [x] **Telegram Long-Poll Gateway**: Bot API updates with real-time thinking status message editing.
+- [x] **Direct Outbound CLI (`send`, `inject`)**: Host-initiated push messages and simulated turns without background polling.
+- [x] **Mobile Formatting**: Automatic Markdown table conversion to Telegram-readable bullet lists.
+- [x] **Trailer Parsing**: Extracts session, user ID, alias, and return code from harness stdout trailers.
+- [x] **Subprocess Isolation**: One `runner.loop` process per request. No in-process LLM state.
+- [x] **Zero Bloat Runtime**: Pure Python standard library only.
+
+### Planned (Roadmap)
+
+- [ ] **SSE Token Streaming (`/v1/stream`)**: Direct server-sent events for client web UIs.
+- [ ] **A2A Board Mailbox Proxy (`/v1/a2a/mail`, `/v1/a2a/peers`)**: Peer-to-peer agent relay for board instances.
+- [ ] **Inbound Webhook Hub (`/v1/webhook/{source}`)**: Direct ingress for CI/CD and deployment alerts.
+- [ ] **Multi-Channel Adapters**: Signal / Discord gateway adapters alongside Telegram.
+
+---
+
 ## Commands
 
 Machine-readable catalog: `python -m agents_relay --help-json` (do not scrape `--help`).
