@@ -4,16 +4,26 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
+from pathlib import Path
 from typing import Callable
 
 from .config import RelayConfig
 from .loop_client import LoopTurnResult, run_loop_turn
-from .telegram_format import format_telegram_html, status_html
+from .telegram_format import (
+    extract_traces,
+    format_telegram_html,
+    humanize_status,
+    status_html,
+    visible_reply,
+)
 
 log = logging.getLogger("agents_relay.telegram")
 
@@ -31,11 +41,16 @@ def _post_json(url: str, payload: dict) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _strip_html_tags(text: str) -> str:
+    return re.sub(r"<[^>]+>", "", text or "").strip()
+
+
 def send_message(token: str, chat_id: int, text: str, *, parse_mode: str = "HTML") -> dict:
     body = {
         "chat_id": chat_id,
         "text": text[:4096],
         "disable_web_page_preview": True,
+        "link_preview_options": {"is_disabled": True},
     }
     if parse_mode:
         body["parse_mode"] = parse_mode
@@ -44,6 +59,7 @@ def send_message(token: str, chat_id: int, text: str, *, parse_mode: str = "HTML
     except urllib.error.HTTPError as exc:
         if parse_mode and exc.code == 400:
             body.pop("parse_mode", None)
+            body["text"] = _strip_html_tags(text)[:4096] or "(empty)"
             return _post_json(_api_url(token, "sendMessage"), body)
         raise
 
@@ -54,14 +70,23 @@ def edit_message(token: str, chat_id: int, message_id: int, text: str, *, parse_
         "message_id": message_id,
         "text": text[:4096],
         "disable_web_page_preview": True,
+        "link_preview_options": {"is_disabled": True},
     }
     if parse_mode:
         body["parse_mode"] = parse_mode
     try:
         return _post_json(_api_url(token, "editMessageText"), body)
     except urllib.error.HTTPError as exc:
+        err_msg = ""
+        try:
+            err_msg = exc.read().decode("utf-8")
+        except Exception:
+            pass
+        if "message is not modified" in err_msg.lower():
+            return {"ok": True, "result": {"message_id": message_id}}
         if parse_mode and exc.code == 400:
             body.pop("parse_mode", None)
+            body["text"] = _strip_html_tags(text)[:4096] or "(empty)"
             return _post_json(_api_url(token, "editMessageText"), body)
         raise
 
@@ -70,6 +95,166 @@ def _allowed(chat_id: int, allowed: tuple[int, ...]) -> bool:
     if not allowed:
         return True
     return chat_id in allowed
+
+
+def send_to_user(
+    *,
+    token: str,
+    chat_id: int,
+    text: str,
+    allowed: tuple[int, ...],
+) -> dict:
+    """One-shot outbound Telegram message. Enforces allowlist. No token in errors."""
+    if not token:
+        raise ValueError("TELEGRAM_BOT_TOKEN is not set")
+    if not chat_id:
+        raise ValueError("chat_id is required")
+    if not _allowed(chat_id, allowed):
+        raise PermissionError("chat_id not in TELEGRAM_ALLOWED_CHAT_IDS")
+    html = format_telegram_html(text, ())
+    return send_message(token, chat_id, html, parse_mode="HTML")
+
+
+def _download_telegram_file(token: str, file_id: str, dest_dir: Path) -> Path | None:
+    try:
+        info = _post_json(_api_url(token, "getFile"), {"file_id": file_id})
+        file_path = (info.get("result") or {}).get("file_path")
+        if not file_path:
+            return None
+        file_url = f"{API_BASE}/file/bot{token}/{file_path}"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        ext = Path(file_path).suffix or ".jpg"
+        target = dest_dir / f"photo_{int(time.time())}_{uuid.uuid4().hex[:6]}{ext}"
+        req = urllib.request.Request(file_url)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            target.write_bytes(resp.read())
+        return target
+    except Exception as exc:
+        log.warning("Failed to download photo %s: %s", file_id, exc)
+        return None
+
+
+def inbound_payload(result: LoopTurnResult) -> dict:
+    """Caller JSON: visible answer + humanized traces. No tokens, no raw CLI dump."""
+    _, err_traces = extract_traces(result.stderr or "")
+    traces: list[str] = []
+    seen: set[str] = set()
+    for raw in err_traces:
+        h = humanize_status(str(raw))
+        if h and h not in seen:
+            seen.add(h)
+            traces.append(h)
+    reply = visible_reply(result.reply or "", err_traces)
+    return {
+        "reply": reply,
+        "traces": traces,
+        "session": result.session,
+        "user_id": result.user_id,
+        "alias": result.alias,
+        "returncode": result.returncode,
+    }
+
+
+def handle_inbound_text(
+    *,
+    chat_id: int,
+    text: str,
+    config: RelayConfig,
+    on_turn: Callable[..., LoopTurnResult] | None = None,
+    user: str | None = None,
+) -> LoopTurnResult:
+    """Same Telegram lifecycle as a poll text update: thinking edit, then final."""
+    token = config.telegram_bot_token
+    if not token:
+        raise ValueError("TELEGRAM_BOT_TOKEN is not set")
+    loop_user = (user or str(chat_id)).strip() or str(chat_id)
+
+    thinking_msg = send_message(token, chat_id, status_html("thinking..."), parse_mode="HTML")
+    thinking_id = (thinking_msg.get("result") or {}).get("message_id") if isinstance(thinking_msg, dict) else None
+
+    last_status_time = [0.0]
+    last_status_val = [""]
+
+    def handle_status(status_text: str) -> None:
+        if not thinking_id:
+            return
+        cleaned = humanize_status(status_text)
+        if not cleaned or cleaned == last_status_val[0]:
+            return
+        now = time.monotonic()
+        if now - last_status_time[0] < 1.5:
+            return
+        last_status_time[0] = now
+        last_status_val[0] = cleaned
+        try:
+            edit_message(token, chat_id, thinking_id, status_html(cleaned), parse_mode="HTML")
+        except Exception:
+            pass
+
+    runner = on_turn or run_loop_turn
+    result = LoopTurnResult(reply="", session="", user_id="", alias="", returncode=1, stderr="")
+    try:
+        try:
+            result = runner(channel="telegram", user=loop_user, message=text, on_status=handle_status)
+        except TypeError:
+            result = runner(channel="telegram", user=loop_user, message=text)
+        _, err_traces = extract_traces(result.stderr or "")
+        if not (result.reply or "").strip() and result.returncode != 0:
+            log.error("Loop turn failed (rc=%d): %s", result.returncode, result.stderr)
+            err_msg = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else f"Code {result.returncode}"
+            reply_html = format_telegram_html(f"Turn failed ({err_msg}).", err_traces)
+        else:
+            reply_html = format_telegram_html(result.reply, err_traces)
+        if not _strip_html_tags(reply_html):
+            reply_html = format_telegram_html("", err_traces)
+    except Exception as exc:
+        log.exception("Loop turn error")
+        line = str(exc).splitlines()[0].strip() if str(exc).strip() else exc.__class__.__name__
+        if len(line) > 200:
+            line = line[:200] + "..."
+        reply_html = format_telegram_html(f"Turn error: {line}", ())
+        result = LoopTurnResult(
+            reply=f"Turn error: {line}",
+            session="",
+            user_id="",
+            alias="",
+            returncode=1,
+            stderr="",
+        )
+
+    if thinking_id:
+        try:
+            edit_message(token, chat_id, thinking_id, reply_html, parse_mode="HTML")
+            return result
+        except Exception:
+            pass
+    send_message(token, chat_id, reply_html, parse_mode="HTML")
+    return result
+
+
+def inject_text(
+    *,
+    chat_id: int,
+    text: str,
+    config: RelayConfig,
+    on_turn: Callable[..., LoopTurnResult] | None = None,
+    user: str | None = None,
+) -> LoopTurnResult:
+    """Allowlisted synthetic inbound: same handler as poll, plus caller payload."""
+    if not chat_id:
+        raise ValueError("chat_id is required")
+    if not _allowed(chat_id, config.telegram_allowed_chat_ids):
+        raise PermissionError("chat_id not in TELEGRAM_ALLOWED_CHAT_IDS")
+    stripped = (text or "").strip()
+    if not stripped:
+        raise ValueError("text is required")
+    return handle_inbound_text(
+        chat_id=chat_id,
+        text=stripped,
+        config=config,
+        on_turn=on_turn,
+        user=user or str(chat_id),
+    )
 
 
 def process_update(
@@ -85,28 +270,34 @@ def process_update(
     chat_id = int(chat.get("id") or 0)
     if not chat_id or not _allowed(chat_id, config.telegram_allowed_chat_ids):
         return
-    text = str(message.get("text") or "").strip()
-    if not text:
-        return
-    user = str((message.get("from") or {}).get("username") or chat_id)
+
+    text = str(message.get("text") or message.get("caption") or "").strip()
+    photo_list = message.get("photo") or []
+    image_path: str | None = None
     token = config.telegram_bot_token
+
+    if photo_list and isinstance(photo_list, list) and token:
+        largest = photo_list[-1]
+        file_id = largest.get("file_id") if isinstance(largest, dict) else None
+        if file_id:
+            override_home = os.environ.get("AGENTS_HOME")
+            inbox_dir = (Path(override_home) if override_home else (Path.home() / ".agents")) / "inbox"
+            saved = _download_telegram_file(token, file_id, inbox_dir)
+            if saved:
+                image_path = str(saved)
+
+    if not text and not image_path:
+        return
+
+    if not text and image_path:
+        text = f"[Photo received: {image_path}]"
+    elif image_path:
+        text = f"{text}\n\n[Photo attached: {image_path}]"
+
+    user = str((message.get("from") or {}).get("username") or chat_id)
     if not token:
         return
-
-    thinking_msg = send_message(token, chat_id, status_html("thinking..."), parse_mode="HTML")
-    thinking_id = (thinking_msg.get("result") or {}).get("message_id") if isinstance(thinking_msg, dict) else None
-
-    runner = on_turn or run_loop_turn
-    result = runner(channel="telegram", user=user, message=text)
-    reply_html = format_telegram_html(result.reply, ())
-
-    if thinking_id:
-        try:
-            edit_message(token, chat_id, thinking_id, reply_html, parse_mode="HTML")
-            return
-        except Exception:
-            pass
-    send_message(token, chat_id, reply_html, parse_mode="HTML")
+    handle_inbound_text(chat_id=chat_id, text=text, config=config, on_turn=on_turn, user=user)
 
 
 def telegram_poll_loop(

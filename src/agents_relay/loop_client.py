@@ -44,6 +44,20 @@ def parse_loop_stdout(stdout: str) -> dict[str, Any]:
     }
 
 
+_TIMEOUT_REPLY = "Turn stopped before a final answer."
+
+
+def _stopped(stderr: str) -> LoopTurnResult:
+    return LoopTurnResult(
+        reply=_TIMEOUT_REPLY,
+        session="",
+        user_id="",
+        alias="",
+        returncode=1,
+        stderr=stderr,
+    )
+
+
 def run_loop_turn(
     *,
     channel: str,
@@ -53,7 +67,8 @@ def run_loop_turn(
     session: str = "",
     user_id: str = "",
     new_session: bool = False,
-    timeout_sec: int = 600,
+    timeout_sec: int = 0,
+    on_status: Any = None,
 ) -> LoopTurnResult:
     cfg = config or RelayConfig.from_env()
     argv = list(cfg.loop_cmd)
@@ -79,19 +94,71 @@ def run_loop_turn(
     if new_session:
         argv.append("--new-session")
 
-    proc = subprocess.run(
+    wait = timeout_sec if timeout_sec and timeout_sec > 0 else None
+
+    if on_status is None:
+        try:
+            proc = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=wait,
+                shell=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            err = exc.stderr or ""
+            if isinstance(err, bytes):
+                err = err.decode("utf-8", errors="replace")
+            return _stopped(err)
+        parsed = parse_loop_stdout(proc.stdout or "")
+        return LoopTurnResult(
+            reply=parsed["reply"],
+            session=parsed["session"],
+            user_id=parsed["user_id"],
+            alias=parsed["alias"],
+            returncode=int(proc.returncode),
+            stderr=proc.stderr or "",
+        )
+
+    import threading
+
+    proc = subprocess.Popen(
         argv,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=timeout_sec,
-        shell=False,
+        bufsize=1,
     )
-    parsed = parse_loop_stdout(proc.stdout or "")
+    stderr_lines: list[str] = []
+
+    def _read_err() -> None:
+        if proc.stderr:
+            for line in proc.stderr:
+                stderr_lines.append(line)
+                s = line.strip()
+                if s and on_status:
+                    try:
+                        on_status(s)
+                    except Exception:
+                        pass
+
+    t = threading.Thread(target=_read_err, daemon=True)
+    t.start()
+    try:
+        stdout, _ = proc.communicate(timeout=wait)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        return _stopped("".join(stderr_lines))
+    finally:
+        t.join(timeout=2)
+
+    parsed = parse_loop_stdout(stdout or "")
     return LoopTurnResult(
         reply=parsed["reply"],
         session=parsed["session"],
         user_id=parsed["user_id"],
         alias=parsed["alias"],
         returncode=int(proc.returncode),
-        stderr=proc.stderr or "",
+        stderr="".join(stderr_lines),
     )

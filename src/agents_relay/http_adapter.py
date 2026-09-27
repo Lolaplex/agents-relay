@@ -1,4 +1,4 @@
-"""stdlib HTTP server for /v1/turn."""
+"""stdlib HTTP server for /v1/turn and /v1/inject."""
 
 from __future__ import annotations
 
@@ -46,20 +46,76 @@ class TurnHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args) -> None:
         log.info("%s - %s", self.address_string(), fmt % args)
 
+    def _read_json(self) -> dict | None:
+        length = int(self.headers.get("Content-Length") or "0")
+        raw = self.rfile.read(length).decode("utf-8", errors="replace")
+        try:
+            return json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            self.send_error(400, "invalid json")
+            return None
+
+    def _write_json(self, payload: dict, status: int) -> None:
+        data = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _handle_inject(self) -> None:
+        body = self._read_json()
+        if body is None:
+            return
+        raw_id = str(body.get("chat_id") or body.get("user") or "").strip()
+        text = str(body.get("text") or body.get("message") or "")
+        if not raw_id:
+            self.send_error(400, "chat_id is required")
+            return
+        try:
+            chat_id = int(raw_id)
+        except ValueError:
+            self.send_error(400, "chat_id must be numeric")
+            return
+        runner = (self.turn_hook.fn if self.turn_hook else None)
+        from .telegram_adapter import inbound_payload, inject_text
+
+        try:
+            result = inject_text(
+                chat_id=chat_id,
+                text=text,
+                config=self.config or RelayConfig.from_env(),
+                on_turn=runner,
+            )
+        except PermissionError as exc:
+            self.send_error(403, str(exc))
+            return
+        except ValueError as exc:
+            self.send_error(400, str(exc))
+            return
+        except Exception as exc:
+            log.exception("inject failed")
+            self.send_error(500, str(exc))
+            return
+        payload = inbound_payload(result)
+        self._write_json(payload, 200 if result.returncode == 0 else 502)
+
     def do_POST(self) -> None:
         path = self.path.rstrip("/")
+        if path == "/v1/inject":
+            if not _check_secret(self, self.relay_secret):
+                self.send_error(401, "unauthorized")
+                return
+            self._handle_inject()
+            return
         if path not in ("/v1/turn", "/v1/alert", "/webhook/alert"):
             self.send_error(404)
             return
         if not _check_secret(self, self.relay_secret):
             self.send_error(401, "unauthorized")
             return
-        length = int(self.headers.get("Content-Length") or "0")
-        raw = self.rfile.read(length).decode("utf-8", errors="replace")
-        try:
-            body = json.loads(raw) if raw else {}
-        except json.JSONDecodeError:
-            self.send_error(400, "invalid json")
+        body = self._read_json()
+        if body is None:
             return
         channel = str(body.get("channel") or ("webhook" if path != "/v1/turn" else "http"))
         user = str(body.get("user") or ("alert" if path != "/v1/turn" else "anonymous"))
@@ -87,10 +143,11 @@ class TurnHandler(BaseHTTPRequestHandler):
         notified = False
         if notify and self.config and self.config.telegram_bot_token and self.config.telegram_allowed_chat_ids:
             from .telegram_adapter import send_message
-            from .telegram_format import format_telegram_html
+            from .telegram_format import extract_traces, format_telegram_html
             try:
                 primary_chat = self.config.telegram_allowed_chat_ids[0]
-                html = format_telegram_html(result.reply, ())
+                _, err_traces = extract_traces(result.stderr or "")
+                html = format_telegram_html(result.reply, err_traces)
                 send_message(self.config.telegram_bot_token, primary_chat, html, parse_mode="HTML")
                 notified = True
             except Exception as exc:
@@ -104,12 +161,7 @@ class TurnHandler(BaseHTTPRequestHandler):
             "returncode": result.returncode,
             "notified": notified,
         }
-        data = json.dumps(payload).encode("utf-8")
-        self.send_response(200 if result.returncode == 0 else 502)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        self._write_json(payload, 200 if result.returncode == 0 else 502)
 
     def do_GET(self) -> None:
         if self.path.rstrip("/") in ("/health", "/"):
