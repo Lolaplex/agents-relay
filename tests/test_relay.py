@@ -174,7 +174,7 @@ class TestHttpTurn(unittest.TestCase):
             "message": {
                 "chat": {"id": 12345},
                 "text": "test message",
-                "from": {"username": "felix"},
+                "from": {"username": "alice"},
             }
         }
         with patch("agents_relay.telegram_adapter.send_message", return_value={"result": {"message_id": 99}}) as mock_send:
@@ -186,7 +186,7 @@ class TestHttpTurn(unittest.TestCase):
                         reply="Echo: test message",
                         session="ses_123",
                         user_id="u_123",
-                        alias="telegram:felix",
+                        alias="telegram:alice",
                         returncode=0,
                         stderr="[*] Running 'mcp.terminal'...\n[+] 'mcp.terminal' OK (exit 0)",
                     )
@@ -250,8 +250,8 @@ class TestTelegramFormat(unittest.TestCase):
     def test_normal_json_in_text_preserved(self):
         from agents_relay.telegram_format import visible_reply
 
-        user_code = 'In Python kannst du ein Dict definieren: `{"user": "Felix", "score": 10}`.'
-        self.assertIn('{"user": "Felix", "score": 10}', visible_reply(user_code))
+        user_code = 'In Python kannst du ein Dict definieren: `{"user": "Alice", "score": 10}`.'
+        self.assertIn('{"user": "Alice", "score": 10}', visible_reply(user_code))
 
     def test_empty_with_traces_synthesizes_progress(self):
         from agents_relay.telegram_format import visible_reply
@@ -480,7 +480,7 @@ class TestTelegramAdapterResilience(unittest.TestCase):
             "message": {
                 "chat": {"id": 12345},
                 "caption": "Photo caption question",
-                "from": {"username": "felix"},
+                "from": {"username": "alice"},
             }
         }
         received_msg = []
@@ -521,7 +521,7 @@ class TestInject(unittest.TestCase):
             "message": {
                 "chat": {"id": 12345},
                 "text": "hello from poll",
-                "from": {"username": "felix"},
+                "from": {"username": "alice"},
             }
         }
         with patch(
