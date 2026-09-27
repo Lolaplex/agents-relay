@@ -30,28 +30,17 @@ Needs `runner.loop` on `PATH` (`LOOP_CMD`, default `python -m runner.loop`). Tha
 
 ## Architecture
 
-```
-+--------------------------+       +-------------------------+
-| Telegram Long-Poll       |       | HTTP Client / Webhook   |
-| (Bot API updates)        |       | (/v1/turn, /v1/inject)  |
-+------------+-------------+       +------------+------------+
-             |                                  |
-             +----------------+-----------------+
-                              |
-                              v
-                 +--------------------------+
-                 |   agents-relay (Server)  |
-                 |   - Auth / Allowlist     |
-                 |   - Buffered Subprocess  |
-                 |   - Stream Status / Edit |
-                 +-------------+------------+
-                               |
-                               v
-                 +--------------------------+
-                 |  agents-harness          |
-                 |  (runner.loop CLI)       |
-                 +--------------------------+
-```
+| Component | Responsibility |
+| :--- | :--- |
+| **HTTP Adapter** | Serves `/v1/turn` and `/v1/inject` endpoints with secret header validation |
+| **Telegram Adapter** | Long-poll bot updates with real-time thinking status edits |
+| **Loop Client** | Spawns buffered `runner.loop` subprocess per turn with trailer parsing |
+| **Outbound Send** | Direct Telegram push via `agents-relay send` for reminders and notifications |
+
+- **Subprocess Isolation**: One `runner.loop` process per request. No in-process LLM logic.
+- **Stateless Relay**: No identity storage, no traces, no local state under `~/.agents`.
+- **Streaming Status**: Throttled progress streaming and real-time status edits during long-running tool rounds.
+- **Zero Bloat**: Pure Python standard library (`http.server`, `urllib.request`, `subprocess`).
 
 ---
 
