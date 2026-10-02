@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Prevent race condition between stdout reader and stderr loop reader in `loop_client.run_loop_turn`.
+- Extract informative root exception line in `telegram_adapter` rather than truncated `Traceback (most recent call last):` header.
+
 ## [0.0.2] - 2026-09-27
 
 ### Added

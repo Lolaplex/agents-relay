@@ -201,7 +201,14 @@ def handle_inbound_text(
         _, err_traces = extract_traces(result.stderr or "")
         if not (result.reply or "").strip() and result.returncode != 0:
             log.error("Loop turn failed (rc=%d): %s", result.returncode, result.stderr)
-            err_msg = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else f"Code {result.returncode}"
+            err_lines = [l.strip() for l in (result.stderr or "").splitlines() if l.strip()]
+            err_msg = ""
+            for l in reversed(err_lines):
+                if l and not l.startswith("Traceback"):
+                    err_msg = l
+                    break
+            if not err_msg:
+                err_msg = err_lines[-1] if err_lines else f"Code {result.returncode}"
             reply_html = format_telegram_html(f"Turn failed ({err_msg}).", err_traces)
         else:
             reply_html = format_telegram_html(result.reply, err_traces)

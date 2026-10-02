@@ -142,16 +142,29 @@ def run_loop_turn(
                     except Exception:
                         pass
 
+    stdout_lines: list[str] = []
+
+    def _read_out() -> None:
+        if proc.stdout:
+            stdout_lines.append(proc.stdout.read())
+
+    out_t = threading.Thread(target=_read_out, daemon=True)
+    out_t.start()
     t = threading.Thread(target=_read_err, daemon=True)
     t.start()
     try:
-        stdout, _ = proc.communicate(timeout=wait)
+        proc.wait(timeout=wait)
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
+        t.join(timeout=1)
+        out_t.join(timeout=1)
         return _stopped("".join(stderr_lines))
     finally:
         t.join(timeout=2)
+        out_t.join(timeout=2)
+
+    stdout = "".join(stdout_lines)
 
     parsed = parse_loop_stdout(stdout or "")
     return LoopTurnResult(
