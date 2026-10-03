@@ -294,16 +294,61 @@ class TestTelegramFormat(unittest.TestCase):
     def test_failure_notes_humanized_not_cli(self):
         from agents_relay.telegram_format import format_telegram_html
 
-        raw = (
+        # When body is present, intermediate failures are suppressed from the final message
+        raw_with_body = (
             "[*] Running 'tool' (check <stdin> & <stdout>)...\n"
             "[-] 'mcp.memory.add' FAILED: expected exit 0, got 2\n"
             "Done!"
         )
-        formatted = format_telegram_html(raw)
-        self.assertNotIn("<blockquote expandable><b>tools</b>", formatted)
-        self.assertNotIn("[*] Running", formatted)
-        self.assertIn("Memory fehlgeschlagen (exit 2).", formatted)
+        formatted = format_telegram_html(raw_with_body)
+        self.assertNotIn("Memory fehlgeschlagen", formatted)
         self.assertIn("Done!", formatted)
+
+        # When NO body is present, fallback humanized failure is preserved
+        raw_no_body = (
+            "[*] Running 'tool' (check <stdin> & <stdout>)...\n"
+            "[-] 'mcp.memory.add' FAILED: expected exit 0, got 2\n"
+        )
+        formatted_no_body = format_telegram_html(raw_no_body)
+        self.assertIn("Memory fehlgeschlagen (exit 2).", formatted_no_body)
+
+    def test_new_and_reset_command_forwards_new_session(self):
+        from agents_relay.loop_client import LoopTurnResult
+        from agents_relay.telegram_adapter import handle_inbound_text
+
+        cfg = RelayConfig(
+            loop_cmd=("python", "-m", "runner.loop"),
+            loop_provider="echo",
+            relay_secret="",
+            telegram_bot_token="fake_bot_token",
+            telegram_allowed_chat_ids=(12345,),
+            relay_host="127.0.0.1",
+            relay_port=8787,
+            telegram_poll_timeout=1,
+        )
+        recorded = []
+
+        def fake_turn(*args, **kwargs):
+            recorded.append(kwargs)
+            return LoopTurnResult(
+                reply="Neu gestartet.",
+                session="ses_new",
+                user_id="u_1",
+                alias="telegram:12345",
+                returncode=0,
+                stderr="",
+            )
+
+        with patch("agents_relay.telegram_adapter.send_message", return_value={"ok": True}):
+            handle_inbound_text(chat_id=12345, text="/new", config=cfg, on_turn=fake_turn)
+            handle_inbound_text(chat_id=12345, text="/reset Start working", config=cfg, on_turn=fake_turn)
+
+        self.assertEqual(len(recorded), 2)
+        self.assertTrue(recorded[0]["new_session"])
+        self.assertEqual(recorded[0]["message"], "Hallo")
+        self.assertTrue(recorded[1]["new_session"])
+        self.assertEqual(recorded[1]["message"], "Start working")
+
 
     def test_humanize_status_calendar_progress(self):
         from agents_relay.telegram_format import humanize_status, status_html

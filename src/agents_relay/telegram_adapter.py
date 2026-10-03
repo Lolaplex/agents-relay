@@ -191,13 +191,24 @@ def handle_inbound_text(
         except Exception:
             pass
 
+    raw_lower = (text or "").strip().lower()
+    is_new = raw_lower in ("/new", "/reset") or raw_lower.startswith(("/new ", "/reset "))
+    turn_text = text
+    if is_new:
+        turn_text = re.sub(r"^/(new|reset)\s*", "", text, flags=re.IGNORECASE).strip()
+        if not turn_text:
+            turn_text = "Hallo"
+
     runner = on_turn or run_loop_turn
     result = LoopTurnResult(reply="", session="", user_id="", alias="", returncode=1, stderr="")
     try:
         try:
-            result = runner(channel="telegram", user=loop_user, message=text, on_status=handle_status)
+            result = runner(channel="telegram", user=loop_user, message=turn_text, new_session=is_new, on_status=handle_status)
         except TypeError:
-            result = runner(channel="telegram", user=loop_user, message=text)
+            try:
+                result = runner(channel="telegram", user=loop_user, message=turn_text, new_session=is_new)
+            except TypeError:
+                result = runner(channel="telegram", user=loop_user, message=turn_text)
         _, err_traces = extract_traces(result.stderr or "")
         if not (result.reply or "").strip() and result.returncode != 0:
             log.error("Loop turn failed (rc=%d): %s", result.returncode, result.stderr)

@@ -312,7 +312,7 @@ def format_telegram_html(answer: str, traces: tuple[str, ...] = ()) -> str:
         reply = fallback_from_traces(all_traces) if all_traces else "(leere Antwort)"
     reply = _transform_markdown_tables(reply)
     body = _light_md_html(reply)
-    extra = _failure_notes(all_traces) if had_body else ""
+    extra = _failure_notes(all_traces) if not had_body else ""
     out = body + extra
     if len(out) <= TG_LIMIT:
         return out
