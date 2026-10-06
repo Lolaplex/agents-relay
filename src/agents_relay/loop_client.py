@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from .config import RelayConfig
 
@@ -69,6 +70,8 @@ def run_loop_turn(
     new_session: bool = False,
     timeout_sec: int = 0,
     on_status: Any = None,
+    attachments: list[str] | None = None,
+    on_pid: Callable[[int], None] | None = None,
 ) -> LoopTurnResult:
     cfg = config or RelayConfig.from_env()
     argv = list(cfg.loop_cmd)
@@ -93,10 +96,13 @@ def run_loop_turn(
         argv.extend(["--user-id", user_id])
     if new_session:
         argv.append("--new-session")
+    for path in attachments or ():
+        if path:
+            argv.extend(["--attach", str(path)])
 
     wait = timeout_sec if timeout_sec and timeout_sec > 0 else None
 
-    if on_status is None:
+    if on_status is None and on_pid is None:
         try:
             proc = subprocess.run(
                 argv,
@@ -122,13 +128,24 @@ def run_loop_turn(
 
     import threading
 
+    popen_kwargs: dict[str, Any] = {}
+    if os.name != "nt":
+        # Own process group so /stop can kill the loop and its tool children
+        # without signaling the relay.
+        popen_kwargs["start_new_session"] = True
     proc = subprocess.Popen(
         argv,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
+        **popen_kwargs,
     )
+    if on_pid is not None and proc.pid:
+        try:
+            on_pid(int(proc.pid))
+        except Exception:
+            pass
     stderr_lines: list[str] = []
 
     def _read_err() -> None:
@@ -155,14 +172,26 @@ def run_loop_turn(
     try:
         proc.wait(timeout=wait)
     except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
+        from .jobs import kill_process_tree
+
+        kill_process_tree(proc.pid)
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            proc.kill()
+            proc.wait()
         t.join(timeout=1)
         out_t.join(timeout=1)
         return _stopped("".join(stderr_lines))
     finally:
         t.join(timeout=2)
         out_t.join(timeout=2)
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
 
     stdout = "".join(stdout_lines)
 

@@ -8,7 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `agents-relay approve --user <chat_id> --timeout N` reads a tool-approval JSON object on stdin, sends a Telegram Approve/Deny keyboard, and exits 0/1/2. The poll loop answers `callback_query` and writes `$AGENTS_RELAY_STATE/approvals/<id>.json`. Only allowlisted users can decide.
+- Telegram updates run on worker threads. Each chat can run up to `AGENTS_RELAY_MAX_JOBS_PER_CHAT` turns (default 3) and queues the rest. `/jobs`, `/stop`, and `/stop <id>` list and kill those process groups. The thinking-status edit is unchanged.
+- Long Telegram replies are split at paragraph boundaries into valid HTML messages instead of being cut at 4096 characters.
+- Telegram photos and documents, and `/v1/turn` `attachments` (`path` or `http(s)` `url` plus `mime`), are passed to `runner.loop` as repeatable `--attach`.
 - Handle `/new` and `/reset` commands in Telegram adapter to start fresh sessions (`new_session=True`).
+
+### Changed
+- The Telegram adapter refuses to start when `TELEGRAM_ALLOWED_CHAT_IDS` is empty unless `AGENTS_RELAY_ALLOW_ANYONE=1` (loud warning). Empty allowlists no longer mean "everyone".
+- Relay files live in `AGENTS_RELAY_STATE` (default `~/.agents-relay`). Nothing under `~/.agents`.
+- Telegram turns pass the numeric chat id as `runner.loop --user` so approval `{user}` substitution addresses that chat.
+- `approve` falls back to `AGENTS_RELAY_APPROVER`, or the single allowlisted chat, when `--user` is missing or not numeric. Otherwise it exits 2 with a JSON note.
+- Local `/v1/turn` attachment paths must resolve inside `AGENTS_RELAY_ATTACH_DIR` (default: relay state dir). `mime` sets the saved file extension.
 
 ### Fixed
 - Prevent race condition between stdout reader and stderr loop reader in `loop_client.run_loop_turn`.

@@ -124,17 +124,38 @@ class TurnHandler(BaseHTTPRequestHandler):
         user_id = str(body.get("user_id") or "")
         new_session = bool(body.get("new_session"))
         notify = bool(path in ("/v1/alert", "/webhook/alert") or body.get("notify") or body.get("broadcast"))
+        raw_attachments = body.get("attachments") or []
 
         runner = (self.turn_hook.fn if self.turn_hook else None) or run_loop_turn
+        turn_kwargs = {
+            "channel": channel,
+            "user": user,
+            "message": text,
+            "session": session,
+            "user_id": user_id,
+            "new_session": new_session,
+        }
+        if raw_attachments:
+            from .attachments import AttachmentRejected, allowed_attach_root, materialize_attachments
+            from .state import inbox_dir
+
+            try:
+                turn_kwargs["attachments"] = materialize_attachments(
+                    raw_attachments,
+                    inbox_dir(self.config),
+                    allowed_root=allowed_attach_root(self.config),
+                )
+            except AttachmentRejected:
+                self.send_error(400, "attachment path outside allowed directory")
+                return
         try:
-            result = runner(
-                channel=channel,
-                user=user,
-                message=text,
-                session=session,
-                user_id=user_id,
-                new_session=new_session,
-            )
+            try:
+                result = runner(**turn_kwargs)
+            except TypeError:
+                if "attachments" not in turn_kwargs:
+                    raise
+                turn_kwargs.pop("attachments", None)
+                result = runner(**turn_kwargs)
         except Exception as exc:
             log.exception("turn failed")
             self.send_error(500, str(exc))
@@ -142,13 +163,13 @@ class TurnHandler(BaseHTTPRequestHandler):
 
         notified = False
         if notify and self.config and self.config.telegram_bot_token and self.config.telegram_allowed_chat_ids:
-            from .telegram_adapter import send_message
+            from .telegram_adapter import deliver_html
             from .telegram_format import extract_traces, format_telegram_html
             try:
                 primary_chat = self.config.telegram_allowed_chat_ids[0]
                 _, err_traces = extract_traces(result.stderr or "")
                 html = format_telegram_html(result.reply, err_traces)
-                send_message(self.config.telegram_bot_token, primary_chat, html, parse_mode="HTML")
+                deliver_html(self.config.telegram_bot_token, primary_chat, html)
                 notified = True
             except Exception as exc:
                 log.warning("failed to broadcast notification to telegram: %s", exc)
