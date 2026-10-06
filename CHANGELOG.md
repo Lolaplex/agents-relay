@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Telegram turns pass the numeric chat id as `runner.loop --user` so approval `{user}` substitution addresses that chat.
 - `approve` falls back to `AGENTS_RELAY_APPROVER`, or the single allowlisted chat, when `--user` is missing or not numeric. Otherwise it exits 2 with a JSON note.
 - Local `/v1/turn` attachment paths must resolve inside `AGENTS_RELAY_ATTACH_DIR` (default: relay state dir). `mime` sets the saved file extension.
+- CI is one job on every pull request and on manual dispatch: Ubuntu, Python 3.12, tests, then build and `twine check`. The merge notification workflows and the failure webhook job are removed.
 
 ### Fixed
 - Prevent race condition between stdout reader and stderr loop reader in `loop_client.run_loop_turn`.
