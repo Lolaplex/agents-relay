@@ -101,6 +101,7 @@ Telegram chats can send `/jobs`, `/stop`, and `/stop <id>` while `serve` is poll
 | `AGENTS_RELAY_ATTACH_DIR` | Only local `/v1/turn` attachment paths under this directory are accepted (default: the relay state dir) |
 | `AGENTS_RELAY_MAX_JOBS` | Global cap on parallel Telegram turns (default 8) |
 | `AGENTS_RELAY_MAX_JOBS_PER_CHAT` | Parallel turns per chat before extra messages queue (default 3, queue cap 20) |
+| `AGENTS_RELAY_WAIT_TEXT` | Telegram placeholder while a turn runs (default `One moment …`). Status and fallback lines are English |
 | `RELAY_HOST` / `RELAY_PORT` | Bind (default `127.0.0.1:8787`; `GATEWAY_HOST` / `GATEWAY_PORT` fallbacks) |
 | `TELEGRAM_POLL_TIMEOUT` | Long-poll seconds, clamped 1–50 (default 50) |
 
