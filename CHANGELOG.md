@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Long Telegram replies are split at paragraph boundaries into valid HTML messages instead of being cut at 4096 characters.
 - Telegram photos and documents, and `/v1/turn` `attachments` (`path` or `http(s)` `url` plus `mime`), are passed to `runner.loop` as repeatable `--attach`.
 - Handle `/new` and `/reset` commands in Telegram adapter to start fresh sessions (`new_session=True`).
+- CLI (and MCP, when present) check PyPI at most once per day for a newer release and print one stderr / tool-response line (`uv tool upgrade …`). Disabled with `AGENTS_NO_UPDATE_CHECK=1` or when `CI` is set; offline/timeout stays silent.
 
 ### Changed
 - The Telegram adapter refuses to start when `TELEGRAM_ALLOWED_CHAT_IDS` is empty unless `AGENTS_RELAY_ALLOW_ANYONE=1` (loud warning). Empty allowlists no longer mean "everyone".
