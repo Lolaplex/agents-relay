@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import re
 
 TG_LIMIT = 4096
@@ -30,24 +31,25 @@ _BLOB_KEYS = (
     '"arguments"',
 )
 _JOB_LABELS = {
-    "mcp.calendar.list": "Kalender",
-    "mcp.calendar.add": "Kalender",
-    "mcp.calendar.update": "Kalender",
-    "mcp.calendar.delete": "Kalender",
-    "mcp.calendar.calendars": "Kalender",
+    "mcp.calendar.list": "Calendar",
+    "mcp.calendar.add": "Calendar",
+    "mcp.calendar.update": "Calendar",
+    "mcp.calendar.delete": "Calendar",
+    "mcp.calendar.calendars": "Calendar",
     "mcp.memory.search": "Memory",
     "mcp.memory.add": "Memory",
     "mcp.docs.search": "Docs",
     "mcp.docs.write": "Docs",
     "mcp.terminal": "Terminal",
-    "mcp.schedule.add": "Erinnerung",
-    "mcp.schedule.list": "Erinnerungen",
-    "mcp.schedule.remove": "Erinnerung",
+    "mcp.schedule.add": "Reminder",
+    "mcp.schedule.list": "Reminders",
+    "mcp.schedule.remove": "Reminder",
     "mcp.browser": "Browser",
-    "list_catalog": "Katalog",
+    "list_catalog": "Catalog",
     "load_schema": "Schema",
     "call_job": "Job",
 }
+DEFAULT_WAIT_TEXT = "One moment …"
 _JOB_RE = re.compile(r"'([^']+)'")
 _RUNNING_RE = re.compile(r"^running\s+(.+?)(?:\.{3}|\u2026)$", re.I)
 _OK_RE = re.compile(r"^\[\+\]\s+'([^']+)'\s+OK\b", re.I)
@@ -58,6 +60,11 @@ _FAIL_RE = re.compile(
 _EXIT_RE = re.compile(r"got\s+(\d+)", re.I)
 _MACHINE_ONLY_RE = re.compile(r"^[\s\-_=*~.]{3,}$")
 _MARK_RE = re.compile("[\u2705\u2713\u2714\u2717\u2718\u274c]")
+
+
+def wait_text() -> str:
+    """Placeholder while a turn runs. ``AGENTS_RELAY_WAIT_TEXT`` overrides the English default."""
+    return os.environ.get("AGENTS_RELAY_WAIT_TEXT", "").strip() or DEFAULT_WAIT_TEXT
 
 
 def _looks_like_blob(text: str) -> bool:
@@ -145,7 +152,7 @@ def _job_label(job: str) -> str:
         return _JOB_LABELS[name]
     if name.startswith("mcp.") and "." in name:
         return name.rsplit(".", 1)[-1]
-    return name or "Schritt"
+    return name or "Step"
 
 
 def _job_from_running(payload: str) -> str:
@@ -167,7 +174,7 @@ def humanize_status(text: str) -> str:
     if s.startswith("CMD:") or s.startswith("STDERR:"):
         return ""
     if s in ("thinking...", "tools"):
-        return "Einen Moment …"
+        return wait_text()
     fail = _FAIL_RE.match(s)
     if fail:
         job, kind, detail = fail.group(1), fail.group(2).upper(), fail.group(3) or ""
@@ -177,14 +184,14 @@ def humanize_status(text: str) -> str:
             got = _EXIT_RE.search(detail)
             extra = f" (exit {got.group(1)})" if got else ""
         elif kind == "TIMEOUT":
-            extra = " (Timeout)"
+            extra = " (timeout)"
         elif detail.strip():
             extra = f" ({detail.strip()[:80]})"
-        return f"{lab} fehlgeschlagen{extra}."
+        return f"{lab} failed{extra}."
     ok = _OK_RE.match(s)
     if ok:
         job = ok.group(1)
-        return f"{_job_label(job)} fertig."
+        return f"{_job_label(job)} done."
     if s.startswith("[*] Running"):
         m = _JOB_RE.search(s)
         job = m.group(1) if m else ""
@@ -284,7 +291,7 @@ def fallback_from_traces(traces: tuple[str, ...]) -> str:
         seen.add(h)
         lines.append(h)
     if not lines:
-        return "Keine sichtbare Antwort."
+        return "No visible reply."
     return "\n".join(lines[-8:])
 
 
@@ -294,12 +301,12 @@ def visible_reply(text: str, traces: tuple[str, ...] = ()) -> str:
         return cleaned
     if traces:
         return fallback_from_traces(traces)
-    return "(leere Antwort)"
+    return "(empty reply)"
 
 
 def status_html(text: str) -> str:
-    plain = humanize_status(text) or "Einen Moment …"
-    plain = re.sub(r"[*_`]", "", plain).strip() or "Einen Moment …"
+    plain = humanize_status(text) or wait_text()
+    plain = re.sub(r"[*_`]", "", plain).strip() or wait_text()
     return f"<i>{html.escape(plain)}</i>"
 
 
@@ -309,7 +316,7 @@ def format_telegram_html(answer: str, traces: tuple[str, ...] = ()) -> str:
     had_body = bool(strip_model_dumps(cleaned_body).strip())
     reply = visible_reply(cleaned_body, all_traces)
     if not reply.strip():
-        reply = fallback_from_traces(all_traces) if all_traces else "(leere Antwort)"
+        reply = fallback_from_traces(all_traces) if all_traces else "(empty reply)"
     reply = _transform_markdown_tables(reply)
     body = _light_md_html(reply)
     extra = _failure_notes(all_traces) if not had_body else ""

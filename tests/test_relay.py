@@ -216,7 +216,7 @@ class TestTelegramFormat(unittest.TestCase):
         self.assertIn("<b>dev</b>", formatted)
         self.assertNotIn("<blockquote expandable><b>tools</b>", formatted)
         self.assertNotIn("[*] Running", formatted)
-        self.assertNotIn("(leere Antwort)", formatted)
+        self.assertNotIn("(empty reply)", formatted)
 
     def test_bracket_lists_not_stripped(self):
         from agents_relay.telegram_format import format_telegram_html
@@ -229,7 +229,7 @@ class TestTelegramFormat(unittest.TestCase):
         formatted = format_telegram_html(text)
         self.assertIn("[1] Option eins", formatted)
         self.assertIn("[2] Option zwei", formatted)
-        self.assertNotIn("(leere Antwort)", formatted)
+        self.assertNotIn("(empty reply)", formatted)
 
     def test_urls_with_query_params(self):
         from agents_relay.telegram_format import format_telegram_html
@@ -242,10 +242,10 @@ class TestTelegramFormat(unittest.TestCase):
         from agents_relay.telegram_format import visible_reply
 
         tool_json = '{"name": "call_job", "arguments": {"catalog": "mcp.memory.search", "query": "test"}}'
-        self.assertEqual(visible_reply(tool_json), "(leere Antwort)")
+        self.assertEqual(visible_reply(tool_json), "(empty reply)")
 
         tool_fenced = '```json\n{"tool_call": "search", "arguments": {"q": "test"}}\n```'
-        self.assertEqual(visible_reply(tool_fenced), "(leere Antwort)")
+        self.assertEqual(visible_reply(tool_fenced), "(empty reply)")
 
     def test_normal_json_in_text_preserved(self):
         from agents_relay.telegram_format import visible_reply
@@ -264,7 +264,7 @@ class TestTelegramFormat(unittest.TestCase):
         self.assertIn("Memory", out)
         self.assertNotEqual(out.strip(), "")
         self.assertNotEqual(out, "Fertig.")
-        self.assertEqual(visible_reply("", ()), "(leere Antwort)")
+        self.assertEqual(visible_reply("", ()), "(empty reply)")
 
     def test_long_message_budget(self):
         import re
@@ -309,7 +309,7 @@ class TestTelegramFormat(unittest.TestCase):
             "Done!"
         )
         formatted = format_telegram_html(raw_with_body)
-        self.assertNotIn("Memory fehlgeschlagen", formatted)
+        self.assertNotIn("Memory failed", formatted)
         self.assertIn("Done!", formatted)
 
         # When NO body is present, fallback humanized failure is preserved
@@ -318,7 +318,7 @@ class TestTelegramFormat(unittest.TestCase):
             "[-] 'mcp.memory.add' FAILED: expected exit 0, got 2\n"
         )
         formatted_no_body = format_telegram_html(raw_no_body)
-        self.assertIn("Memory fehlgeschlagen (exit 2).", formatted_no_body)
+        self.assertIn("Memory failed (exit 2).", formatted_no_body)
 
     def test_new_and_reset_command_forwards_new_session(self):
         from agents_relay.loop_client import LoopTurnResult
@@ -365,18 +365,22 @@ class TestTelegramFormat(unittest.TestCase):
             "[*] Running 'mcp.calendar.list' (rests on: agents-calendar CLI list "
             "VEVENTs; extra argv is --from/--to ISO; exit 0 = listed)..."
         )
-        self.assertEqual(humanize_status(running), "Kalender (mcp.calendar.list) …")
+        self.assertEqual(humanize_status(running), "Calendar (mcp.calendar.list) …")
         self.assertEqual(
             humanize_status("[+] 'mcp.calendar.list' OK (exit 0) in 2.21s"),
-            "Kalender fertig.",
+            "Calendar done.",
         )
         self.assertEqual(
             humanize_status("[-] 'mcp.memory.add' FAILED: expected exit 0, got 2"),
-            "Memory fehlgeschlagen (exit 2).",
+            "Memory failed (exit 2).",
         )
         self.assertEqual(humanize_status("CMD: python -m agents_calendar list"), "")
-        self.assertEqual(humanize_status("thinking..."), "Einen Moment …")
-        self.assertIn("Einen Moment", status_html("thinking..."))
+        with patch.dict("os.environ", {"AGENTS_RELAY_WAIT_TEXT": ""}):
+            self.assertEqual(humanize_status("thinking..."), "One moment …")
+            self.assertIn("One moment", status_html("thinking..."))
+        with patch.dict("os.environ", {"AGENTS_RELAY_WAIT_TEXT": "Einen Moment …"}):
+            self.assertEqual(humanize_status("thinking..."), "Einen Moment …")
+            self.assertEqual(status_html(""), "<i>Einen Moment …</i>")
         self.assertNotIn("[*]", status_html(running))
 
     def test_empty_final_never_whitespace(self):
@@ -390,8 +394,8 @@ class TestTelegramFormat(unittest.TestCase):
             ),
         )
         self.assertTrue(formatted.strip())
-        self.assertNotIn("(leere Antwort)", formatted)
-        self.assertIn("Kalender", formatted)
+        self.assertNotIn("(empty reply)", formatted)
+        self.assertIn("Calendar", formatted)
 
     def test_long_body_not_truncated_for_traces(self):
         from agents_relay.telegram_format import format_telegram_html, TG_LIMIT
@@ -604,7 +608,7 @@ class TestInject(unittest.TestCase):
             if kwargs.get("on_status"):
                 kwargs["on_status"]("running mcp.calendar.list...")
             return LoopTurnResult(
-                reply="Kalender leer.",
+                reply="Calendar empty.",
                 session="ses_1",
                 user_id="u_1",
                 alias="telegram:12345",
@@ -621,12 +625,12 @@ class TestInject(unittest.TestCase):
                     chat_id=12345, text="was steht diese woche an?", config=cfg, on_turn=fake_turn
                 )
 
-        self.assertEqual(result.reply, "Kalender leer.")
+        self.assertEqual(result.reply, "Calendar empty.")
         self.assertEqual(seen[0]["channel"], "telegram")
         self.assertEqual(seen[0]["user"], "12345")
         mock_send.assert_called_once()
         self.assertGreaterEqual(mock_edit.call_count, 1)
-        self.assertIn("Kalender leer.", mock_edit.call_args[0][3])
+        self.assertIn("Calendar empty.", mock_edit.call_args[0][3])
 
     def test_inject_denylist(self):
         from agents_relay.telegram_adapter import inject_text
