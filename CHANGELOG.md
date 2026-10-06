@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Prevent race condition between stdout reader and stderr loop reader in `loop_client.run_loop_turn`.
 - Extract informative root exception line in `telegram_adapter` rather than truncated `Traceback (most recent call last):` header.
 - Suppress internal intermediate tool failure footnotes in Telegram formatting when the agent produces a valid final reply body.
+- `agents-relay serve` exits promptly on SIGTERM/SIGINT. The signal handler called `server.shutdown()` on the thread running `serve_forever()` and deadlocked, so `docker stop` waited for the kill timeout.
 
 ## [0.0.2] - 2026-09-27
 

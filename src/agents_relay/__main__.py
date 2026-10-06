@@ -7,6 +7,7 @@ import json
 import logging
 import signal
 import sys
+import threading
 
 from . import __version__
 from .approvals import resolve_approver_chat
@@ -184,12 +185,20 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_telegram and config.telegram_bot_token:
         tg_thread, tg_stop = start_telegram_thread(config)
 
+    stopping = threading.Event()
+
     def _shutdown(*_sig) -> None:
+        if stopping.is_set():
+            return
+        stopping.set()
         log.info("shutting down")
         if tg_stop is not None:
             tg_stop.set()
         shutdown_jobs()
-        server.shutdown()
+        # Signal handlers run on the main thread, which is inside serve_forever().
+        # server.shutdown() waits for serve_forever() to return, so calling it here
+        # would deadlock. Ask from another thread; serve_forever() exits within one poll.
+        threading.Thread(target=server.shutdown, name="relay-shutdown", daemon=True).start()
 
     signal.signal(signal.SIGINT, _shutdown)
     if hasattr(signal, "SIGTERM"):
