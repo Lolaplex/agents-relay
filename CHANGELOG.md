@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-06
+
 ### Added
 - `agents-relay approve --user <chat_id> --timeout N` reads a tool-approval JSON object on stdin, sends a Telegram Approve/Deny keyboard, and exits 0/1/2. The poll loop answers `callback_query` and writes `$AGENTS_RELAY_STATE/approvals/<id>.json`. Only allowlisted users can decide.
 - Telegram updates run on worker threads. Each chat can run up to `AGENTS_RELAY_MAX_JOBS_PER_CHAT` turns (default 3) and queues the rest. `/jobs`, `/stop`, and `/stop <id>` list and kill those process groups. The thinking-status edit is unchanged.
@@ -59,6 +61,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Buffered `runner.loop` subprocess with trailer parsing.
 - Telegram message lifecycle from `thinking...` to formatted HTML answer.
 
-[Unreleased]: https://github.com/Lolaplex/agents-relay/compare/v0.0.2...HEAD
+[Unreleased]: https://github.com/Lolaplex/agents-relay/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Lolaplex/agents-relay/compare/v0.0.2...v0.1.0
 [0.0.2]: https://github.com/Lolaplex/agents-relay/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/Lolaplex/agents-relay/releases/tag/v0.0.1
