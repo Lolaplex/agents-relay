@@ -7,11 +7,14 @@ import json
 import logging
 import signal
 import sys
+import threading
 
 from . import __version__
+from .approvals import resolve_approver_chat
 from .config import RelayConfig
 from .http_adapter import serve_http
-from .telegram_adapter import inbound_payload, inject_text, send_to_user, start_telegram_thread
+from .jobs import shutdown_jobs
+from .telegram_adapter import inbound_payload, inject_text, run_approve, send_to_user, start_telegram_thread
 
 log = logging.getLogger("agents_relay")
 
@@ -39,6 +42,7 @@ def _cmd_send(args: argparse.Namespace) -> int:
             chat_id=chat_id,
             text=str(args.text),
             allowed=config.telegram_allowed_chat_ids,
+            allow_anyone=config.allow_anyone,
         )
     except PermissionError as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -72,6 +76,37 @@ def _cmd_inject(args: argparse.Namespace) -> int:
     return 0 if result.returncode == 0 else 1
 
 
+def _cmd_approve(args: argparse.Namespace) -> int:
+    raw = sys.stdin.read()
+    try:
+        request = json.loads(raw) if raw.strip() else None
+    except json.JSONDecodeError:
+        print("Error: invalid JSON on stdin", file=sys.stderr)
+        return 2
+    if not isinstance(request, dict):
+        print("Error: approval request must be a JSON object", file=sys.stderr)
+        return 2
+    config = RelayConfig.from_env()
+    raw_user = str(getattr(args, "user", "") or getattr(args, "chat_id", "") or "")
+    chat_id, why = resolve_approver_chat(
+        raw_user,
+        approver=config.approver,
+        allowed=config.telegram_allowed_chat_ids,
+    )
+    if chat_id is None:
+        print(json.dumps({"note": why}, ensure_ascii=False))
+        print(f"Error: {why}", file=sys.stderr)
+        return 2
+    code, note = run_approve(
+        chat_id=chat_id,
+        timeout=float(args.timeout),
+        request=request,
+        config=config,
+    )
+    print(json.dumps({"note": note}, ensure_ascii=False))
+    return code
+
+
 def _help_json() -> dict:
     return {
         "name": "agents-relay",
@@ -85,6 +120,10 @@ def _help_json() -> dict:
             "inject": {
                 "description": "Run one turn as an allowlisted Telegram chat (thinking edits + JSON reply)",
                 "flags": ["--user", "--chat-id", "--text"],
+            },
+            "approve": {
+                "description": "Ask an allowlisted Telegram chat to approve or deny a tool call (JSON on stdin)",
+                "flags": ["--user", "--chat-id", "--timeout"],
             },
         },
         "flags": ["--help-json"],
@@ -110,6 +149,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run one turn as an allowlisted Telegram chat (thinking edits + JSON reply)",
     )
     _add_chat_text_flags(inject_p)
+    approve_p = sub.add_parser("approve", help="Block until an allowlisted chat approves or denies")
+    approve_p.add_argument("--user", dest="user", default="", help="Target chat id")
+    approve_p.add_argument("--chat-id", dest="chat_id", default="", help="Alias for --user")
+    approve_p.add_argument("--timeout", type=float, default=300, help="Seconds to wait (default 300)")
     return parser
 
 
@@ -129,6 +172,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_send(args)
     if args.command == "inject":
         return _cmd_inject(args)
+    if args.command == "approve":
+        return _cmd_approve(args)
     if args.command != "serve":
         build_parser().print_help()
         return 0
@@ -140,11 +185,20 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_telegram and config.telegram_bot_token:
         tg_thread, tg_stop = start_telegram_thread(config)
 
+    stopping = threading.Event()
+
     def _shutdown(*_sig) -> None:
+        if stopping.is_set():
+            return
+        stopping.set()
         log.info("shutting down")
         if tg_stop is not None:
             tg_stop.set()
-        server.shutdown()
+        shutdown_jobs()
+        # Signal handlers run on the main thread, which is inside serve_forever().
+        # server.shutdown() waits for serve_forever() to return, so calling it here
+        # would deadlock. Ask from another thread; serve_forever() exits within one poll.
+        threading.Thread(target=server.shutdown, name="relay-shutdown", daemon=True).start()
 
     signal.signal(signal.SIGINT, _shutdown)
     if hasattr(signal, "SIGTERM"):

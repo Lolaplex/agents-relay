@@ -267,12 +267,20 @@ class TestTelegramFormat(unittest.TestCase):
         self.assertEqual(visible_reply("", ()), "(leere Antwort)")
 
     def test_long_message_budget(self):
-        from agents_relay.telegram_format import format_telegram_html
+        import re
+
+        from agents_relay.telegram_format import format_telegram_html, split_telegram_html, utf16_len
 
         long_text = "A" * 5000
         formatted = format_telegram_html(long_text)
-        self.assertLessEqual(len(formatted), 4096)
-        self.assertTrue(formatted.endswith("..."))
+        self.assertEqual(formatted.count("A"), 5000)
+        self.assertFalse(formatted.endswith("..."))
+        parts = split_telegram_html(formatted)
+        self.assertGreater(len(parts), 1)
+        for part in parts:
+            self.assertLessEqual(utf16_len(part), 4096)
+        joined = "".join(re.sub(r"<[^>]+>", "", part) for part in parts)
+        self.assertEqual(joined.count("A"), 5000)
 
     def test_html_entities_escaped_with_formatting(self):
         from agents_relay.telegram_format import format_telegram_html

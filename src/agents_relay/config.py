@@ -33,6 +33,10 @@ def _int_list(value: str) -> tuple[int, ...]:
     return tuple(out)
 
 
+def _flag(val: str) -> bool:
+    return _clean(val).lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class RelayConfig:
     loop_cmd: tuple[str, ...]
@@ -43,6 +47,12 @@ class RelayConfig:
     relay_host: str
     relay_port: int
     telegram_poll_timeout: int
+    allow_anyone: bool = False
+    state_dir: str = ""
+    max_jobs: int = 8
+    max_jobs_per_chat: int = 3
+    approver: str = ""
+    attach_dir: str = ""
 
     @classmethod
     def from_env(cls) -> "RelayConfig":
@@ -59,6 +69,12 @@ class RelayConfig:
             relay_host=_clean(os.environ.get("RELAY_HOST", os.environ.get("GATEWAY_HOST", "127.0.0.1"))) or "127.0.0.1",
             relay_port=_int(os.environ.get("RELAY_PORT", os.environ.get("GATEWAY_PORT", "8787")), 8787),
             telegram_poll_timeout=max(1, min(50, _int(os.environ.get("TELEGRAM_POLL_TIMEOUT", "50"), 50))),
+            allow_anyone=_flag(os.environ.get("AGENTS_RELAY_ALLOW_ANYONE", "")),
+            state_dir=_clean(os.environ.get("AGENTS_RELAY_STATE", "")),
+            max_jobs=max(1, _int(os.environ.get("AGENTS_RELAY_MAX_JOBS", "8"), 8)),
+            max_jobs_per_chat=max(1, _int(os.environ.get("AGENTS_RELAY_MAX_JOBS_PER_CHAT", "3"), 3)),
+            approver=_clean(os.environ.get("AGENTS_RELAY_APPROVER", "")),
+            attach_dir=_clean(os.environ.get("AGENTS_RELAY_ATTACH_DIR", "")),
         )
 
 
