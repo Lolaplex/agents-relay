@@ -34,6 +34,8 @@ def _cfg(
     allow_anyone: bool = False,
     max_jobs: int = 8,
     max_jobs_per_chat: int = 3,
+    approver: str = "",
+    attach_dir: str = "",
 ) -> RelayConfig:
     return RelayConfig(
         loop_cmd=(sys.executable, "-c", "print('skip')"),
@@ -48,6 +50,8 @@ def _cfg(
         state_dir=str(tmp),
         max_jobs=max_jobs,
         max_jobs_per_chat=max_jobs_per_chat,
+        approver=approver,
+        attach_dir=attach_dir,
     )
 
 
@@ -161,6 +165,8 @@ class TestAllowlistSafety(unittest.TestCase):
             "AGENTS_RELAY_STATE": "/tmp/relay-state",
             "AGENTS_RELAY_MAX_JOBS": "4",
             "AGENTS_RELAY_MAX_JOBS_PER_CHAT": "2",
+            "AGENTS_RELAY_APPROVER": "4242",
+            "AGENTS_RELAY_ATTACH_DIR": "/tmp/relay-attach",
             "TELEGRAM_ALLOWED_CHAT_IDS": "",
         }
         with patch.dict(os.environ, env, clear=False):
@@ -170,6 +176,8 @@ class TestAllowlistSafety(unittest.TestCase):
         self.assertEqual(cfg.max_jobs, 4)
         self.assertEqual(cfg.max_jobs_per_chat, 2)
         self.assertEqual(cfg.telegram_allowed_chat_ids, ())
+        self.assertEqual(cfg.approver, "4242")
+        self.assertEqual(cfg.attach_dir, "/tmp/relay-attach")
 
 
 class TestApproval(unittest.TestCase):
@@ -299,6 +307,50 @@ class TestApproval(unittest.TestCase):
             code, note = run_approve(chat_id=99, timeout=1, request=self._request(), config=cfg)
             self.assertEqual(code, 2)
             self.assertIn("allowlist", note)
+
+    def test_non_numeric_user_falls_back_to_approver_or_single_chat(self):
+        import io
+
+        from agents_relay.__main__ import main as relay_main
+        from agents_relay.approvals import resolve_approver_chat
+
+        chat, note = resolve_approver_chat("anonymous", approver="12345", allowed=(9, 8))
+        self.assertEqual(chat, 12345)
+        self.assertEqual(note, "")
+        chat, note = resolve_approver_chat("anonymous", approver="", allowed=(42,))
+        self.assertEqual(chat, 42)
+        self.assertEqual(note, "")
+        chat, note = resolve_approver_chat("12345", approver="99", allowed=(99,))
+        self.assertEqual(chat, 12345)
+        chat, note = resolve_approver_chat("anonymous", approver="", allowed=(1, 2))
+        self.assertIsNone(chat)
+        self.assertIn("AGENTS_RELAY_APPROVER", note)
+        chat, note = resolve_approver_chat("", approver="nope", allowed=(42,))
+        self.assertIsNone(chat)
+        self.assertIn("not a numeric chat id", note)
+
+        request = json.dumps(self._request())
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(Path(tmp), allowed=(7, 8), approver="7")
+            with patch("agents_relay.__main__.RelayConfig.from_env", return_value=cfg):
+                with patch("agents_relay.__main__.run_approve", return_value=(0, "approved")) as approved:
+                    with patch("sys.stdin", io.StringIO(request)):
+                        with patch("sys.stdout", io.StringIO()):
+                            rc = relay_main(["approve", "--user", "anonymous", "--timeout", "5"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(approved.call_args.kwargs["chat_id"], 7)
+
+            buf = io.StringIO()
+            denied_cfg = _cfg(Path(tmp), allowed=(7, 8), approver="")
+            with patch("agents_relay.__main__.RelayConfig.from_env", return_value=denied_cfg):
+                with patch("agents_relay.__main__.run_approve") as not_called:
+                    with patch("sys.stdin", io.StringIO(request)):
+                        with patch("sys.stdout", buf):
+                            rc = relay_main(["approve", "--user", "anonymous", "--timeout", "5"])
+            self.assertEqual(rc, 2)
+            not_called.assert_not_called()
+            self.assertIn("anonymous", buf.getvalue())
+            self.assertIn("AGENTS_RELAY_APPROVER", buf.getvalue())
 
 
 class TestConcurrency(unittest.TestCase):
@@ -668,6 +720,111 @@ class TestAttachmentsAndKill(unittest.TestCase):
                 self.assertEqual(saved.read_bytes(), b"hello-bytes")
                 self.assertTrue(str(saved).startswith(tmp))
                 self.assertEqual(saved.suffix, ".png")
+            finally:
+                server.shutdown()
+                thread.join(timeout=2)
+
+    def test_local_path_confined_and_mime_extension(self):
+        from agents_relay.attachments import AttachmentRejected, materialize_attachments
+
+        with tempfile.TemporaryDirectory() as root_s, tempfile.TemporaryDirectory() as other_s:
+            root = Path(root_s)
+            other = Path(other_s)
+            inbox = root / "inbox"
+            secret = other / "secret.txt"
+            secret.write_text("nope")
+            blob = root / "blob"
+            blob.write_bytes(b"img")
+            ready = root / "pic.png"
+            ready.write_bytes(b"png")
+            link = root / "linked.png"
+            link.symlink_to(secret)
+
+            with self.assertRaises(AttachmentRejected):
+                materialize_attachments(
+                    [{"path": str(secret), "mime": "text/plain"}],
+                    inbox,
+                    allowed_root=root,
+                )
+            with self.assertRaises(AttachmentRejected):
+                materialize_attachments([{"path": str(link)}], inbox, allowed_root=root)
+
+            copied = materialize_attachments(
+                [{"path": str(blob), "mime": "image/jpeg"}],
+                inbox,
+                allowed_root=root,
+            )
+            self.assertEqual(Path(copied[0]).suffix, ".jpg")
+            self.assertEqual(Path(copied[0]).read_bytes(), b"img")
+            self.assertTrue(Path(copied[0]).resolve().is_relative_to(inbox.resolve()))
+
+            kept = materialize_attachments(
+                [{"path": str(ready), "mime": "image/png"}],
+                inbox,
+                allowed_root=root,
+            )
+            self.assertEqual(Path(kept[0]).resolve(), ready.resolve())
+
+            cfg = _cfg(root, attach_dir=str(inbox))
+            seen: dict = {}
+
+            def turn(**kwargs):
+                seen.update(kwargs)
+                return _result("ok")
+
+            server = serve_http(cfg, on_turn=turn)
+            host, port = server.server_address
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                conn = HTTPConnection(host, port, timeout=5)
+                body = json.dumps({"text": "look", "attachments": [{"path": str(secret)}]})
+                conn.request(
+                    "POST",
+                    "/v1/turn",
+                    body=body,
+                    headers={"Content-Type": "application/json", "X-Relay-Secret": "expected"},
+                )
+                resp = conn.getresponse()
+                resp.read()
+                self.assertEqual(resp.status, 400)
+                self.assertEqual(seen, {})
+
+                inside = inbox / "ok.png"
+                inside.parent.mkdir(parents=True, exist_ok=True)
+                inside.write_bytes(b"ok")
+                conn = HTTPConnection(host, port, timeout=5)
+                body = json.dumps(
+                    {
+                        "text": "look",
+                        "attachments": [{"url": "https://example.com/file.txt", "mime": "image/webp"}],
+                    }
+                )
+
+                class FakeResp:
+                    def read(self, _n=None):
+                        if not hasattr(self, "_done"):
+                            self._done = True
+                            return b"webp-bytes"
+                        return b""
+
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *_a):
+                        return False
+
+                with patch("agents_relay.attachments.urllib.request.urlopen", return_value=FakeResp()):
+                    conn.request(
+                        "POST",
+                        "/v1/turn",
+                        body=body,
+                        headers={"Content-Type": "application/json", "X-Relay-Secret": "expected"},
+                    )
+                    self.assertEqual(conn.getresponse().status, 200)
+                saved = Path(seen["attachments"][0])
+                self.assertEqual(saved.suffix, ".webp")
+                self.assertEqual(saved.read_bytes(), b"webp-bytes")
             finally:
                 server.shutdown()
                 thread.join(timeout=2)

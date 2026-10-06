@@ -97,12 +97,16 @@ Telegram chats can send `/jobs`, `/stop`, and `/stop <id>` while `serve` is poll
 | `TELEGRAM_ALLOWED_CHAT_IDS` | Comma-separated numeric IDs. Empty refuses the Telegram adapter unless `AGENTS_RELAY_ALLOW_ANYONE=1` |
 | `AGENTS_RELAY_ALLOW_ANYONE` | `1` opts in to an empty allowlist. Logs a loud warning. Anyone who can message the bot can run turns and approve tools |
 | `AGENTS_RELAY_STATE` | Relay files (default `~/.agents-relay`). Approvals: `$AGENTS_RELAY_STATE/approvals/<id>.json`. Inbox: `.../inbox/` |
+| `AGENTS_RELAY_APPROVER` | Chat id used by `approve` when `--user` is missing or not numeric (HTTP turns often pass `anonymous`) |
+| `AGENTS_RELAY_ATTACH_DIR` | Only local `/v1/turn` attachment paths under this directory are accepted (default: the relay state dir) |
 | `AGENTS_RELAY_MAX_JOBS` | Global cap on parallel Telegram turns (default 8) |
 | `AGENTS_RELAY_MAX_JOBS_PER_CHAT` | Parallel turns per chat before extra messages queue (default 3, queue cap 20) |
 | `RELAY_HOST` / `RELAY_PORT` | Bind (default `127.0.0.1:8787`; `GATEWAY_HOST` / `GATEWAY_PORT` fallbacks) |
 | `TELEGRAM_POLL_TIMEOUT` | Long-poll seconds, clamped 1–50 (default 50) |
 
-`POST /v1/turn` accepts `attachments`: a list of `{"path": "/abs/file", "mime": "image/png"}` or `{"url": "https://...", "mime": "..."}`. `path` must already exist. `url` must be `http` or `https` and is downloaded into the relay inbox (20 MB cap). Each file is passed to the loop as `--attach`. Photos and documents from Telegram take the same path. The loop `--user` for a Telegram turn is the numeric chat id so `AGENTS_APPROVAL_CMD` can substitute `{user}`.
+`POST /v1/turn` accepts `attachments`: a list of `{"path": "/abs/file", "mime": "image/png"}` or `{"url": "https://...", "mime": "..."}`. A local `path` must already exist and must resolve inside `AGENTS_RELAY_ATTACH_DIR` (default: the relay state dir). Paths outside that directory are rejected with HTTP 400. `url` must be `http` or `https` and is downloaded into the relay inbox (20 MB cap). When `mime` is set, the saved file extension matches it (`image/jpeg` → `.jpg`) so the harness can infer the type. Each file is passed to the loop as `--attach`. Photos and documents from Telegram take the same `--attach` path. The loop `--user` for a Telegram turn is the numeric chat id so `AGENTS_APPROVAL_CMD` can substitute `{user}`.
+
+`approve --user` may be a non-numeric turn id (HTTP defaults to `anonymous`). Then the prompt goes to `AGENTS_RELAY_APPROVER`, or to the only entry in `TELEGRAM_ALLOWED_CHAT_IDS` when that list has exactly one chat. Otherwise approve exits 2 and prints `{"note":"..."}`. A numeric `--user` is used as given.
 
 `approve` and `serve` must share `AGENTS_RELAY_STATE` on the same host. The poll loop answers `callback_query` and writes the decision. Only allowlisted user ids can press Approve or Deny. In a private chat that id is the chat id. In a group, list both the group chat id and the approving user id.
 

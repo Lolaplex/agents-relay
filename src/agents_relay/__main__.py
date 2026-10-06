@@ -9,6 +9,7 @@ import signal
 import sys
 
 from . import __version__
+from .approvals import resolve_approver_chat
 from .config import RelayConfig
 from .http_adapter import serve_http
 from .jobs import shutdown_jobs
@@ -84,10 +85,17 @@ def _cmd_approve(args: argparse.Namespace) -> int:
     if not isinstance(request, dict):
         print("Error: approval request must be a JSON object", file=sys.stderr)
         return 2
-    chat_id = _chat_id_from_args(args)
-    if chat_id is None:
-        return 2
     config = RelayConfig.from_env()
+    raw_user = str(getattr(args, "user", "") or getattr(args, "chat_id", "") or "")
+    chat_id, why = resolve_approver_chat(
+        raw_user,
+        approver=config.approver,
+        allowed=config.telegram_allowed_chat_ids,
+    )
+    if chat_id is None:
+        print(json.dumps({"note": why}, ensure_ascii=False))
+        print(f"Error: {why}", file=sys.stderr)
+        return 2
     code, note = run_approve(
         chat_id=chat_id,
         timeout=float(args.timeout),

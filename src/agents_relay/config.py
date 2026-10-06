@@ -51,6 +51,8 @@ class RelayConfig:
     state_dir: str = ""
     max_jobs: int = 8
     max_jobs_per_chat: int = 3
+    approver: str = ""
+    attach_dir: str = ""
 
     @classmethod
     def from_env(cls) -> "RelayConfig":
@@ -71,6 +73,8 @@ class RelayConfig:
             state_dir=_clean(os.environ.get("AGENTS_RELAY_STATE", "")),
             max_jobs=max(1, _int(os.environ.get("AGENTS_RELAY_MAX_JOBS", "8"), 8)),
             max_jobs_per_chat=max(1, _int(os.environ.get("AGENTS_RELAY_MAX_JOBS_PER_CHAT", "3"), 3)),
+            approver=_clean(os.environ.get("AGENTS_RELAY_APPROVER", "")),
+            attach_dir=_clean(os.environ.get("AGENTS_RELAY_ATTACH_DIR", "")),
         )
 
 

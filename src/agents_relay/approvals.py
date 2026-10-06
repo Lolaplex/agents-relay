@@ -196,6 +196,42 @@ def wait_for_decision(
     return _TIMEOUT, "timeout"
 
 
+def resolve_approver_chat(
+    raw_user: str,
+    *,
+    approver: str = "",
+    allowed: tuple[int, ...] = (),
+) -> tuple[int | None, str]:
+    """Pick the Telegram chat that should receive an approval prompt.
+
+    A numeric `--user` wins. Otherwise use `AGENTS_RELAY_APPROVER`, then the
+    sole allowlisted chat. Anything else is unavailable (caller exits 2).
+    """
+    text = (raw_user or "").strip()
+    if text:
+        try:
+            return int(text), ""
+        except ValueError:
+            pass
+    configured = (approver or "").strip()
+    if configured:
+        try:
+            return int(configured), ""
+        except ValueError:
+            return None, "AGENTS_RELAY_APPROVER is not a numeric chat id"
+    if len(allowed) == 1:
+        return int(allowed[0]), ""
+    if text:
+        return None, (
+            f"user {text!r} is not a numeric chat id; "
+            "set AGENTS_RELAY_APPROVER or allow exactly one chat in TELEGRAM_ALLOWED_CHAT_IDS"
+        )
+    return None, (
+        "no numeric approver; set AGENTS_RELAY_APPROVER "
+        "or allow exactly one chat in TELEGRAM_ALLOWED_CHAT_IDS"
+    )
+
+
 def status_exit_code(status: str) -> int:
     if status == _APPROVED:
         return 0

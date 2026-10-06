@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The Telegram adapter refuses to start when `TELEGRAM_ALLOWED_CHAT_IDS` is empty unless `AGENTS_RELAY_ALLOW_ANYONE=1` (loud warning). Empty allowlists no longer mean "everyone".
 - Relay files live in `AGENTS_RELAY_STATE` (default `~/.agents-relay`). Nothing under `~/.agents`.
 - Telegram turns pass the numeric chat id as `runner.loop --user` so approval `{user}` substitution addresses that chat.
+- `approve` falls back to `AGENTS_RELAY_APPROVER`, or the single allowlisted chat, when `--user` is missing or not numeric. Otherwise it exits 2 with a JSON note.
+- Local `/v1/turn` attachment paths must resolve inside `AGENTS_RELAY_ATTACH_DIR` (default: relay state dir). `mime` sets the saved file extension.
 
 ### Fixed
 - Prevent race condition between stdout reader and stderr loop reader in `loop_client.run_loop_turn`.

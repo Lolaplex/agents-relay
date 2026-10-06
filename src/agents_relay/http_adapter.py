@@ -136,13 +136,18 @@ class TurnHandler(BaseHTTPRequestHandler):
             "new_session": new_session,
         }
         if raw_attachments:
-            from .attachments import materialize_attachments
+            from .attachments import AttachmentRejected, allowed_attach_root, materialize_attachments
             from .state import inbox_dir
 
-            turn_kwargs["attachments"] = materialize_attachments(
-                raw_attachments,
-                inbox_dir(self.config),
-            )
+            try:
+                turn_kwargs["attachments"] = materialize_attachments(
+                    raw_attachments,
+                    inbox_dir(self.config),
+                    allowed_root=allowed_attach_root(self.config),
+                )
+            except AttachmentRejected:
+                self.send_error(400, "attachment path outside allowed directory")
+                return
         try:
             try:
                 result = runner(**turn_kwargs)
