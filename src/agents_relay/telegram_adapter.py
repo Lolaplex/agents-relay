@@ -194,6 +194,21 @@ def send_to_user(
     last: dict = {}
     for part in parts or ["(empty)"]:
         last = send_message(token, chat_id, part, parse_mode="HTML")
+    if (text or "").strip():
+        try:
+            from agents_traces.assemble import record_message
+            from agents_traces.identity import IdentityStore
+            resolved = IdentityStore().resolve(channel="telegram", user=str(chat_id), max_idle_hours=0)
+            record_message(
+                resolved.session.id,
+                "assistant",
+                str(text).strip(),
+                channel="telegram",
+                user=str(chat_id),
+                user_id=resolved.user.id,
+            )
+        except Exception:
+            pass
     return last
 
 
