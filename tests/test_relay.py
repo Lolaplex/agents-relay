@@ -738,6 +738,84 @@ class TestInject(unittest.TestCase):
         self.assertEqual(payload["reply"], "cli pong")
 
 
+    def test_v1_inject_webhook_query_auth_and_async(self):
+        import time
+        from agents_relay.loop_client import LoopTurnResult
+
+        cfg = self._cfg()
+        seen_messages = []
+
+        def fake_turn(**kwargs):
+            seen_messages.append(kwargs.get("message", ""))
+            return LoopTurnResult(
+                reply="diagnosed",
+                session="ses_w",
+                user_id="u_w",
+                alias="telegram:12345",
+                returncode=0,
+                stderr="",
+            )
+
+        server = serve_http(cfg, on_turn=fake_turn)
+        host, port = server.server_address
+        thread = __import__("threading").Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with patch(
+                "agents_relay.telegram_adapter.send_message",
+                return_value={"result": {"message_id": 1}},
+            ):
+                with patch("agents_relay.telegram_adapter.edit_message"):
+                    # 1. Query secret + omitted chat_id (falls back to primary allowlisted chat) + structured webhook JSON
+                    conn = HTTPConnection(host, port, timeout=5)
+                    webhook_body = json.dumps({
+                        "message": "Deployment failed",
+                        "event": "deployment_failed",
+                        "application_name": "demo-app",
+                        "url": "https://panel.example.com/deploy/1",
+                    })
+                    conn.request(
+                        "POST",
+                        "/v1/inject?secret=expected&prefix=Ops+Alert",
+                        body=webhook_body,
+                        headers={"Content-Type": "application/json"},
+                    )
+                    resp = conn.getresponse()
+                    self.assertEqual(resp.status, 200)
+                    data = json.loads(resp.read().decode())
+                    self.assertEqual(data["reply"], "diagnosed")
+                    self.assertEqual(len(seen_messages), 1)
+                    self.assertIn("Ops Alert", seen_messages[0])
+                    self.assertIn("Deployment failed", seen_messages[0])
+                    self.assertIn("application_name: demo-app", seen_messages[0])
+
+                    # 2. Async mode (?async=1) returns 202 immediately and runs on worker thread
+                    conn = HTTPConnection(host, port, timeout=5)
+                    conn.request(
+                        "POST",
+                        "/v1/inject?async=1",
+                        body=json.dumps({"message": "Container restarted", "service": "api"}),
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": "Bearer expected",
+                        },
+                    )
+                    resp2 = conn.getresponse()
+                    self.assertEqual(resp2.status, 202)
+                    data2 = json.loads(resp2.read().decode())
+                    self.assertTrue(data2["queued"])
+                    self.assertEqual(data2["chat_id"], 12345)
+                    for _ in range(20):
+                        if len(seen_messages) >= 2:
+                            break
+                        time.sleep(0.05)
+                    self.assertEqual(len(seen_messages), 2)
+                    self.assertIn("service: api", seen_messages[1])
+        finally:
+            server.shutdown()
+            thread.join(timeout=2)
+
+
 if __name__ == "__main__":
     unittest.main()
 
