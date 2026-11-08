@@ -10,7 +10,7 @@ import sys
 import threading
 
 from . import __version__
-from .approvals import resolve_approver_chat
+from .approvals import decide_approval, resolve_approver_chat, run_local_approve
 from .client import GatewayClient
 from .config import RelayConfig
 from .http_adapter import serve_http
@@ -78,6 +78,19 @@ def _cmd_inject(args: argparse.Namespace) -> int:
 
 
 def _cmd_approve(args: argparse.Namespace) -> int:
+    config = RelayConfig.from_env()
+    decide_id = str(getattr(args, "decide", "") or "").strip()
+    if decide_id:
+        if bool(getattr(args, "allow", False)) == bool(getattr(args, "deny", False)):
+            note = "pass exactly one of --allow or --deny"
+            print(json.dumps({"note": note}, ensure_ascii=False))
+            print(f"Error: {note}", file=sys.stderr)
+            return 2
+        code, note = decide_approval(config, decide_id, allow=bool(args.allow))
+        print(json.dumps({"note": note}, ensure_ascii=False))
+        if code != 0:
+            print(f"Error: {note}", file=sys.stderr)
+        return code
     raw = sys.stdin.read()
     try:
         request = json.loads(raw) if raw.strip() else None
@@ -87,7 +100,10 @@ def _cmd_approve(args: argparse.Namespace) -> int:
     if not isinstance(request, dict):
         print("Error: approval request must be a JSON object", file=sys.stderr)
         return 2
-    config = RelayConfig.from_env()
+    if getattr(args, "local", False):
+        code, note = run_local_approve(config, request, float(args.timeout))
+        print(json.dumps({"note": note}, ensure_ascii=False))
+        return code
     raw_user = str(getattr(args, "user", "") or getattr(args, "chat_id", "") or "")
     chat_id, why = resolve_approver_chat(
         raw_user,
@@ -123,8 +139,8 @@ def _help_json() -> dict:
                 "flags": ["--user", "--chat-id", "--text"],
             },
             "approve": {
-                "description": "Ask an allowlisted Telegram chat to approve or deny a tool call (JSON on stdin)",
-                "flags": ["--user", "--chat-id", "--timeout"],
+                "description": "Block until a tool call is approved or denied (JSON on stdin). --local waits on the approval file. --decide writes one decision.",
+                "flags": ["--user", "--chat-id", "--timeout", "--local", "--decide", "--allow", "--deny"],
             },
             "client": {
                 "description": "Smoke-test relay turn/stream/health",
@@ -154,10 +170,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run one turn as an allowlisted Telegram chat (thinking edits + JSON reply)",
     )
     _add_chat_text_flags(inject_p)
-    approve_p = sub.add_parser("approve", help="Block until an allowlisted chat approves or denies")
+    approve_p = sub.add_parser("approve", help="Block until an approval file is decided")
     approve_p.add_argument("--user", dest="user", default="", help="Target chat id")
     approve_p.add_argument("--chat-id", dest="chat_id", default="", help="Alias for --user")
     approve_p.add_argument("--timeout", type=float, default=300, help="Seconds to wait (default 300)")
+    approve_p.add_argument("--local", action="store_true", help="Wait on the approval file without Telegram")
+    approve_p.add_argument("--decide", default="", help="Resolve this pending id and exit")
+    approve_p.add_argument("--allow", action="store_true", help="With --decide, allow the tool")
+    approve_p.add_argument("--deny", action="store_true", help="With --decide, deny the tool")
     client_p = sub.add_parser("client", help="Relay client smoke tests")
     client_sub = client_p.add_subparsers(dest="client_cmd")
     turn_p = client_sub.add_parser("turn", help="POST /v1/turn")

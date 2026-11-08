@@ -271,6 +271,116 @@ class TestApproval(unittest.TestCase):
             self.assertEqual(read_approval(cfg, request["id"])["status"], "pending")
             self.assertEqual(posted.call_args[0][1]["text"], "Not allowed")
 
+    def test_local_file_allow_deny_and_timeout(self):
+        from agents_relay.approvals import decide_approval, run_local_approve
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(Path(tmp), token="")
+            request = self._request()
+            holder: dict[str, int | str] = {}
+
+            def _run() -> None:
+                code, note = run_local_approve(
+                    cfg, request, 5, poll_interval=0.05
+                )
+                holder["code"] = code
+                holder["note"] = note
+
+            thread = threading.Thread(target=_run)
+            thread.start()
+            path = Path(tmp) / "approvals" / f"{request['id']}.json"
+            deadline = time.time() + 2
+            while time.time() < deadline and not path.is_file():
+                time.sleep(0.02)
+            self.assertTrue(path.is_file())
+            code, note = decide_approval(cfg, request["id"], allow=True)
+            self.assertEqual((code, note), (0, "approved"))
+            thread.join(timeout=3)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(holder["code"], 0)
+            self.assertEqual(holder["note"], "approved")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(Path(tmp), token="")
+            request = dict(self._request())
+            request["id"] = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            holder = {}
+
+            def _deny() -> None:
+                code, note = run_local_approve(cfg, request, 5, poll_interval=0.05)
+                holder["code"] = code
+                holder["note"] = note
+
+            thread = threading.Thread(target=_deny)
+            thread.start()
+            path = Path(tmp) / "approvals" / f"{request['id']}.json"
+            deadline = time.time() + 2
+            while time.time() < deadline and not path.is_file():
+                time.sleep(0.02)
+            self.assertTrue(path.is_file())
+            self.assertEqual(decide_approval(cfg, request["id"], allow=False), (0, "denied"))
+            thread.join(timeout=3)
+            self.assertEqual(holder["code"], 1)
+            self.assertEqual(holder["note"], "denied")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(Path(tmp), token="")
+            code, note = run_local_approve(
+                cfg, self._request(), 0.2, poll_interval=0.05
+            )
+            self.assertEqual(code, 2)
+            self.assertEqual(note, "timeout")
+            self.assertEqual(decide_approval(cfg, "missing-id", allow=True)[0], 2)
+
+    def test_cli_local_decide(self):
+        request = {
+            "id": "cli-local-1",
+            "session": "ses_1",
+            "user": "local",
+            "tool": "mcp.terminal.run",
+            "args": {"cmd": "echo hi"},
+            "summary": "mcp.terminal.run cmd=echo hi",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            env = os.environ.copy()
+            env["AGENTS_RELAY_STATE"] = tmp
+            env["AGENTS_NO_UPDATE_CHECK"] = "1"
+            env.pop("TELEGRAM_BOT_TOKEN", None)
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "agents_relay", "approve", "--local", "--timeout", "5"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+                text=True,
+            )
+            out = ""
+            err = ""
+            try:
+                assert proc.stdin is not None
+                proc.stdin.write(json.dumps(request))
+                proc.stdin.close()
+                path = Path(tmp) / "approvals" / "cli-local-1.json"
+                deadline = time.time() + 3
+                while time.time() < deadline and not path.is_file():
+                    time.sleep(0.02)
+                self.assertTrue(path.is_file())
+                decided = subprocess.run(
+                    [sys.executable, "-m", "agents_relay", "approve", "--decide", "cli-local-1", "--deny"],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(decided.returncode, 0, decided.stderr)
+                out, err = proc.communicate(timeout=5)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=3)
+            self.assertEqual(proc.returncode, 1, err)
+            self.assertIn("denied", out)
+
     def test_timeout_exit_2(self):
         from agents_relay.telegram_adapter import run_approve
 
@@ -296,6 +406,8 @@ class TestApproval(unittest.TestCase):
         blob = json.dumps(_help_json())
         self.assertIn("approve", blob)
         self.assertIn("--timeout", blob)
+        self.assertIn("--local", blob)
+        self.assertIn("--decide", blob)
         with patch("sys.stdin", io.StringIO("not-json")):
             self.assertEqual(relay_main(["approve", "--user", "12345", "--timeout", "1"]), 2)
 

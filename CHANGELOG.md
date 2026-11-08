@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `agents-relay approve --local` waits on `$AGENTS_RELAY_STATE/approvals/<id>.json` without Telegram. `--decide <id> --allow` or `--deny` writes that same decision.
+
 ### Fixed
 - `POST /v1/stream` closes the HTTP connection after the trailer, so a client reading the event stream receives `delta` and `trailer` instead of waiting on keep-alive.
 
