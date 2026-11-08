@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#12100e">
+<title>Klanker</title>
+<link rel="manifest" href="manifest.webmanifest">
+<style>
+  :root { --bg:#12100e; --panel:#1c1915; --edge:#2e2820; --amber:#e8a020; --dim:#8a7f6d; --text:#e8e0d2; }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--text); font:15px/1.5 ui-monospace,Consolas,monospace;
+         height:100dvh; display:flex; flex-direction:column; }
+  header { padding:.7rem 1rem; border-bottom:1px solid var(--edge); display:flex; align-items:center; gap:.6rem; }
+  header .mark { color:var(--amber); font-weight:700; letter-spacing:.1em; }
+  header .host { color:var(--dim); font-size:.78rem; overflow:hidden; text-overflow:ellipsis; }
+  #dot { width:.55rem; height:.55rem; border-radius:50%; background:#555; margin-left:auto; flex:none; }
+  #dot.ok { background:var(--amber); } #dot.bad { background:#a33; }
+  #log { flex:1; overflow-y:auto; padding:1rem; display:flex; flex-direction:column; gap:.7rem; }
+  .msg { max-width:85%; padding:.55rem .8rem; border-radius:.5rem; white-space:pre-wrap; word-break:break-word; }
+  .msg.user { align-self:flex-end; background:var(--panel); border:1px solid var(--edge); }
+  .msg.bot { align-self:flex-start; border-left:2px solid var(--amber); background:transparent; }
+  .msg.err { align-self:center; color:#d77; font-size:.85rem; }
+  form { display:flex; gap:.5rem; padding:.7rem; border-top:1px solid var(--edge); }
+  input,button { font:inherit; background:var(--panel); color:var(--text); border:1px solid var(--edge);
+                 border-radius:.4rem; padding:.55rem .7rem; }
+  input { flex:1; min-width:0; }
+  button { color:var(--amber); cursor:pointer; flex:none; }
+  #secretbar { display:none; padding:.7rem 1rem; gap:.5rem; border-bottom:1px solid var(--edge); }
+  #secretbar.open { display:flex; }
+</style>
+</head>
+<body>
+<header>
+  <span class="mark">KLANKER</span>
+  <span class="host" id="host"></span>
+  <span id="dot"></span>
+</header>
+<div id="secretbar">
+  <input id="secret" type="password" placeholder="relay secret" autocomplete="off">
+  <button id="savesecret" type="button">save</button>
+</div>
+<div id="log"></div>
+<form id="f">
+  <input id="in" autocomplete="off" placeholder="message klanker…">
+  <button type="submit">send</button>
+</form>
+<script>
+const $ = (id) => document.getElementById(id);
+const S = {
+  get secret() { return localStorage.getItem("klanker.secret") || ""; },
+  set secret(v) { v ? localStorage.setItem("klanker.secret", v) : localStorage.removeItem("klanker.secret"); },
+  get session() { return localStorage.getItem("klanker.session") || ""; },
+  set session(v) { v ? localStorage.setItem("klanker.session", v) : localStorage.removeItem("klanker.session"); },
+  get uid() { return localStorage.getItem("klanker.uid") || ""; },
+  set uid(v) { v ? localStorage.setItem("klanker.uid", v) : localStorage.removeItem("klanker.uid"); },
+};
+$("host").textContent = location.host;
+$("secret").value = S.secret;
+if (!S.secret) $("secretbar").classList.add("open");
+$("savesecret").onclick = () => { S.secret = $("secret").value.trim(); $("secretbar").classList.remove("open"); ping(); };
+
+function say(cls, text) {
+  const d = document.createElement("div");
+  d.className = "msg " + cls; d.textContent = text;
+  $("log").appendChild(d); $("log").scrollTop = $("log").scrollHeight;
+  return d;
+}
+
+async function ping() {
+  try {
+    const r = await fetch("/health", { signal: AbortSignal.timeout(5000) });
+    const j = await r.json();
+    $("dot").className = j.ok ? "ok" : "bad";
+  } catch { $("dot").className = "bad"; }
+}
+setInterval(ping, 30000); ping();
+
+async function send(text) {
+  say("user", text);
+  const bubble = say("bot", "…");
+  const headers = { "Content-Type": "application/json" };
+  if (S.secret) headers["Authorization"] = "Bearer " + S.secret;
+  try {
+    const res = await fetch("/v1/stream", {
+      method: "POST", headers,
+      body: JSON.stringify({ text, channel: "pwa", user: "pwa",
+                             session: S.session, user_id: S.uid }),
+    });
+    if (res.status === 401) { bubble.remove(); say("err", "unauthorized — set the relay secret above"); $("secretbar").classList.add("open"); return; }
+    if (!res.ok || !res.body) { bubble.remove(); say("err", "relay " + res.status); return; }
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "", out = "";
+    bubble.textContent = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const chunk = buf.slice(0, i); buf = buf.slice(i + 2);
+        const data = chunk.split("\n").filter(l => l.startsWith("data:")).map(l => l.slice(5).trim()).join("");
+        if (!data) continue;
+        try {
+          const ev = JSON.parse(data);
+          if (ev.type === "delta" && ev.text) { out += ev.text; bubble.textContent = out; $("log").scrollTop = $("log").scrollHeight; }
+          else { if (ev.session) S.session = ev.session; if (ev.user_id) S.uid = ev.user_id; }
+        } catch { /* partial json */ }
+      }
+    }
+    if (!out) { bubble.remove(); say("err", "empty reply"); }
+  } catch (e) { bubble.remove(); say("err", "turn failed: " + e.message); }
+}
+
+$("f").onsubmit = (e) => { e.preventDefault(); const t = $("in").value.trim(); if (t) { $("in").value = ""; send(t); } };
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js", { scope: "./" }).catch(() => {});
+</script>
+</body>
+</html>

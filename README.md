@@ -104,6 +104,7 @@ Telegram chats can send `/jobs`, `/stop`, and `/stop <id>` while `serve` is poll
 | `AGENTS_RELAY_MAX_JOBS_PER_CHAT` | Parallel turns per chat before extra messages queue (default 3, queue cap 20) |
 | `AGENTS_RELAY_WAIT_TEXT` | Telegram placeholder while a turn runs (default `One moment …`). Status and fallback lines are English |
 | `RELAY_HOST` / `RELAY_PORT` | Bind (default `127.0.0.1:8787`; `GATEWAY_HOST` / `GATEWAY_PORT` fallbacks) |
+| `AGENTS_RELAY_WEB_DIR` | Static dir for `GET /app/` (default: bundled `agents_relay/web/` herd PWA) |
 | `TELEGRAM_POLL_TIMEOUT` | Long-poll seconds, clamped 1–50 (default 50) |
 
 `POST /v1/turn` accepts `attachments`: a list of `{"path": "/abs/file", "mime": "image/png"}` or `{"url": "https://...", "mime": "..."}`. A local `path` must already exist and must resolve inside `AGENTS_RELAY_ATTACH_DIR` (default: the relay state dir). Paths outside that directory are rejected with HTTP 400. `url` must be `http` or `https` and is downloaded into the relay inbox (20 MB cap). When `mime` is set, the saved file extension matches it (`image/jpeg` → `.jpg`) so the harness can infer the type. Each file is passed to the loop as `--attach`. Photos and documents from Telegram take the same `--attach` path. The loop `--user` for a Telegram turn is the numeric chat id so `AGENTS_APPROVAL_CMD` can substitute `{user}`.
@@ -121,6 +122,7 @@ HTTP secret headers supported: `X-Relay-Secret`, `Relay-Secret`, `X-Gateway-Secr
 | Route | Method | Purpose |
 |-------|--------|---------|
 | `/health`, `/` | GET | Liveness (`{"ok": true}`) |
+| `/app/` | GET | Static herd PWA (installable chat client, same-origin with `/v1/*`) |
 | `/v1/turn` | POST | Buffered turn JSON |
 | `/v1/stream` | POST | SSE token stream (`delta` + `trailer` events) |
 | `/v1/inject` | POST | Inject a turn into the Telegram chat flow (`?async=1` queues a job) |
