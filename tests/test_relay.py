@@ -220,6 +220,47 @@ class TestHttpTurn(unittest.TestCase):
             server.shutdown()
             server_thread.join(timeout=2)
 
+    def test_app_static_serving(self):
+        cfg = _test_config()
+        server = serve_http(cfg, on_turn=lambda **kw: None)
+        host, port = server.server_address  # type: ignore[misc]
+        server_thread = __import__("threading").Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        try:
+            conn = HTTPConnection(host, port, timeout=5)
+            conn.request("GET", "/app")
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 302)
+            self.assertEqual(resp.getheader("Location"), "/app/")
+            resp.read()
+
+            conn.request("GET", "/app/")
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            self.assertIn("text/html", resp.getheader("Content-Type"))
+            self.assertIn("KLANKER", resp.read().decode())
+
+            conn.request("GET", "/app/manifest.webmanifest")
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(resp.getheader("Content-Type"), "application/manifest+json")
+            resp.read()
+
+            conn.request("GET", "/app/sw.js")
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            resp.read()
+
+            # traversal must 404, never escape the web root
+            for bad in ("/app/../http_adapter.py", "/app/..%2F..%2Fpyproject.toml", "/app/nope.txt"):
+                conn.request("GET", bad)
+                resp = conn.getresponse()
+                self.assertEqual(resp.status, 404, bad)
+                resp.read()
+        finally:
+            server.shutdown()
+            server_thread.join(timeout=2)
+
     def test_process_update_edits_message(self):
         from agents_relay.telegram_adapter import process_update
         from agents_relay.loop_client import LoopTurnResult

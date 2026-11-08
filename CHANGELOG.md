@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `GET /app/` serves a bundled static herd PWA (installable chat client) same-origin with the API — a phone on the tailnet can pin `https://<node>.ts.net/app/` and talk to `/v1/*` with no cross-origin fetch and no CORS change. `/app` redirects to `/app/`; paths stay inside the web root. `AGENTS_RELAY_WEB_DIR` overrides the bundled dir. Static files stay public; `/v1/*` keeps the secret check.
+
 ## [0.1.1] - 2026-11-08
 
 ### Added

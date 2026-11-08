@@ -448,6 +448,29 @@ class TurnHandler(BaseHTTPRequestHandler):
         if path in ("/health", "/"):
             self._write_json({"ok": True}, 200)
             return
+        if path == "/app" or path.startswith("/app/"):
+            from .web import guess_type, resolve_app_path
+
+            # _parse_query strips trailing slashes; the raw path tells them apart.
+            # Relative asset URLs in the PWA need the /app/ base.
+            raw_path = urllib.parse.urlsplit(self.path).path
+            if raw_path == "/app":
+                self.send_response(302)
+                self.send_header("Location", "/app/")
+                self.end_headers()
+                return
+            target = resolve_app_path(raw_path)
+            if target is None:
+                self.send_error(404)
+                return
+            data = target.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", guess_type(target))
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-cache" if target.name == "index.html" else "max-age=3600")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if path == "/v1/a2a/peers":
             if not _check_secret(self, self.relay_secret, query_params):
                 self.send_error(401, "unauthorized")
