@@ -407,7 +407,8 @@ class TurnHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
+        # keep-alive makes BaseHTTPRequestHandler wait for another request, so the body never ends.
+        self.send_header("Connection", "close")
         self.end_headers()
         try:
             for event in iter_loop_stream(params, config=self._cfg()):
