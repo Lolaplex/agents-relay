@@ -1,8 +1,9 @@
-"""Telegram approval gate. Decision files live under the relay state dir.
+"""Approval files under the relay state dir.
 
 `agents-relay approve` writes `$AGENTS_RELAY_STATE/approvals/<id>.json` and
-blocks. The serve poll loop records the inline-keyboard decision into that
-file. Both processes must share the state dir (same host). No HTTP endpoint.
+blocks. Telegram inline buttons and `approve --decide` both call
+`record_decision`. `--local` skips Telegram and waits on that same file.
+No HTTP endpoint.
 """
 
 from __future__ import annotations
@@ -238,3 +239,48 @@ def status_exit_code(status: str) -> int:
     if status == _DENIED:
         return 1
     return 2
+
+
+def run_local_approve(
+    config: RelayConfig,
+    request: dict,
+    timeout: float,
+    *,
+    poll_interval: float = 0.2,
+) -> tuple[int, str]:
+    """Write the pending file and block. No Telegram. Exit 0, 1, or 2."""
+    ident = str(request.get("id") or "").strip()
+    if not APPROVAL_ID_RE.match(ident):
+        return 2, "invalid approval id"
+    existing = read_approval(config, ident)
+    if existing and existing.get("status") == _APPROVED:
+        return 0, str(existing.get("note") or "approved")
+    if existing and existing.get("status") == _DENIED:
+        return 1, str(existing.get("note") or "denied")
+    create_pending(config, 0, request)
+    status, note = wait_for_decision(
+        config,
+        ident,
+        float(timeout),
+        poll_interval=poll_interval,
+    )
+    return status_exit_code(status), note or status
+
+
+def decide_approval(config: RelayConfig, ident: str, *, allow: bool) -> tuple[int, str]:
+    """Write one decision. 0 when the file was pending, 2 when it was not."""
+    ident = (ident or "").strip()
+    if not APPROVAL_ID_RE.match(ident):
+        return 2, "invalid approval id"
+    status = _APPROVED if allow else _DENIED
+    updated = record_decision(
+        config,
+        ident,
+        status=status,
+        note=status,
+        decided_by=None,
+        expected_chat_id=None,
+    )
+    if updated is None:
+        return 2, "not pending"
+    return 0, status
