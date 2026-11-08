@@ -7,11 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-08
+
 ### Added
 - `agents-relay approve --local` waits on `$AGENTS_RELAY_STATE/approvals/<id>.json` without Telegram. `--decide <id> --allow` or `--deny` writes that same decision.
 
 ### Fixed
 - `POST /v1/stream` closes the HTTP connection after the trailer, so a client reading the event stream receives `delta` and `trailer` instead of waiting on keep-alive.
+- `LOOP_CMD` splits with the platform's quoting rules, and the value is no longer quote-stripped at both ends. A quoted program path such as `C:\Program Files\Python\python.exe` survives on Windows.
 
 ## [0.1.0] - 2026-10-06
 
@@ -69,7 +72,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Buffered `runner.loop` subprocess with trailer parsing.
 - Telegram message lifecycle from `thinking...` to formatted HTML answer.
 
-[Unreleased]: https://github.com/Lolaplex/agents-relay/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Lolaplex/agents-relay/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/Lolaplex/agents-relay/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Lolaplex/agents-relay/compare/v0.0.2...v0.1.0
 [0.0.2]: https://github.com/Lolaplex/agents-relay/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/Lolaplex/agents-relay/releases/tag/v0.0.1
