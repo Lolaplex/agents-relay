@@ -22,6 +22,23 @@ from agents_relay.loop_client import LoopTurnResult
 from agents_relay.telegram_format import split_telegram_html, utf16_len
 
 
+def _can_symlink() -> bool:
+    """Windows needs Developer Mode or admin for symlinks (WinError 1314)."""
+    if getattr(os, "symlink", None) is None:
+        return False
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        try:
+            os.symlink(tmp / "a", tmp / "b")
+        except (OSError, NotImplementedError):
+            return False
+    return True
+
+
+_SYMLINK_OK = _can_symlink()
+_SYMLINK_SKIP = "os.symlink unavailable (Windows needs Developer Mode or admin; WinError 1314)"
+
+
 def _result(reply: str = "ok") -> LoopTurnResult:
     return LoopTurnResult(reply=reply, session="s", user_id="u", alias="a", returncode=0, stderr="")
 
@@ -678,6 +695,7 @@ class TestAttachmentsAndKill(unittest.TestCase):
             self.assertEqual(result.reply, "hi")
             self.assertTrue(pids and pids[0] > 0)
 
+    @unittest.skipUnless(os.name != "nt", "process groups and `sleep` are POSIX-only")
     def test_kill_process_tree(self):
         code = (
             "import subprocess, sys, time\n"
@@ -836,6 +854,7 @@ class TestAttachmentsAndKill(unittest.TestCase):
                 server.shutdown()
                 thread.join(timeout=2)
 
+    @unittest.skipUnless(_SYMLINK_OK, _SYMLINK_SKIP)
     def test_local_path_confined_and_mime_extension(self):
         from agents_relay.attachments import AttachmentRejected, materialize_attachments
 

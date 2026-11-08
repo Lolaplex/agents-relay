@@ -11,6 +11,22 @@ def _clean(val: str) -> str:
     return val.strip().strip("'\"").strip()
 
 
+def _split_loop_cmd(raw: str) -> list[str]:
+    """Split ``LOOP_CMD`` the way the platform quotes.
+
+    ``posix=True`` eats the backslashes in a Windows path, and ``posix=False``
+    keeps the quotes. Split by platform, then drop the quotes the non-posix
+    branch leaves behind, so a quoted program path survives on Windows.
+    """
+    argv = shlex.split(raw, posix=os.name != "nt")
+    if os.name == "nt":
+        argv = [
+            item[1:-1] if len(item) >= 2 and item[0] == item[-1] and item[0] in "\"'" else item
+            for item in argv
+        ]
+    return argv
+
+
 def _int(val: str, default: int) -> int:
     cleaned = _clean(val)
     if not cleaned:
@@ -60,8 +76,10 @@ class RelayConfig:
 
     @classmethod
     def from_env(cls) -> "RelayConfig":
-        raw_loop = _clean(os.environ.get("LOOP_CMD", "python -m runner.loop"))
-        loop_cmd = tuple(shlex.split(raw_loop, posix=os.name != "nt"))
+        # Not ``_clean``: it strips quotes from both ends of the whole string,
+        # which unbalances a command whose program path is quoted.
+        raw_loop = os.environ.get("LOOP_CMD", "python -m runner.loop").strip()
+        loop_cmd = tuple(_split_loop_cmd(raw_loop))
         if not loop_cmd:
             loop_cmd = ("python", "-m", "runner.loop")
         return cls(

@@ -34,6 +34,34 @@ def _test_config(**overrides) -> RelayConfig:
     return RelayConfig(**base)
 
 
+class TestLoopCmdSplit(unittest.TestCase):
+    def test_plain_command_splits(self):
+        with patch.dict("os.environ", {"LOOP_CMD": "python -m runner.loop"}, clear=False):
+            self.assertEqual(
+                RelayConfig.from_env().loop_cmd, ("python", "-m", "runner.loop")
+            )
+
+    def test_quoted_program_path_survives(self):
+        raw = "'C:/Program Files/Python/python.exe' -m klanker.turn --system 'C:/a b/s.txt'"
+        with patch.dict("os.environ", {"LOOP_CMD": raw}, clear=False):
+            self.assertEqual(
+                RelayConfig.from_env().loop_cmd,
+                (
+                    "C:/Program Files/Python/python.exe",
+                    "-m",
+                    "klanker.turn",
+                    "--system",
+                    "C:/a b/s.txt",
+                ),
+            )
+
+    def test_empty_command_falls_back(self):
+        with patch.dict("os.environ", {"LOOP_CMD": "   "}, clear=False):
+            self.assertEqual(
+                RelayConfig.from_env().loop_cmd, ("python", "-m", "runner.loop")
+            )
+
+
 class TestTrailerParse(unittest.TestCase):
     def test_parse_trailer(self):
         stdout = f"hello\n{LOOP_TRAILER_MARKER}\n" + json.dumps(
