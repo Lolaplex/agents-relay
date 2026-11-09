@@ -62,6 +62,7 @@ def handle_webhook(
             message=text,
             config=cfg,
             new_session=True,
+            workspace=str(body.get("workspace") or ""),
         )
         out["turn"] = {
             "reply": result.reply,

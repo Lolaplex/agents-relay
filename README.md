@@ -38,6 +38,7 @@ Needs `runner.loop` on `PATH` (`LOOP_CMD`, default `python -m runner.loop`). Tha
 | **Loop Client** | Spawns buffered `runner.loop` subprocess per turn with trailer parsing and repeatable `--attach` |
 | **Outbound Send** | Direct Telegram push via `agents-relay send` for reminders and notifications |
 | **Approval Gate** | `agents-relay approve` asks an allowlisted chat and blocks on a decision file |
+| **Web Surface** | Cookie login, static assets from `RELAY_STATIC_DIR`, `/v1/chat/stream` with status + deltas, `/v1/chat/stop` |
 
 - **Subprocess Isolation**: One `runner.loop` process per request. No in-process LLM logic.
 - **No harness state**: No identity storage, no traces, no writes under `~/.agents`. Relay files (approvals, inbox) stay in `AGENTS_RELAY_STATE`.
@@ -61,12 +62,16 @@ Needs `runner.loop` on `PATH` (`LOOP_CMD`, default `python -m runner.loop`). Tha
 - [x] **Subprocess Isolation**: One `runner.loop` process per request. No in-process LLM state.
 - [x] **Zero Bloat Runtime**: Pure Python standard library only.
 - [x] **SSE Token Streaming (`/v1/stream`)**: Server-sent events (`delta` + `trailer`) for client web UIs.
+- [x] **Web Surface**: Cookie login, static assets from `RELAY_STATIC_DIR`, streamed status + answer, stop button. The UI itself lives in the Klanker repo, not here.
 - [x] **A2A Board Mailbox Proxy (`/v1/a2a/mail`, `GET /v1/a2a/peers`)**: Peer-to-peer agent relay for board instances.
 - [x] **Inbound Webhook Hub (`/v1/webhook/{source}`)**: Generic structured ingress for CI/CD and deployment alerts.
 - [x] **Client SDK (`agents_relay.client.GatewayClient`)**: `turn()`, `stream()`, `health()` with prefs persistence.
 
 ### Planned (Roadmap)
 
+- [ ] **Web approvals**: `/v1/approvals` list + decide + an `approval` SSE event, so a browser client can gate mutating tools without Telegram.
+- [ ] **Web inbox + push**: mirror `send` into a web inbox, `/v1/inbox`, Web Push (VAPID) for reminders while the app is closed.
+- [ ] **Server history**: `/v1/history?session=` from agents-traces instead of browser-only storage.
 - [ ] **Multi-Channel Adapters**: Signal / Discord gateway adapters alongside Telegram.
 
 ---
@@ -106,6 +111,10 @@ Telegram chats can send `/jobs`, `/stop`, and `/stop <id>` while `serve` is poll
 | `RELAY_HOST` / `RELAY_PORT` | Bind (default `127.0.0.1:8787`; `GATEWAY_HOST` / `GATEWAY_PORT` fallbacks) |
 | `AGENTS_RELAY_WEB_DIR` | Static dir for `GET /app/` (default: bundled `agents_relay/web/` herd PWA) |
 | `TELEGRAM_POLL_TIMEOUT` | Long-poll seconds, clamped 1–50 (default 50) |
+| `RELAY_WEB_TOKEN` | Enables cookie auth and the web surface. Empty = no web surface |
+| `RELAY_WEB_USER` | Harness `--user` for web turns (default `web`) |
+| `RELAY_STATIC_DIR` | Directory served at `/` (the dashboard build). Empty = no static assets |
+| `RELAY_WEB_SECURE` | `0` drops the `Secure` cookie flag for plain-HTTP local testing (default on) |
 
 `POST /v1/turn` accepts `attachments`: a list of `{"path": "/abs/file", "mime": "image/png"}` or `{"url": "https://...", "mime": "..."}`. A local `path` must already exist and must resolve inside `AGENTS_RELAY_ATTACH_DIR` (default: the relay state dir). Paths outside that directory are rejected with HTTP 400. `url` must be `http` or `https` and is downloaded into the relay inbox (20 MB cap). When `mime` is set, the saved file extension matches it (`image/jpeg` → `.jpg`) so the harness can infer the type. Each file is passed to the loop as `--attach`. Photos and documents from Telegram take the same `--attach` path. The loop `--user` for a Telegram turn is the numeric chat id so `AGENTS_APPROVAL_CMD` can substitute `{user}`.
 
@@ -121,8 +130,14 @@ HTTP secret headers supported: `X-Relay-Secret`, `Relay-Secret`, `X-Gateway-Secr
 
 | Route | Method | Purpose |
 |-------|--------|---------|
-| `/health`, `/` | GET | Liveness (`{"ok": true}`) |
+| `/health` | GET | Liveness (`{"ok": true}`) |
+| `/` | GET | `index.html` from `RELAY_STATIC_DIR`, else `{"ok": true}` |
 | `/app/` | GET | Static herd PWA (installable chat client, same-origin with `/v1/*`) |
+| `/v1/auth/login` | POST | `{"token": "..."}` → HttpOnly `relay_web` cookie (30 days) |
+| `/v1/auth/logout` | POST | Clears the cookie |
+| `/v1/auth/status` | GET | `{"authenticated": bool, "user": "..."}` |
+| `/v1/chat/stream` | POST | SSE for a browser client: `start`, `status`, `delta`, `trailer`, `error` |
+| `/v1/chat/stop` | POST | `{"run": "..."}` kills that turn's process tree |
 | `/v1/turn` | POST | Buffered turn JSON |
 | `/v1/stream` | POST | SSE token stream (`delta` + `trailer` events) |
 | `/v1/inject` | POST | Inject a turn into the Telegram chat flow (`?async=1` queues a job) |
@@ -130,6 +145,23 @@ HTTP secret headers supported: `X-Relay-Secret`, `Relay-Secret`, `X-Gateway-Secr
 | `/v1/webhook/{source}` | POST | Generic webhook ingress (`X-Webhook-Secret` header) |
 | `/v1/a2a/mail` | POST | Board mailbox proxy |
 | `/v1/a2a/peers` | GET | Board peers (`?project=slug`) |
+
+### Web surface
+
+The relay does not ship a UI. It serves whatever directory `RELAY_STATIC_DIR` points at, so a dashboard build can be mounted on the same origin as the API and needs no CORS.
+
+- `RELAY_WEB_TOKEN` enables cookie auth. Login exchanges the token for an HttpOnly `relay_web` cookie, so the token never lands in JS storage and `EventSource` works.
+- `/v1/chat/stream` interleaves stderr progress (`status`, humanized) with stdout answer tokens (`delta`), then a `trailer` with the session id.
+- `/v1/chat/stop` kills the turn's process tree by `run` id.
+- The client keeps the thread and session id; the relay stays stateless.
+- With `RELAY_WEB_TOKEN` set and `RELAY_SECRET` empty, the cookie is the only gate on every endpoint. Set `RELAY_SECRET` too if CLI clients need header auth.
+
+```bash
+RELAY_WEB_TOKEN=$(python -c "import secrets;print(secrets.token_urlsafe(24))")
+RELAY_STATIC_DIR=/srv/klanker-dashboard
+agents-relay serve
+# open http://127.0.0.1:8787/ and paste the token
+```
 
 ### POST /v1/turn
 

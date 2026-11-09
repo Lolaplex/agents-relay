@@ -1,4 +1,4 @@
-"""Relay-local state directory. Never writes under ~/.agents."""
+"""Relay-local state directory. Lives in the workspace relay domain."""
 
 from __future__ import annotations
 
@@ -9,20 +9,24 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+from agents_workspace import Workspace
+
 from .config import RelayConfig
 
 
 def resolve_state_dir(config: RelayConfig | None = None) -> Path:
     """Directory for approvals and downloaded attachments.
 
-    `AGENTS_RELAY_STATE` wins, then `RelayConfig.state_dir`, else `~/.agents-relay`.
+    `AGENTS_RELAY_STATE` wins, then the workspace relay domain. The legacy
+    `~/.agents-relay` is read while it still holds pending approvals.
     """
     if config is not None and config.state_dir:
         return Path(config.state_dir).expanduser()
-    env = os.environ.get("AGENTS_RELAY_STATE", "").strip()
-    if env:
-        return Path(env).expanduser()
-    return Path.home() / ".agents-relay"
+    ws = Workspace.from_env()
+    legacy = Path.home() / ".agents-relay"
+    if not ws.relay_state.exists() and legacy.is_dir():
+        return legacy
+    return ws.relay_state
 
 
 def approval_dir(config: RelayConfig | None = None) -> Path:

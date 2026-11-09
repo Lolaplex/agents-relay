@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .config import RelayConfig
+from .turn import workspace_env
 
 LOOP_TRAILER_MARKER = "---agents-loop-trailer---"
 
@@ -75,6 +76,7 @@ def run_loop_turn(
     provider: str = "",
     persona: str = "",
     project: str = "",
+    workspace: str = "",
 ) -> LoopTurnResult:
     cfg = config or RelayConfig.from_env()
     argv = list(cfg.loop_cmd)
@@ -117,6 +119,7 @@ def run_loop_turn(
                 text=True,
                 timeout=wait,
                 shell=False,
+                env=workspace_env(workspace),
             )
         except subprocess.TimeoutExpired as exc:
             err = exc.stderr or ""
@@ -146,6 +149,7 @@ def run_loop_turn(
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
+        env=workspace_env(workspace),
         **popen_kwargs,
     )
     if on_pid is not None and proc.pid:

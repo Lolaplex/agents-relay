@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
+import queue
 import subprocess
+import threading
+import time
 from dataclasses import dataclass, replace
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from .config import GatewayConfig
 
@@ -23,6 +27,7 @@ class TurnParams:
     provider: str = ""
     persona: str = ""
     project: str = ""
+    workspace: str = ""
     deliver: str = "buffered"
 
 
@@ -79,6 +84,7 @@ def turn_params_from_body(body: dict[str, Any]) -> TurnParams:
         provider=str(body.get("provider") or ""),
         persona=str(body.get("persona") or ""),
         project=str(body.get("project") or ""),
+        workspace=str(body.get("workspace") or ""),
     )
 
 
@@ -113,6 +119,22 @@ def build_loop_argv(params: TurnParams, config: GatewayConfig) -> list[str]:
     return argv
 
 
+def workspace_env(ref: str) -> dict[str, str] | None:
+    """Env for a turn that must run inside a named workspace.
+
+    Empty ref means the process default, so the subprocess inherits the env.
+    """
+    needle = (ref or "").strip()
+    if not needle:
+        return None
+    from agents_workspace import Workspace
+
+    ws = Workspace.resolve(needle)
+    if ws is None:
+        raise ValueError(f"unknown workspace: {needle}")
+    return ws.env()
+
+
 def run_loop_turn(
     *,
     channel: str,
@@ -125,6 +147,7 @@ def run_loop_turn(
     provider: str = "",
     persona: str = "",
     project: str = "",
+    workspace: str = "",
     timeout_sec: int = 600,
 ) -> LoopTurnResult:
     params = TurnParams(
@@ -137,6 +160,7 @@ def run_loop_turn(
         provider=provider,
         persona=persona,
         project=project,
+        workspace=workspace,
         deliver="buffered",
     )
     cfg = config or GatewayConfig.from_env()
@@ -147,6 +171,7 @@ def run_loop_turn(
         text=True,
         timeout=timeout_sec,
         shell=False,
+        env=workspace_env(workspace),
     )
     parsed = parse_loop_stdout(proc.stdout or "")
     return LoopTurnResult(
@@ -174,6 +199,7 @@ def iter_loop_stream(
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
+        env=workspace_env(params.workspace),
     )
     assert proc.stdout is not None
     marker = LOOP_TRAILER_MARKER
@@ -254,3 +280,170 @@ def iter_loop_stream(
     finally:
         if proc.poll() is None:
             proc.kill()
+
+
+def _parse_trailer(trailer_part: str) -> dict[str, Any]:
+    lines = [ln for ln in (trailer_part or "").strip().splitlines() if ln.strip()]
+    if not lines:
+        return {}
+    try:
+        meta = json.loads(lines[0])
+    except json.JSONDecodeError:
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def iter_loop_stream_live(
+    params: TurnParams,
+    config: GatewayConfig | None = None,
+    *,
+    timeout_sec: int = 900,
+    cancel: threading.Event | None = None,
+    on_pid: Callable[[int], None] | None = None,
+) -> Iterator[StreamEvent]:
+    """Stream one turn, interleaving stderr progress with stdout answer deltas.
+
+    ``iter_loop_stream`` only forwards stdout, so a web client sees nothing while
+    tools run. Here both pipes feed one queue: stderr lines become ``status``
+    events, stdout characters become ``delta`` events. ``cancel`` kills the whole
+    process tree, which is what a browser stop button needs.
+    """
+    cfg = config or GatewayConfig.from_env()
+    argv = build_loop_argv(replace(params, deliver="stream"), cfg)
+    popen_kwargs: dict[str, Any] = {}
+    if os.name != "nt":
+        # Own process group so cancel kills the loop and its tool children.
+        popen_kwargs["start_new_session"] = True
+    proc = subprocess.Popen(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env=workspace_env(params.workspace),
+        **popen_kwargs,
+    )
+    if on_pid is not None and proc.pid:
+        try:
+            on_pid(int(proc.pid))
+        except Exception:
+            pass
+
+    events: "queue.Queue[tuple[str, str]]" = queue.Queue()
+
+    def _pump(stream, tag: str, *, by_line: bool) -> None:
+        try:
+            if stream is None:
+                return
+            if by_line:
+                for line in stream:
+                    events.put((tag, line))
+            else:
+                while True:
+                    piece = stream.read(1)
+                    if not piece:
+                        break
+                    events.put((tag, piece))
+        except Exception:
+            pass
+        finally:
+            events.put((tag + "-eof", ""))
+
+    threading.Thread(target=_pump, args=(proc.stdout, "out"), kwargs={"by_line": False}, daemon=True).start()
+    threading.Thread(target=_pump, args=(proc.stderr, "err"), kwargs={"by_line": True}, daemon=True).start()
+
+    marker = LOOP_TRAILER_MARKER
+    pending = ""
+    emitted = 0
+    out_eof = False
+    err_eof = False
+    deadline = time.monotonic() + max(1, int(timeout_sec))
+
+    def _kill() -> None:
+        from .jobs import kill_process_tree
+
+        if proc.poll() is None:
+            kill_process_tree(proc.pid)
+
+    try:
+        while True:
+            if cancel is not None and cancel.is_set():
+                _kill()
+                return
+            if time.monotonic() > deadline:
+                _kill()
+                yield StreamEvent(type="error", text="Turn timed out.")
+                return
+            try:
+                tag, data = events.get(timeout=0.25)
+            except queue.Empty:
+                if out_eof and err_eof:
+                    break
+                continue
+
+            if tag == "err":
+                line = data.strip()
+                if line:
+                    yield StreamEvent(type="status", text=line)
+                continue
+            if tag == "err-eof":
+                err_eof = True
+                continue
+            if tag == "out-eof":
+                out_eof = True
+                continue
+
+            pending += data
+            if marker in pending:
+                if not out_eof and proc.poll() is None:
+                    continue
+                body, _, trailer_part = pending.partition(marker)
+                tail = body[emitted:]
+                if tail:
+                    yield StreamEvent(type="delta", text=tail)
+                emitted = len(body)
+                meta = _parse_trailer(trailer_part)
+                rc = proc.wait(timeout=5) if proc.poll() is None else int(proc.returncode or 0)
+                yield StreamEvent(
+                    type="trailer",
+                    session=str(meta.get("session") or ""),
+                    user_id=str(meta.get("user_id") or ""),
+                    alias=str(meta.get("alias") or ""),
+                    returncode=rc,
+                )
+                return
+            safe = len(pending) - len(marker)
+            if safe > emitted:
+                piece = pending[emitted:safe]
+                emitted = safe
+                yield StreamEvent(type="delta", text=piece)
+
+        rc = proc.wait(timeout=5) if proc.poll() is None else int(proc.returncode or 0)
+        # The marker may have arrived in the same chunk that ended the stream, so
+        # the loop above skipped it while waiting for EOF. Strip it here.
+        if marker in pending:
+            body, _, trailer_part = pending.partition(marker)
+            tail = body[emitted:]
+            if tail:
+                yield StreamEvent(type="delta", text=tail)
+            meta = _parse_trailer(trailer_part)
+        else:
+            tail = pending[emitted:]
+            if tail:
+                yield StreamEvent(type="delta", text=tail)
+            parsed = parse_loop_stdout(pending)
+            meta = {
+                "session": parsed["session"],
+                "user_id": parsed["user_id"],
+                "alias": parsed["alias"],
+            }
+        yield StreamEvent(
+            type="trailer",
+            session=str(meta.get("session") or ""),
+            user_id=str(meta.get("user_id") or ""),
+            alias=str(meta.get("alias") or ""),
+            returncode=rc,
+        )
+    finally:
+        if proc.poll() is None:
+            _kill()

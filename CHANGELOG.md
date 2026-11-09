@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - `GET /app/` serves a bundled static herd PWA (installable chat client) same-origin with the API — a phone on the tailnet can pin `https://<node>.ts.net/app/` and talk to `/v1/*` with no cross-origin fetch and no CORS change. `/app` redirects to `/app/`; paths stay inside the web root. `AGENTS_RELAY_WEB_DIR` overrides the bundled dir. Static files stay public; `/v1/*` keeps the secret check.
+- Multi-workspace turns: `"workspace"` on `/v1/turn`, `/v1/stream`, and `/v1/chat/stream` runs the loop subprocess with that workspace's env (`AGENTS_WORKSPACE_ROOT`, `AGENTS_WORKDIR`, and every domain path). `GET /v1/workspaces` lists the default plus every workspace under `AGENTS_WORKSPACES_DIR`; `POST /v1/workspaces {"label": ...}` creates one.
+- Web surface for a browser client: `RELAY_WEB_TOKEN` enables cookie auth, `RELAY_STATIC_DIR` serves a dashboard build at `/`. Login exchanges the token for an HttpOnly `relay_web` cookie (30 days, HMAC-signed). `RELAY_WEB_USER` and `RELAY_WEB_SECURE` tune it. The relay ships no UI of its own.
+- `POST /v1/chat/stream` streams `start`, `status` (humanized stderr progress), `delta` (answer tokens), `trailer`, and `error` events. `POST /v1/chat/stop` kills the turn's process tree by `run` id. `GET /v1/auth/status`, `POST /v1/auth/login`, `POST /v1/auth/logout`.
+- `iter_loop_stream_live` in `turn.py`: stdout and stderr feed one queue, so progress is visible while tools run. Cancellation reuses `jobs.kill_process_tree`.
+
+### Changed
+- `_check_secret` accepts the `relay_web` cookie. With `RELAY_WEB_TOKEN` set and `RELAY_SECRET` empty, the cookie is the only gate on every endpoint instead of "no auth".
+- `GET /` serves `index.html` from `RELAY_STATIC_DIR` when it exists and keeps `{"ok": true}` otherwise. `_parse_query` keeps `/` instead of collapsing it to an empty path.
 
 ## [0.1.1] - 2026-11-08
 

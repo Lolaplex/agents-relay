@@ -15,6 +15,17 @@ from .a2a import handle_a2a_mail, list_peers
 from .config import RelayConfig
 from .loop_client import LoopTurnResult, run_loop_turn
 from .turn import iter_loop_stream, turn_params_from_body
+from .web import (
+    cookie_from_header,
+    handle_chat_stop,
+    handle_chat_stream,
+    handle_login,
+    handle_logout,
+    handle_status,
+    serve_static,
+    verify_cookie,
+    web_enabled,
+)
 from .webhooks import handle_webhook
 
 log = logging.getLogger("agents_relay.http")
@@ -44,7 +55,7 @@ _ENVELOPE_KEYS = frozenset({
 
 def _parse_query(raw_path: str) -> tuple[str, dict[str, str]]:
     parsed = urllib.parse.urlsplit(raw_path)
-    path = parsed.path.rstrip("/")
+    path = parsed.path.rstrip("/") or "/"
     qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=False)
     params = {k: v[-1] for k, v in qs.items() if v}
     return path, params
@@ -55,7 +66,13 @@ def _check_secret(
     expected: str,
     query_params: dict[str, str] | None = None,
 ) -> bool:
+    cfg = getattr(handler, "config", None)
     if not expected:
+        # A web surface without a relay secret would expose every endpoint to
+        # anyone who can reach the port. The cookie is then the only gate.
+        if isinstance(cfg, RelayConfig) and web_enabled(cfg):
+            raw = cookie_from_header(handler.headers.get("Cookie") or "")
+            return bool(raw and verify_cookie(cfg, raw))
         return True
     auth_header = (handler.headers.get("Authorization") or "").strip()
     bearer = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else ""
@@ -70,9 +87,15 @@ def _check_secret(
         or qp.get("token")
         or ""
     ).strip()
-    if not got:
-        return False
-    return hmac.compare_digest(got.encode("utf-8"), expected.encode("utf-8"))
+    if got and hmac.compare_digest(got.encode("utf-8"), expected.encode("utf-8")):
+        return True
+    # A browser client authenticates with an HttpOnly cookie: the token stays
+    # out of JS storage and EventSource, which cannot set headers, still works.
+    if isinstance(cfg, RelayConfig) and web_enabled(cfg):
+        raw = cookie_from_header(handler.headers.get("Cookie") or "")
+        if raw and verify_cookie(cfg, raw):
+            return True
+    return False
 
 
 def _extract_payload_text(
@@ -183,13 +206,16 @@ class TurnHandler(BaseHTTPRequestHandler):
 
     def _run_turn(self, turn_kwargs: dict) -> LoopTurnResult:
         runner = (self.turn_hook.fn if self.turn_hook else None) or run_loop_turn
+        kwargs = dict(turn_kwargs)
+        if runner is run_loop_turn:
+            kwargs["config"] = self._cfg()
         try:
-            return runner(**turn_kwargs)
+            return runner(**kwargs)
         except TypeError:
-            optional = {k: turn_kwargs.pop(k) for k in _OPTIONAL_TURN_KWARGS if k in turn_kwargs}
+            optional = {k: kwargs.pop(k) for k in _OPTIONAL_TURN_KWARGS if k in kwargs}
             if not optional:
                 raise
-            return runner(**turn_kwargs)
+            return runner(**kwargs)
 
     def _handle_inject(self, query_params: dict[str, str] | None = None) -> None:
         body = self._read_json()
@@ -283,6 +309,54 @@ class TurnHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path, query_params = _parse_query(self.path)
 
+        if path == "/v1/auth/login":
+            body = self._read_json()
+            if body is None:
+                return
+            handle_login(self, body)
+            return
+
+        if path == "/v1/auth/logout":
+            handle_logout(self)
+            return
+
+        if path == "/v1/workspaces":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            body = self._read_json()
+            if body is None:
+                return
+            label = str(body.get("label") or "").strip()
+            if not label:
+                self.send_error(400, "label is required")
+                return
+            from .workspaces import create_workspace
+
+            ws = create_workspace(label)
+            self._write_json({"ok": True, "workspace": ws.to_dict()}, 201)
+            return
+
+        if path == "/v1/chat/stream":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            body = self._read_json()
+            if body is None:
+                return
+            handle_chat_stream(self, body)
+            return
+
+        if path == "/v1/chat/stop":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            body = self._read_json()
+            if body is None:
+                return
+            handle_chat_stop(self, body)
+            return
+
         if path == "/v1/inject":
             if not _check_secret(self, self.relay_secret, query_params):
                 self.send_error(401, "unauthorized")
@@ -354,7 +428,7 @@ class TurnHandler(BaseHTTPRequestHandler):
             "user_id": user_id,
             "new_session": new_session,
         }
-        for key in ("provider", "persona", "project"):
+        for key in ("provider", "persona", "project", "workspace"):
             val = str(body.get(key) or "").strip()
             if val:
                 turn_kwargs[key] = val
@@ -445,7 +519,22 @@ class TurnHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path, query_params = _parse_query(self.path)
+        cfg = self._cfg()
+        if path == "/v1/auth/status":
+            handle_status(self)
+            return
+        if path == "/v1/workspaces":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            from .workspaces import list_workspaces
+
+            rows = [ws.to_dict() for ws in list_workspaces()]
+            self._write_json({"ok": True, "workspaces": rows}, 200)
+            return
         if path in ("/health", "/"):
+            if path == "/" and web_enabled(cfg) and serve_static(self, "index.html"):
+                return
             self._write_json({"ok": True}, 200)
             return
         if path == "/app" or path.startswith("/app/"):
@@ -470,6 +559,8 @@ class TurnHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache" if target.name == "index.html" else "max-age=3600")
             self.end_headers()
             self.wfile.write(data)
+            return
+        if web_enabled(cfg) and serve_static(self, path):
             return
         if path == "/v1/a2a/peers":
             if not _check_secret(self, self.relay_secret, query_params):

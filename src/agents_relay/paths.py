@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-import os
 import shutil
 from pathlib import Path
 
-# Human UI config lives here — not brain/memory/traces/identity (those stay under ~/.agents).
+from agents_workspace import Workspace
+
+# Human UI config lives here — not brain/memory/traces/identity.
 SURFACES = ("host", "overlay")
 
 
 def agents_home() -> Path:
-    raw = os.environ.get("AGENTS_HOME", "").strip()
-    return Path(raw) if raw else Path.home() / ".agents"
+    return Workspace.from_env().root
 
 
 def clients_dir() -> Path:
