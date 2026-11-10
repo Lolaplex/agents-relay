@@ -21,6 +21,7 @@ class GatewayClient:
     provider: str = ""
     persona: str = ""
     project: str = ""
+    workspace: str = ""
     prefs_path: Path | None = None
 
     def _headers(self) -> dict[str, str]:
@@ -50,6 +51,7 @@ class GatewayClient:
                     "provider": self.provider,
                     "persona": self.persona,
                     "project": self.project,
+                    "workspace": self.workspace,
                 },
                 indent=2,
             ),
@@ -67,6 +69,7 @@ class GatewayClient:
         self.provider = str(data.get("provider") or self.provider)
         self.persona = str(data.get("persona") or self.persona)
         self.project = str(data.get("project") or self.project)
+        self.workspace = str(data.get("workspace") or self.workspace)
 
     def _turn_body(self, text: str, *, new_session: bool = False) -> dict[str, Any]:
         body: dict[str, Any] = {
@@ -86,6 +89,8 @@ class GatewayClient:
             body["persona"] = self.persona
         if self.project:
             body["project"] = self.project
+        if self.workspace:
+            body["workspace"] = self.workspace
         return body
 
     def turn(self, text: str, *, new_session: bool = False) -> dict[str, Any]:
