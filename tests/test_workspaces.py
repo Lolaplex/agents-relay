@@ -68,9 +68,12 @@ class TestWorkspaceEnv(unittest.TestCase):
                 env = workspace_env("demo")
             self.assertIsNotNone(env)
             assert env is not None
-            self.assertEqual(env["AGENTS_WORKSPACE_ROOT"], str(ws.root))
+            self.assertEqual(env["AGENTS_WORKSPACE"], "demo")
+            self.assertEqual(env["AGENTS_HOST_DIR"], str(ws.host.dir))
+            self.assertEqual(env["AGENTS_MEMORY_DIR"], str(ws.memory))
             self.assertEqual(env["AGENTS_MEMORY_PATH"], str(ws.memory))
             self.assertEqual(env["AGENTS_TRACES_DIR"], str(ws.traces))
+            self.assertNotIn("AGENTS_WORKSPACE_ROOT", env)
 
     def test_turn_passes_workspace_env(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -91,7 +94,8 @@ class TestWorkspaceEnv(unittest.TestCase):
                 with patch("agents_relay.turn.subprocess.run", fake_run):
                     run_loop_turn(channel="http", user="u", message="hi", workspace="demo")
 
-            self.assertEqual(captured["env"]["AGENTS_WORKSPACE_ROOT"], str(ws.root))
+            self.assertEqual(captured["env"]["AGENTS_WORKSPACE"], "demo")
+            self.assertEqual(captured["env"]["AGENTS_HOST_DIR"], str(ws.host.dir))
 
 
 class TestWorkspaceRoutes(unittest.TestCase):
