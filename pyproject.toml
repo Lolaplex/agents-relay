@@ -37,5 +37,3 @@ agents-relay = "agents_relay.__main__:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[tool.setuptools.package-data]
-agents_relay = ["web/**/*"]

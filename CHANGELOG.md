@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- Bundled hand-written PWA (`src/agents_relay/web/`); the relay serves only a configured static dir (`RELAY_STATIC_DIR`/`AGENTS_RELAY_WEB_DIR`) - the dashboard build comes from klanker `web/` (option 1b).
+
 ### Added
 - Telegram `/persona` command: `/persona` shows current + available personas, `/persona <id>` pins a per-chat persona (stored in `<ws>/relay/chat_prefs.json`), `/persona default` resets. Turns run under the pinned persona so sessions stay separate while workspace memory stays shared.
 
