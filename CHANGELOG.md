@@ -56,6 +56,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `POST /v1/chat/stream` streams `start`, `status` (humanized stderr progress), `delta` (answer tokens), `trailer`, and `error` events. `POST /v1/chat/stop` kills the turn's process tree by `run` id. `GET /v1/auth/status`, `POST /v1/auth/login`, `POST /v1/auth/logout`.
 - `iter_loop_stream_live` in `turn.py`: stdout and stderr feed one queue, so progress is visible while tools run. Cancellation reuses `jobs.kill_process_tree`.
 
+### Added
+- Dashboard API (agents-relay#12): `GET /v1/traces?workspace=&persona=&session=&limit=` tails the workspace's agents-traces daily JSONL files (`<ws>/traces/YYYY-MM-DD.jsonl`) filtered by session id and returns the newest `limit` raw lines (`{"lines": [...], "note": ""}`); without `session` it lists that persona's on-disk session ids instead. `persona` narrows events to that stamp (unstamped events still match). `GET /v1/approvals?workspace=` lists pending tool approvals (`{id, tool, summary}`) and `POST /v1/approvals/<id>` with `{"allow": true|false}` resolves one through the same `approvals/<id>.json` file the Telegram callback and `approve --decide` write. `?workspace=` targets `<ws>/relay/approvals`; without it the serve state dir is used.
+- `RELAY_CORS_ORIGINS`: comma-separated origin allowlist for cross-origin dashboard fetches. Matching `/v1/*` responses carry `Access-Control-Allow-Origin` and `OPTIONS` preflights answer 204 with `Access-Control-Allow-Methods`/`-Headers`. Unset means no CORS headers at all; same-origin static serving is unaffected.
+
 ### Changed
 - `_check_secret` accepts the `relay_web` cookie. With `RELAY_WEB_TOKEN` set and `RELAY_SECRET` empty, the cookie is the only gate on every endpoint instead of "no auth".
 - `GET /` serves `index.html` from `RELAY_STATIC_DIR` when it exists and keeps `{"ok": true}` otherwise. `_parse_query` keeps `/` instead of collapsing it to an empty path.

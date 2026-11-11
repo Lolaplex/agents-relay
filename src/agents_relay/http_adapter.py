@@ -1,5 +1,5 @@
 """stdlib HTTP server: /v1/turn, /v1/stream, /v1/inject, /v1/alert,
-/webhook/alert, /v1/webhook/*, /v1/a2a/*."""
+/webhook/alert, /v1/webhook/*, /v1/a2a/*, /v1/traces, /v1/approvals."""
 
 from __future__ import annotations
 
@@ -7,7 +7,10 @@ import hmac
 import json
 import logging
 import urllib.parse
+from collections import deque
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Callable
 from urllib.parse import urlparse
 
@@ -204,6 +207,42 @@ class TurnHandler(BaseHTTPRequestHandler):
     def _cfg(self) -> RelayConfig:
         return self.config or RelayConfig.from_env()
 
+    def _cors_origin(self) -> str:
+        """Origin to echo on /v1/* when RELAY_CORS_ORIGINS allows it (off by default)."""
+        origins = self._cfg().cors_origins
+        if not origins:
+            return ""
+        path, _ = _parse_query(self.path or "/")
+        if not path.startswith("/v1/"):
+            return ""
+        origin = (self.headers.get("Origin") or "").strip()
+        if not origin:
+            return ""
+        if "*" in origins:
+            return "*"
+        return origin if origin in origins else ""
+
+    def end_headers(self) -> None:
+        allowed = self._cors_origin()
+        if allowed:
+            self.send_header("Access-Control-Allow-Origin", allowed)
+            self.send_header("Vary", "Origin")
+        super().end_headers()
+
+    def do_OPTIONS(self) -> None:
+        if not self._cors_origin():
+            self.send_error(404)
+            return
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        req_headers = (self.headers.get("Access-Control-Request-Headers") or "").strip()
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            req_headers or "Content-Type, Authorization, X-Relay-Secret",
+        )
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def _run_turn(self, turn_kwargs: dict) -> LoopTurnResult:
         runner = (self.turn_hook.fn if self.turn_hook else None) or run_loop_turn
         kwargs = dict(turn_kwargs)
@@ -353,6 +392,14 @@ class TurnHandler(BaseHTTPRequestHandler):
                 self.send_error(401, "unauthorized")
                 return
             self._handle_persona_post(parts, query_params)
+            return
+
+        # POST /v1/approvals/<id> {allow: true|false}
+        if len(parts) == 4 and parts[1] == "v1" and parts[2] == "approvals":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            self._handle_approval_post(parts[3], query_params)
             return
 
         if path == "/v1/chat/stream":
@@ -666,6 +713,170 @@ class TurnHandler(BaseHTTPRequestHandler):
             log.warning("session events unavailable: %s", exc)
         self._write_json(payload, 200)
 
+    def _handle_traces(self, query_params: dict) -> None:
+        """Tail the workspace's daily agents-traces JSONL files for one session.
+
+        agents-traces appends to ``<ws>/traces/YYYY-MM-DD.jsonl`` (there is no
+        per-session file), so ``session`` filters each line's ``session`` field.
+        ``lines`` are the last ``limit`` matching raw JSONL lines, oldest first.
+        Without ``session`` the on-disk session ids are listed instead.
+        ``persona`` is a narrowing hint: events stamped with a *different*
+        persona are skipped; unstamped events still match.
+        """
+        ws_ref = str(query_params.get("workspace") or "").strip()
+        persona = str(query_params.get("persona") or "").strip()
+        sid = str(query_params.get("session") or "").strip()
+        for label, ref in (("workspace", ws_ref), ("persona", persona)):
+            if ref and not valid_id(ref):
+                self.send_error(400, f"invalid {label} id: {ref!r}")
+                return
+        if sid and not valid_id(sid) and not sid.startswith(
+                ("ses_", "proc-", "telegram-", "repl-")):
+            self.send_error(400, f"invalid session id: {sid!r}")
+            return
+        from .workspaces import get_workspace, select_workspace
+
+        try:
+            ws = get_workspace(ws_ref) if ws_ref else select_workspace()
+        except (KeyError, ValueError):
+            self.send_error(400, f"unknown workspace: {ws_ref!r}")
+            return
+        try:
+            limit = max(1, min(int(str(query_params.get("limit") or "50")), 500))
+        except ValueError:
+            self.send_error(400, "limit must be numeric")
+            return
+
+        if not sid:
+            root = Path(ws.personas)
+            dirs = [root / persona] if persona else (
+                sorted(p for p in root.iterdir() if p.is_dir())
+                if root.is_dir() else []
+            )
+            sessions: list[str] = []
+            for pdir in dirs:
+                sdir = pdir / "sessions"
+                if sdir.is_dir():
+                    sessions.extend(f.stem for f in sdir.glob("*.json"))
+            self._write_json(
+                {
+                    "ok": True,
+                    "lines": [],
+                    "sessions": sorted(sessions),
+                    "note": "no session given; pass session=<id> to tail trace events",
+                },
+                200,
+            )
+            return
+
+        tail: deque[str] = deque(maxlen=limit)
+        troot = Path(ws.traces)
+        if troot.is_dir():
+            for path in sorted(troot.glob("*.jsonl")):
+                try:
+                    fh = open(path, encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                with fh:
+                    for line in fh:
+                        if sid not in line:
+                            continue
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(event, dict) or event.get("session") != sid:
+                            continue
+                        meta = event.get("metadata")
+                        stamp = meta.get("persona") if isinstance(meta, dict) else None
+                        if persona and stamp and stamp != persona:
+                            continue
+                        tail.append(line.rstrip("\r\n"))
+        self._write_json({"ok": True, "lines": list(tail), "note": ""}, 200)
+
+    def _approvals_dir(self, query_params: dict) -> Path:
+        """``<ws>/relay/approvals`` for ?workspace=<id>, else the serve state dir."""
+        from .state import approval_dir
+        from .workspaces import get_workspace
+
+        ws_ref = str(query_params.get("workspace") or "").strip()
+        if not ws_ref:
+            return approval_dir(self._cfg())
+        if not valid_id(ws_ref):
+            raise ValueError(f"invalid workspace id: {ws_ref!r}")
+        return get_workspace(ws_ref).relay_state / "approvals"
+
+    def _handle_approvals_get(self, query_params: dict) -> None:
+        from .state import read_json
+
+        try:
+            adir = self._approvals_dir(query_params)
+        except KeyError:
+            self.send_error(404, "unknown workspace")
+            return
+        except ValueError as exc:
+            self.send_error(400, str(exc))
+            return
+        pending: list[tuple[float, dict]] = []
+        if adir.is_dir():
+            for path in adir.glob("*.json"):
+                rec = read_json(path)
+                if not rec or rec.get("status") != "pending":
+                    continue
+                req = rec.get("request")
+                if not isinstance(req, dict):
+                    req = {}
+                try:
+                    created = float(rec.get("created_at") or 0)
+                except (TypeError, ValueError):
+                    created = 0.0
+                pending.append((
+                    created,
+                    {
+                        "id": str(rec.get("id") or path.stem),
+                        "tool": str(req.get("tool") or ""),
+                        "summary": str(req.get("summary") or ""),
+                    },
+                ))
+        rows = [row for _, row in sorted(pending, key=lambda item: item[0])]
+        self._write_json({"ok": True, "approvals": rows}, 200)
+
+    def _handle_approval_post(self, ident: str, query_params: dict) -> None:
+        """Resolve a pending approval through the same file /v1/turn waits on."""
+        body = self._read_json()
+        if body is None:
+            return
+        allow = body.get("allow")
+        if not isinstance(allow, bool):
+            self.send_error(400, "allow must be true or false")
+            return
+        cfg = self._cfg()
+        ws_ref = str(query_params.get("workspace") or "").strip()
+        if ws_ref:
+            try:
+                cfg = replace(cfg, state_dir=str(self._approvals_dir(query_params).parent))
+            except KeyError:
+                self.send_error(404, "unknown workspace")
+                return
+            except ValueError as exc:
+                self.send_error(400, str(exc))
+                return
+        from .approvals import decide_approval
+
+        try:
+            code, note = decide_approval(cfg, ident, allow=allow)
+        except ValueError as exc:
+            self.send_error(400, str(exc))
+            return
+        except Exception as exc:
+            log.exception("approval decide failed")
+            self.send_error(500, str(exc))
+            return
+        if code != 0:
+            self.send_error(400 if note == "invalid approval id" else 404, note)
+            return
+        self._write_json({"ok": True, "id": ident, "status": note}, 200)
+
     def _handle_stream(self, body: dict) -> None:
         params = turn_params_from_body(body)
         if params.workspace:
@@ -746,6 +957,18 @@ class TurnHandler(BaseHTTPRequestHandler):
             self._write_json(
                 {"ok": True, "workspace": ws.id,
                  "personas": list_personas(ws)}, 200)
+            return
+        if path == "/v1/traces":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            self._handle_traces(query_params)
+            return
+        if path == "/v1/approvals":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            self._handle_approvals_get(query_params)
             return
         parts = path.split("/")
         # GET /v1/workspaces/<ws>/personas/<p>/inbox

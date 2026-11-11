@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
+import tempfile
+import threading
 import unittest
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from http.client import HTTPConnection
 from unittest.mock import patch
 
@@ -949,6 +952,238 @@ class TestStream(unittest.TestCase):
         self.assertTrue(any(e.type == "delta" for e in events))
         self.assertEqual(events[-1].type, "trailer")
         self.assertEqual(events[-1].session, "s1")
+
+
+class TestDashboardApi(unittest.TestCase):
+    """Board agents-relay#12: /v1/traces, /v1/approvals, RELAY_CORS_ORIGINS."""
+
+    def _serve(self, cfg: RelayConfig) -> tuple[str, int]:
+        server = serve_http(cfg)
+        host, port = server.server_address  # type: ignore[misc]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(thread.join, 2)
+        return host, port
+
+    def _req(self, host: str, port: int, method: str, path: str,
+             body: dict | None = None, headers: dict | None = None,
+             secret: bool = True):
+        conn = HTTPConnection(host, port, timeout=10)
+        h = dict(headers or {})
+        if body is not None:
+            h.setdefault("Content-Type", "application/json")
+        if secret:
+            h.setdefault("X-Relay-Secret", "expected")
+        conn.request(
+            method, path,
+            body=json.dumps(body) if body is not None else None,
+            headers=h,
+        )
+        return conn.getresponse()
+
+    def _workspace(self, ws_id: str = "demo"):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        env = patch.dict(
+            os.environ, {"AGENTS_WORKSPACES_DIR": tmp.name}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        from agents_workspace import Workspace
+
+        return Workspace.create(ws_id)
+
+    def test_traces_tail_and_session_listing(self):
+        ws = self._workspace()
+        events = [
+            {"ts": "2026-01-01T00:00:01Z", "session": "ses_a", "type": "message"},
+            {"ts": "2026-01-01T00:00:02Z", "session": "ses_b", "type": "message"},
+            {"ts": "2026-01-01T00:00:03Z", "session": "ses_a", "type": "tool_call",
+             "tool": "shell"},
+        ]
+        ws.traces.mkdir(parents=True, exist_ok=True)
+        (ws.traces / "2026-01-01.jsonl").write_text(
+            "".join(json.dumps(e) + "\n" for e in events) + "not-json\n",
+            encoding="utf-8")
+        host, port = self._serve(_test_config())
+
+        resp = self._req(
+            host, port, "GET",
+            "/v1/traces?workspace=demo&persona=default&session=ses_a&limit=10")
+        self.assertEqual(resp.status, 200)
+        data = json.loads(resp.read().decode())
+        self.assertEqual(len(data["lines"]), 2)
+        self.assertTrue(
+            all(json.loads(line)["session"] == "ses_a" for line in data["lines"]))
+        self.assertEqual(data["note"], "")
+
+        resp = self._req(
+            host, port, "GET", "/v1/traces?workspace=demo&session=ses_a&limit=1")
+        data = json.loads(resp.read().decode())
+        self.assertEqual(len(data["lines"]), 1)
+        self.assertEqual(json.loads(data["lines"][0])["type"], "tool_call")
+
+        # no session -> list that persona's on-disk session ids
+        sdir = ws.personas / "default" / "sessions"
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / "ses_a.json").write_text("{}", encoding="utf-8")
+        resp = self._req(
+            host, port, "GET", "/v1/traces?workspace=demo&persona=default")
+        self.assertEqual(resp.status, 200)
+        data = json.loads(resp.read().decode())
+        self.assertEqual(data["sessions"], ["ses_a"])
+        self.assertEqual(data["lines"], [])
+
+    def test_traces_rejects_traversal(self):
+        self._workspace()
+        host, port = self._serve(_test_config())
+        for path in (
+            "/v1/traces?workspace=..%2Fevil",
+            "/v1/traces?workspace=demo&persona=..%2Fevil",
+            "/v1/traces?workspace=demo&session=..%2Fevil",
+        ):
+            resp = self._req(host, port, "GET", path)
+            self.assertEqual(resp.status, 400, path)
+            resp.read()
+
+    def test_dashboard_routes_require_secret(self):
+        host, port = self._serve(_test_config())
+        for method, path in (
+            ("GET", "/v1/traces"),
+            ("GET", "/v1/approvals"),
+            ("POST", "/v1/approvals/ap1"),
+        ):
+            resp = self._req(host, port, method, path, secret=False)
+            self.assertEqual(resp.status, 401, path)
+            resp.read()
+
+    def test_approvals_list_and_resolve(self):
+        ws = self._workspace()
+        cfg = _test_config()
+        from agents_relay.approvals import create_pending
+        from agents_relay.state import read_json
+
+        ws_cfg = replace(cfg, state_dir=str(ws.relay_state))
+        create_pending(ws_cfg, 0, {"id": "ap1", "tool": "shell",
+                                   "summary": "run tests"})
+        create_pending(ws_cfg, 0, {"id": "ap2", "tool": "write",
+                                   "summary": "edit file"})
+        host, port = self._serve(cfg)
+
+        resp = self._req(host, port, "GET", "/v1/approvals?workspace=demo")
+        self.assertEqual(resp.status, 200)
+        data = json.loads(resp.read().decode())
+        self.assertEqual([a["id"] for a in data["approvals"]], ["ap1", "ap2"])
+        self.assertEqual(data["approvals"][0]["tool"], "shell")
+        self.assertEqual(data["approvals"][0]["summary"], "run tests")
+
+        resp = self._req(
+            host, port, "POST", "/v1/approvals/ap1?workspace=demo",
+            {"allow": "yes"})
+        self.assertEqual(resp.status, 400)
+        resp.read()
+
+        resp = self._req(
+            host, port, "POST", "/v1/approvals/ap1?workspace=demo",
+            {"allow": True})
+        self.assertEqual(resp.status, 200)
+        data = json.loads(resp.read().decode())
+        self.assertEqual(data["status"], "approved")
+        rec = read_json(ws.relay_state / "approvals" / "ap1.json")
+        self.assertEqual(rec["status"], "approved")
+
+        resp = self._req(host, port, "GET", "/v1/approvals?workspace=demo")
+        data = json.loads(resp.read().decode())
+        self.assertEqual([a["id"] for a in data["approvals"]], ["ap2"])
+
+        # already decided -> 404; deny path writes the same decision file
+        resp = self._req(
+            host, port, "POST", "/v1/approvals/ap1?workspace=demo",
+            {"allow": False})
+        self.assertEqual(resp.status, 404)
+        resp.read()
+        resp = self._req(
+            host, port, "POST", "/v1/approvals/ap2?workspace=demo",
+            {"allow": False})
+        self.assertEqual(resp.status, 200)
+        resp.read()
+        rec = read_json(ws.relay_state / "approvals" / "ap2.json")
+        self.assertEqual(rec["status"], "denied")
+
+    def test_cors_off_by_default(self):
+        self._workspace()
+        host, port = self._serve(_test_config())
+        origin = {"Origin": "https://dash.example.com"}
+        resp = self._req(
+            host, port, "GET", "/v1/traces?workspace=demo&session=ses_a",
+            headers=origin)
+        self.assertEqual(resp.status, 200)
+        self.assertIsNone(resp.getheader("Access-Control-Allow-Origin"))
+        resp.read()
+        resp = self._req(
+            host, port, "OPTIONS", "/v1/turn", headers=origin, secret=False)
+        self.assertEqual(resp.status, 404)
+        self.assertIsNone(resp.getheader("Access-Control-Allow-Origin"))
+        resp.read()
+
+    def test_cors_allowlist_and_preflight(self):
+        self._workspace()
+        host, port = self._serve(
+            _test_config(cors_origins=("https://dash.example.com",)))
+        origin = {"Origin": "https://dash.example.com"}
+        resp = self._req(
+            host, port, "GET", "/v1/traces?workspace=demo&session=ses_a",
+            headers=origin)
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.getheader("Access-Control-Allow-Origin"),
+                         "https://dash.example.com")
+        resp.read()
+
+        # non-/v1 route stays clean even for an allowed origin
+        resp = self._req(
+            host, port, "GET", "/health", headers=origin, secret=False)
+        self.assertEqual(resp.status, 200)
+        self.assertIsNone(resp.getheader("Access-Control-Allow-Origin"))
+        resp.read()
+
+        # unlisted origin gets no CORS headers
+        resp = self._req(
+            host, port, "GET", "/v1/traces?workspace=demo&session=ses_a",
+            headers={"Origin": "https://evil.example.com"})
+        self.assertIsNone(resp.getheader("Access-Control-Allow-Origin"))
+        resp.read()
+
+        resp = self._req(
+            host, port, "OPTIONS", "/v1/turn",
+            headers={**origin,
+                     "Access-Control-Request-Headers": "x-relay-secret, content-type"},
+            secret=False)
+        self.assertEqual(resp.status, 204)
+        self.assertEqual(resp.getheader("Access-Control-Allow-Origin"),
+                         "https://dash.example.com")
+        self.assertIn("GET", resp.getheader("Access-Control-Allow-Methods"))
+        self.assertIn("x-relay-secret",
+                      resp.getheader("Access-Control-Allow-Headers"))
+        resp.read()
+
+        resp = self._req(
+            host, port, "OPTIONS", "/v1/turn",
+            headers={"Origin": "https://evil.example.com"}, secret=False)
+        self.assertEqual(resp.status, 404)
+        self.assertIsNone(resp.getheader("Access-Control-Allow-Origin"))
+        resp.read()
+
+    def test_cors_origins_from_env(self):
+        with patch.dict(
+                "os.environ",
+                {"RELAY_CORS_ORIGINS": "https://a.example.com, https://b.example.com"},
+                clear=False):
+            self.assertEqual(
+                RelayConfig.from_env().cors_origins,
+                ("https://a.example.com", "https://b.example.com"),
+            )
+        with patch.dict("os.environ", {"RELAY_CORS_ORIGINS": ""}, clear=False):
+            self.assertEqual(RelayConfig.from_env().cors_origins, ())
 
 
 if __name__ == "__main__":
