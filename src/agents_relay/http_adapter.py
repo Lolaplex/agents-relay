@@ -1006,6 +1006,34 @@ class TurnHandler(BaseHTTPRequestHandler):
             return
         self.send_error(404)
 
+    def do_DELETE(self) -> None:
+        path, query_params = _parse_query(self.path)
+        parts = path.split("/")
+        # DELETE /v1/workspaces/<id>[?hard=1]
+        if (len(parts) == 4 and parts[1] == "v1"
+                and parts[2] == "workspaces" and parts[3]):
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            ws_id = parts[3]
+            if not valid_id(ws_id):
+                self.send_error(400, f"invalid workspace id: {ws_id!r}")
+                return
+            from agents_workspace import Host
+
+            try:
+                out = Host.from_env().delete(
+                    ws_id, hard=str(query_params.get("hard") or "") == "1")
+            except ValueError as exc:
+                msg = str(exc)
+                code = 409 if "selected workspace" in msg else 400
+                self.send_error(code, msg)
+                return
+            self._write_json({"ok": True, "workspace": ws_id,
+                              "archived": str(out)}, 200)
+            return
+        self.send_error(404)
+
 
 def serve_http(config: RelayConfig, *, on_turn: Callable[..., LoopTurnResult] | None = None) -> ThreadingHTTPServer:
     attrs: dict = {

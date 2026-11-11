@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Telegram `/persona` command: `/persona` shows current + available personas, `/persona <id>` pins a per-chat persona (stored in `<ws>/relay/chat_prefs.json`), `/persona default` resets. Turns run under the pinned persona so sessions stay separate while workspace memory stays shared.
 - Telegram `/workspace` command: `/workspace` lists workspaces, `/workspace <id>` switches the chat to a real workspace (turns then run with `workspace=<id>`), `/workspace new <id> [label]` creates and switches, `/workspace serve` resets to the serve-selected workspace. A pinned persona that does not exist in the target workspace is reset to that workspace's default persona.
+- `DELETE /v1/workspaces/<id>[?hard=1]` archives the workspace to `workspaces/.trash` (or removes it with `hard=1`), returning the archive path. Refuses the serve-selected workspace with 409; invalid ids and traversals get 400, missing secret 401. Telegram `/workspace rm <id>` archives the same way and refuses the chat's current workspace.
 
 ### Changed
 - `select_workspace()` now reads `AGENTS_WORKSPACE` from the process env, so the serve-pinned workspace wins when several workspaces exist (previously `/persona` and other control paths failed with "No workspace resolved." whenever a second workspace was present).

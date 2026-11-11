@@ -598,6 +598,19 @@ def _workspace_text(chat_id: int, arg: str, config: RelayConfig) -> str:
     if not arg:
         return f"workspace: {ws.id}\navailable: {listing}"
     head, _, label = arg.partition(" ")
+    if head in ("rm", "delete"):
+        target = label.strip()
+        if not target:
+            return f"usage: /workspace rm <id>\navailable: {listing}"
+        if _chat_ws(chat_id, config) == target:
+            return f"cannot remove the workspace this chat is in — /workspace <other> first"
+        from agents_workspace import Host
+
+        try:
+            out = Host.from_env().delete(target)
+        except ValueError as exc:
+            return str(exc)
+        return f"workspace {target} archived ({out.name})"
     if head == "new":
         new_id, _, new_label = label.partition(" ")
         try:
