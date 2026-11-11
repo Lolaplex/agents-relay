@@ -489,6 +489,18 @@ class TestTelegramFormat(unittest.TestCase):
             self.assertEqual(status_html(""), "<i>Einen Moment …</i>")
         self.assertNotIn("[*]", status_html(running))
 
+    def test_humanize_status_drops_machine_noise(self):
+        from agents_relay.telegram_format import humanize_status
+
+        self.assertEqual(
+            humanize_status("/usr/local/lib/python3.12/site-packages/klanker/turn.py:44: "
+                            "UserWarning: domain env overrides are test/debug only"),
+            "",
+        )
+        self.assertEqual(humanize_status('  File "/x/runner/loop.py", line 10, in run'), "")
+        self.assertEqual(humanize_status("Traceback (most recent call last):"), "")
+        self.assertEqual(humanize_status("ValueError: unknown workspace"), "")
+
     def test_empty_final_never_whitespace(self):
         from agents_relay.telegram_format import format_telegram_html
 

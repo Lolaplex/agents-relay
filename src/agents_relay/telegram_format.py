@@ -166,12 +166,19 @@ def _job_from_running(payload: str) -> str:
     return raw.split()[0] if raw else ""
 
 
+_MACHINE_NOISE_RE = re.compile(
+    r"^(\S+\.py:\d+|Traceback \(|File \".*\", line \d+|\w*(Warning|Error)\b.*:)"
+)
+
+
 def humanize_status(text: str) -> str:
     """Turn executor/loop stderr into a short person-mid-work line. Empty = skip."""
     s = (text or "").strip()
     if not s:
         return ""
     if s.startswith("CMD:") or s.startswith("STDERR:"):
+        return ""
+    if _MACHINE_NOISE_RE.match(s):
         return ""
     if s in ("thinking...", "tools"):
         return wait_text()
