@@ -75,24 +75,6 @@ def static_root(config: RelayConfig) -> Path | None:
     return root if root.is_dir() else None
 
 
-def resolve_app_path(url_path: str) -> Path | None:
-    """Map /app/* to a file under the web root, or None for traversal/missing."""
-    rel = url_path.removeprefix("/app").lstrip("/")
-    root = web_root()
-    try:
-        candidate = (root / rel).resolve()
-    except OSError:
-        return None
-    try:
-        candidate.relative_to(root.resolve())
-    except ValueError:
-        return None
-    if candidate.is_dir():
-        index = candidate / "index.html"
-        return index if index.is_file() else None
-    return candidate if candidate.is_file() else None
-
-
 def guess_type(path: Path) -> str:
     mime, _ = mimetypes.guess_type(str(path))
     if mime:
