@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `.mailmap` maps legacy `Klix`/`Felix Kempf` author names to `Klix927` (no history rewrite; display only).
+
 ### Added
 - Persona + session HTTP routes (P2): `GET /v1/personas?workspace=<id>` (workspace-scoped, equal personas), `POST /v1/workspaces` accepts `{id,label}` (create yields the workspace's first persona `default`), `GET/POST /v1/workspaces/<ws>/personas[/<p>]` and `GET/POST /v1/workspaces/<ws>/personas/<p>/sessions[/<s>]` (list, mint, history incl. trace events). Ids only - traversal/path/label refs are 400. Session routes use agents-traces lazily; 501 when unavailable.
 - Persona inbox routes (P2 handoffs): `GET/POST /v1/workspaces/<ws>/personas/<p>/inbox` (list, create task) and `POST .../inbox/<task>/handoff {to, note}` — moves ownership to the target persona via `agents_workspace.inbox`.
