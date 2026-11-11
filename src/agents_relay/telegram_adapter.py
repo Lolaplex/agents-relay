@@ -43,7 +43,37 @@ from .telegram_format import (
 log = logging.getLogger("agents_relay.telegram")
 
 API_BASE = "https://api.telegram.org"
-_CONTROL_COMMANDS = {"jobs", "stop"}
+_CONTROL_COMMANDS = {"jobs", "stop", "persona"}
+
+
+def _prefs_path(config: RelayConfig) -> Path:
+    from .state import resolve_state_dir
+
+    return resolve_state_dir(config) / "chat_prefs.json"
+
+
+def _chat_persona(chat_id: int, config: RelayConfig) -> str:
+    """Per-chat persona preference. Empty = workspace default persona."""
+    try:
+        data = json.loads(_prefs_path(config).read_text(encoding="utf-8"))
+        return str(data.get(str(chat_id)) or "")
+    except (OSError, json.JSONDecodeError):
+        return ""
+
+
+def _set_chat_persona(chat_id: int, persona: str, config: RelayConfig) -> None:
+    path = _prefs_path(config)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    if persona:
+        data[str(chat_id)] = persona
+    else:
+        data.pop(str(chat_id), None)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=1, sort_keys=True) + "\n",
+                    encoding="utf-8")
 
 
 def _api_url(token: str, method: str) -> str:
@@ -344,6 +374,7 @@ def handle_inbound_text(
             turn_text = "Hallo"
 
     runner = on_turn or run_loop_turn
+    persona = _chat_persona(chat_id, config)
     result = LoopTurnResult(reply="", session="", user_id="", alias="", returncode=1, stderr="")
     try:
         runner_kwargs = {
@@ -355,10 +386,13 @@ def handle_inbound_text(
             "attachments": list(attachments or ()),
             "on_pid": on_pid,
         }
+        if persona:
+            runner_kwargs["persona"] = persona
         try:
             result = runner(**runner_kwargs)
         except TypeError:
-            slim = {key: value for key, value in runner_kwargs.items() if key not in ("attachments", "on_pid")}
+            slim = {key: value for key, value in runner_kwargs.items()
+                    if key not in ("attachments", "on_pid", "persona")}
             try:
                 result = runner(**slim)
             except TypeError:
@@ -493,6 +527,32 @@ def _jobs_text(jobs: list[Job]) -> str:
     return "\n".join(lines)
 
 
+def _persona_text(chat_id: int, arg: str, config: RelayConfig) -> str:
+    """/persona [<id>] — show or switch the per-chat persona."""
+    from .workspaces import get_persona, list_personas, select_workspace
+
+    try:
+        ws = select_workspace()
+    except Exception:
+        return "No workspace resolved."
+    personas = list_personas(ws)
+    names = [str(p.get("id") or "") for p in personas]
+    current = _chat_persona(chat_id, config) or ws.default_persona or "default"
+    if not arg:
+        listing = ", ".join(names) if names else "none"
+        return f"persona: {current}\navailable: {listing}"
+    if arg == "default":
+        _set_chat_persona(chat_id, "", config)
+        return "persona: default"
+    if arg == current:
+        return f"persona: {arg}"
+    if get_persona(ws, arg) is None:
+        listing = ", ".join(names) if names else "none"
+        return f"unknown persona: {arg}\navailable: {listing}"
+    _set_chat_persona(chat_id, arg, config)
+    return f"persona: {arg}"
+
+
 def _handle_control(
     command: tuple[str, str],
     chat_id: int,
@@ -503,6 +563,10 @@ def _handle_control(
     if not token:
         return
     name, rest = command
+    if name == "persona":
+        body = _persona_text(chat_id, rest, config)
+        deliver_html(token, chat_id, format_telegram_html(body))
+        return
     if name == "jobs":
         body = _jobs_text(registry.list_chat(chat_id))
         deliver_html(token, chat_id, format_telegram_html(body))

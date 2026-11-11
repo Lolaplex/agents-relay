@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Telegram `/persona` command: `/persona` shows current + available personas, `/persona <id>` pins a per-chat persona (stored in `<ws>/relay/chat_prefs.json`), `/persona default` resets. Turns run under the pinned persona so sessions stay separate while workspace memory stays shared.
+
 ### Changed
 - `.mailmap` maps legacy `Klix`/`Felix Kempf` author names to `Klix927` (no history rewrite; display only).
 - Telegram progress UX: the thinking message animates rotating dots (1-3 dots, random start, 0.9s cadence) on a timer instead of echoing tool-call status. Tool detail stays in traces and `/v1/stream` for dashboard clients.
