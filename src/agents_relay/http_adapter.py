@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 from .a2a import handle_a2a_mail, list_peers
 from .config import RelayConfig
 from .loop_client import LoopTurnResult, run_loop_turn
-from .turn import iter_loop_stream, turn_params_from_body
+from .turn import iter_loop_stream, resolve_workspace_id, turn_params_from_body, valid_id
 from .web import (
     cookie_from_header,
     handle_chat_stop,
@@ -173,7 +173,7 @@ def _sse_event(payload: dict) -> bytes:
 
 # Kwargs accepted by loop_client.run_loop_turn beyond the core turn fields.
 # turn_hook callables (e.g. telegram inbound) may not accept them.
-_OPTIONAL_TURN_KWARGS = ("attachments", "provider", "persona", "project")
+_OPTIONAL_TURN_KWARGS = ("attachments", "provider", "persona", "project", "workdir")
 
 
 class TurnHandler(BaseHTTPRequestHandler):
@@ -420,6 +420,20 @@ class TurnHandler(BaseHTTPRequestHandler):
         notify = bool(is_alert or body.get("notify") or body.get("broadcast"))
         raw_attachments = body.get("attachments") or []
 
+        # Workspace/persona are ids only — a path or label is a client bug.
+        ws = None
+        ws_ref = str(body.get("workspace") or "").strip()
+        if ws_ref:
+            try:
+                ws = resolve_workspace_id(ws_ref)
+            except ValueError as exc:
+                self.send_error(400, str(exc))
+                return
+        persona_ref = str(body.get("persona") or "").strip()
+        if persona_ref and not valid_id(persona_ref):
+            self.send_error(400, f"invalid persona id: {persona_ref!r}")
+            return
+
         turn_kwargs = {
             "channel": channel,
             "user": user,
@@ -428,7 +442,7 @@ class TurnHandler(BaseHTTPRequestHandler):
             "user_id": user_id,
             "new_session": new_session,
         }
-        for key in ("provider", "persona", "project", "workspace"):
+        for key in ("provider", "persona", "project", "workspace", "workdir"):
             val = str(body.get(key) or "").strip()
             if val:
                 turn_kwargs[key] = val
@@ -436,10 +450,11 @@ class TurnHandler(BaseHTTPRequestHandler):
             from .attachments import AttachmentRejected, allowed_attach_root, materialize_attachments
             from .state import inbox_dir
 
+            dest = (ws.relay_state / "inbox") if ws is not None else inbox_dir(self._cfg())
             try:
                 turn_kwargs["attachments"] = materialize_attachments(
                     raw_attachments,
-                    inbox_dir(self._cfg()),
+                    dest,
                     allowed_root=allowed_attach_root(self._cfg()),
                 )
             except AttachmentRejected:
@@ -478,6 +493,15 @@ class TurnHandler(BaseHTTPRequestHandler):
 
     def _handle_stream(self, body: dict) -> None:
         params = turn_params_from_body(body)
+        if params.workspace:
+            try:
+                resolve_workspace_id(params.workspace)
+            except ValueError as exc:
+                self.send_error(400, str(exc))
+                return
+        if params.persona and not valid_id(params.persona):
+            self.send_error(400, f"invalid persona id: {params.persona!r}")
+            return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")

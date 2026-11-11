@@ -98,6 +98,107 @@ class TestWorkspaceEnv(unittest.TestCase):
             self.assertEqual(captured["env"]["AGENTS_HOST_DIR"], str(ws.host.dir))
 
 
+class TestTurnWorkspaceHttp(unittest.TestCase):
+    """Per-turn workspace ids and attachment isolation."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.env = patch.dict(
+            os.environ,
+            {"AGENTS_WORKSPACES_DIR": self.dir.name},
+            clear=False,
+        )
+        self.env.start()
+        self.ws_a = Workspace.create("a")
+        self.ws_b = Workspace.create("b")
+        self.srv = _Server(_cfg())
+
+    def tearDown(self):
+        self.srv.close()
+        self.env.stop()
+        self.dir.cleanup()
+
+    def _turn(self, **fields):
+        return self.srv.request("POST", "/v1/turn", {"text": "hi", **fields})
+
+    def test_traversal_workspace_400(self):
+        resp = self._turn(workspace="../x")
+        self.assertEqual(resp.status, 400)
+
+    def test_path_workspace_400(self):
+        resp = self._turn(workspace="/tmp/x")
+        self.assertEqual(resp.status, 400)
+
+    def test_label_workspace_400(self):
+        resp = self._turn(workspace="My Workspace")
+        self.assertEqual(resp.status, 400)
+
+    def test_unknown_workspace_400(self):
+        resp = self._turn(workspace="nope-nothere")
+        self.assertEqual(resp.status, 400)
+
+    def test_persona_path_400(self):
+        resp = self._turn(persona="../evil")
+        self.assertEqual(resp.status, 400)
+
+    def test_stream_rejects_bad_workspace(self):
+        resp = self.srv.request("POST", "/v1/stream", {"text": "hi", "workspace": "../x"})
+        self.assertEqual(resp.status, 400)
+
+    def test_attachment_lands_in_turn_workspace(self):
+        from types import SimpleNamespace
+
+        def fake_dl(url, dest_dir, *, mime=""):
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            path = dest_dir / "dl.bin"
+            path.write_bytes(b"x")
+            return path
+
+        result = SimpleNamespace(
+            reply="ok", session="", user_id="", alias="", returncode=0, stderr=""
+        )
+        with patch("agents_relay.attachments.download_http", fake_dl), patch(
+            "agents_relay.http_adapter.run_loop_turn", return_value=result
+        ):
+            resp = self._turn(
+                workspace="b",
+                attachments=[{"url": "https://example.test/x.bin"}],
+            )
+        self.assertEqual(resp.status, 200)
+        b_inbox = self.ws_b.relay_state / "inbox"
+        a_inbox = self.ws_a.relay_state / "inbox"
+        self.assertTrue((b_inbox / "dl.bin").is_file())
+        self.assertFalse((a_inbox / "dl.bin").exists())
+
+    def test_workdir_field_sets_env(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"AGENTS_WORKSPACES_DIR": tmp}, clear=False):
+                Workspace.create("demo")
+                captured: dict = {}
+
+                def fake_run(argv, **kwargs):
+                    captured["env"] = kwargs.get("env")
+
+                    class Proc:
+                        returncode = 0
+                        stdout = ""
+                        stderr = ""
+
+                    return Proc()
+
+                from agents_relay.turn import run_loop_turn
+
+                with patch("agents_relay.turn.subprocess.run", fake_run):
+                    run_loop_turn(
+                        channel="http", user="u", message="hi",
+                        workspace="demo", workdir="/work/repo",
+                    )
+            self.assertEqual(
+                Path(captured["env"]["AGENTS_WORKDIR"]).resolve(),
+                Path("/work/repo").resolve(),
+            )
+
+
 class TestWorkspaceRoutes(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()

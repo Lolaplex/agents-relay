@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -28,6 +29,7 @@ class TurnParams:
     persona: str = ""
     project: str = ""
     workspace: str = ""
+    workdir: str = ""
     deliver: str = "buffered"
 
 
@@ -85,6 +87,7 @@ def turn_params_from_body(body: dict[str, Any]) -> TurnParams:
         persona=str(body.get("persona") or ""),
         project=str(body.get("project") or ""),
         workspace=str(body.get("workspace") or ""),
+        workdir=str(body.get("workdir") or "").strip(),
     )
 
 
@@ -119,20 +122,39 @@ def build_loop_argv(params: TurnParams, config: GatewayConfig) -> list[str]:
     return argv
 
 
-def workspace_env(ref: str) -> dict[str, str] | None:
+_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+
+
+def valid_id(ref: str) -> bool:
+    """A workspace or persona id: no separators, no traversal, no labels."""
+    needle = (ref or "").strip()
+    return bool(_ID_RE.fullmatch(needle)) and ".." not in needle
+
+
+def resolve_workspace_id(ref: str) -> "Workspace":
+    """Resolve an id under the host. Raises ValueError for ids, labels, paths."""
+    from agents_workspace import Host, Workspace
+
+    needle = (ref or "").strip()
+    if not valid_id(needle):
+        raise ValueError(f"invalid workspace id: {needle!r}")
+    host = Host.from_env()
+    if not host.workspace_exists(needle):
+        raise ValueError(f"unknown workspace: {needle}")
+    return host.workspace(needle)
+
+
+def workspace_env(ref: str, workdir: str = "") -> dict[str, str] | None:
     """Env for a turn that must run inside a named workspace.
 
     Empty ref means the process default, so the subprocess inherits the env.
+    ``workdir`` sets the session cwd (``AGENTS_WORKDIR``) for that child only.
     """
     needle = (ref or "").strip()
     if not needle:
         return None
-    from agents_workspace import Workspace
-
-    ws = Workspace.resolve(needle)
-    if ws is None:
-        raise ValueError(f"unknown workspace: {needle}")
-    return ws.env()
+    ws = resolve_workspace_id(needle)
+    return ws.env(workdir=workdir) if workdir.strip() else ws.env()
 
 
 def run_loop_turn(
@@ -148,6 +170,7 @@ def run_loop_turn(
     persona: str = "",
     project: str = "",
     workspace: str = "",
+    workdir: str = "",
     timeout_sec: int = 600,
 ) -> LoopTurnResult:
     params = TurnParams(
@@ -161,6 +184,7 @@ def run_loop_turn(
         persona=persona,
         project=project,
         workspace=workspace,
+        workdir=workdir,
         deliver="buffered",
     )
     cfg = config or GatewayConfig.from_env()
@@ -171,7 +195,7 @@ def run_loop_turn(
         text=True,
         timeout=timeout_sec,
         shell=False,
-        env=workspace_env(workspace),
+        env=workspace_env(workspace, workdir),
     )
     parsed = parse_loop_stdout(proc.stdout or "")
     return LoopTurnResult(
@@ -199,7 +223,7 @@ def iter_loop_stream(
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
-        env=workspace_env(params.workspace),
+        env=workspace_env(params.workspace, params.workdir),
     )
     assert proc.stdout is not None
     marker = LOOP_TRAILER_MARKER
@@ -320,7 +344,7 @@ def iter_loop_stream_live(
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
-        env=workspace_env(params.workspace),
+        env=workspace_env(params.workspace, params.workdir),
         **popen_kwargs,
     )
     if on_pid is not None and proc.pid:

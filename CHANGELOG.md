@@ -9,7 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - `GatewayClient.workspace` — sent as the `workspace` field on `/v1/turn` and `/v1/stream` and persisted in repl prefs.
+- `workdir` field on `/v1/turn`, `/v1/stream`, `/v1/chat/stream`, `TurnParams`, and both `run_loop_turn` variants — sets the child turn's session cwd (`AGENTS_WORKDIR`) independent of the workspace.
 
+### Changed
+- `workspace` and `persona` on `/v1/turn`, `/v1/alert`, `/v1/stream`, and `/v1/chat/stream` are strict ids now: paths, labels, and traversal (`../x`) are rejected with HTTP 400. The workspace resolves via `Host` per request and the child gets `ws.env()` — no process-global env mutation.
+- Attachments materialize into the selected workspace's `relay/inbox`, never the server workspace's.
 
 ### Added
 - `GET /app/` serves a bundled static herd PWA (installable chat client) same-origin with the API — a phone on the tailnet can pin `https://<node>.ts.net/app/` and talk to `/v1/*` with no cross-origin fetch and no CORS change. `/app` redirects to `/app/`; paths stay inside the web root. `AGENTS_RELAY_WEB_DIR` overrides the bundled dir. Static files stay public; `/v1/*` keeps the secret check.
