@@ -108,6 +108,46 @@ class TestWorkspaceEnv(unittest.TestCase):
                 with patch.dict(os.environ, {"AGENTS_WORKSPACE": "b"}, clear=False):
                     self.assertEqual(select_workspace().id, "b")
 
+    def test_delete_route_archives_and_guards(self):
+        import urllib.error
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"AGENTS_WORKSPACES_DIR": tmp,
+                   "AGENTS_WORKSPACE": "demo"}
+            with patch.dict(os.environ, env, clear=False):
+                Workspace.create("demo")
+                Workspace.create("lab")
+                srv = _Server(_cfg())
+                self.addCleanup(srv.close)
+                # secret required
+                try:
+                    conn = HTTPConnection(srv.host, srv.port, timeout=10)
+                    conn.request("DELETE", "/v1/workspaces/lab")
+                    resp = conn.getresponse()
+                    self.assertEqual(resp.status, 401)
+                    resp.read()
+                finally:
+                    conn.close()
+                # selected workspace refused
+                resp = srv.request("DELETE", "/v1/workspaces/demo")
+                self.assertEqual(resp.status, 409)
+                resp.read()
+                # archive lab
+                resp = srv.request("DELETE", "/v1/workspaces/lab")
+                self.assertEqual(resp.status, 200)
+                data = json.loads(resp.read().decode())
+                self.assertTrue(data["ok"])
+                self.assertIn(".trash", data["archived"])
+                self.assertFalse((Path(tmp) / "lab").exists())
+                # unknown -> 400
+                resp = srv.request("DELETE", "/v1/workspaces/lab")
+                self.assertEqual(resp.status, 400)
+                resp.read()
+                # traversal -> 400
+                resp = srv.request("DELETE", "/v1/workspaces/..%2Fevil")
+                self.assertEqual(resp.status, 400)
+                resp.read()
+
     def test_select_ambiguous_without_env(self):
         from agents_relay.workspaces import select_workspace
 

@@ -79,6 +79,7 @@ class RelayConfig:
     web_user: str = "web"
     static_dir: str = ""
     web_secure: bool = True
+    cors_origins: tuple[str, ...] = ()
 
     @classmethod
     def from_env(cls) -> "RelayConfig":
@@ -111,6 +112,14 @@ class RelayConfig:
             web_user=_clean(os.environ.get("RELAY_WEB_USER", "web")) or "web",
             static_dir=_clean(read_alias(None, "AGENTS_RELAY_WEB_DIR", "RELAY_STATIC_DIR")),
             web_secure=_flag(os.environ.get("RELAY_WEB_SECURE", "1")),
+            cors_origins=tuple(
+                origin
+                for origin in (
+                    _clean(part)
+                    for part in os.environ.get("RELAY_CORS_ORIGINS", "").split(",")
+                )
+                if origin
+            ),
         )
 
 

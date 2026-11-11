@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Telegram `/persona` command: `/persona` shows current + available personas, `/persona <id>` pins a per-chat persona (stored in `<ws>/relay/chat_prefs.json`), `/persona default` resets. Turns run under the pinned persona so sessions stay separate while workspace memory stays shared.
 - Telegram `/workspace` command: `/workspace` lists workspaces, `/workspace <id>` switches the chat to a real workspace (turns then run with `workspace=<id>`), `/workspace new <id> [label]` creates and switches, `/workspace serve` resets to the serve-selected workspace. A pinned persona that does not exist in the target workspace is reset to that workspace's default persona.
+- `DELETE /v1/workspaces/<id>[?hard=1]` archives the workspace to `workspaces/.trash` (or removes it with `hard=1`), returning the archive path. Refuses the serve-selected workspace with 409; invalid ids and traversals get 400, missing secret 401. Telegram `/workspace rm <id>` archives the same way and refuses the chat's current workspace.
 
 ### Changed
 - `select_workspace()` now reads `AGENTS_WORKSPACE` from the process env, so the serve-pinned workspace wins when several workspaces exist (previously `/persona` and other control paths failed with "No workspace resolved." whenever a second workspace was present).
@@ -55,6 +56,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Web surface for a browser client: `RELAY_WEB_TOKEN` enables cookie auth, `RELAY_STATIC_DIR` serves a dashboard build at `/`. Login exchanges the token for an HttpOnly `relay_web` cookie (30 days, HMAC-signed). `RELAY_WEB_USER` and `RELAY_WEB_SECURE` tune it. The relay ships no UI of its own.
 - `POST /v1/chat/stream` streams `start`, `status` (humanized stderr progress), `delta` (answer tokens), `trailer`, and `error` events. `POST /v1/chat/stop` kills the turn's process tree by `run` id. `GET /v1/auth/status`, `POST /v1/auth/login`, `POST /v1/auth/logout`.
 - `iter_loop_stream_live` in `turn.py`: stdout and stderr feed one queue, so progress is visible while tools run. Cancellation reuses `jobs.kill_process_tree`.
+
+### Added
+- Dashboard API (agents-relay#12): `GET /v1/traces?workspace=&persona=&session=&limit=` tails the workspace's agents-traces daily JSONL files (`<ws>/traces/YYYY-MM-DD.jsonl`) filtered by session id and returns the newest `limit` raw lines (`{"lines": [...], "note": ""}`); without `session` it lists that persona's on-disk session ids instead. `persona` narrows events to that stamp (unstamped events still match). `GET /v1/approvals?workspace=` lists pending tool approvals (`{id, tool, summary}`) and `POST /v1/approvals/<id>` with `{"allow": true|false}` resolves one through the same `approvals/<id>.json` file the Telegram callback and `approve --decide` write. `?workspace=` targets `<ws>/relay/approvals`; without it the serve state dir is used.
+- `RELAY_CORS_ORIGINS`: comma-separated origin allowlist for cross-origin dashboard fetches. Matching `/v1/*` responses carry `Access-Control-Allow-Origin` and `OPTIONS` preflights answer 204 with `Access-Control-Allow-Methods`/`-Headers`. Unset means no CORS headers at all; same-origin static serving is unaffected.
 
 ### Changed
 - `_check_secret` accepts the `relay_web` cookie. With `RELAY_WEB_TOKEN` set and `RELAY_SECRET` empty, the cookie is the only gate on every endpoint instead of "no auth".
