@@ -9,8 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Persona + session HTTP routes (P2): `GET /v1/personas?workspace=<id>` (workspace-scoped, equal personas), `POST /v1/workspaces` accepts `{id,label}` (create yields the workspace's first persona `default`), `GET/POST /v1/workspaces/<ws>/personas[/<p>]` and `GET/POST /v1/workspaces/<ws>/personas/<p>/sessions[/<s>]` (list, mint, history incl. trace events). Ids only - traversal/path/label refs are 400. Session routes use agents-traces lazily; 501 when unavailable.
+- Persona inbox routes (P2 handoffs): `GET/POST /v1/workspaces/<ws>/personas/<p>/inbox` (list, create task) and `POST .../inbox/<task>/handoff {to, note}` — moves ownership to the target persona via `agents_workspace.inbox`.
 
 ### Fixed
+- Attachments: the allowed root now follows the turn's workspace (`ws.relay_state`) instead of the env-selected workspace — fixes ambiguous-workspace 500s and cross-workspace allowance when `/v1/turn` carries a workspace id.
 - Tests: `sys.executable` replaces bare `python` in `loop_cmd` (python3-only
   images); `test_cli_local_decide` detaches a closed stdin pipe before
   `communicate()` instead of flushing it.

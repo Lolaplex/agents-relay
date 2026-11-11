@@ -300,6 +300,46 @@ class TestWorkspaceRoutes(unittest.TestCase):
             "GET", "/v1/workspaces/demo/personas/..%2Fevil/sessions")
         self.assertIn(resp.status, (400, 404))
 
+    def test_inbox_handoff_roundtrip(self):
+        create_workspace("demo")
+        resp = self.srv.request(
+            "POST", "/v1/workspaces/demo/personas", {"id": "cos"})
+        self.assertEqual(resp.status, 201)
+        # task lands in default's inbox
+        resp = self.srv.request(
+            "POST", "/v1/workspaces/demo/personas/default/inbox",
+            {"title": "write report", "user": "me"})
+        self.assertEqual(resp.status, 201)
+        task = json.loads(resp.read().decode())["task"]
+        self.assertEqual(task["owner"], "default")
+        tid = task["id"]
+        # handoff default -> cos: owner moves, cos inbox lists it
+        resp = self.srv.request(
+            "POST", f"/v1/workspaces/demo/personas/default/inbox/{tid}/handoff",
+            {"to": "cos", "note": "yours"})
+        self.assertEqual(resp.status, 200)
+        data = json.loads(resp.read().decode())
+        self.assertEqual(data["task"]["owner"], "cos")
+        resp = self.srv.request(
+            "GET", "/v1/workspaces/demo/personas/cos/inbox")
+        self.assertEqual(resp.status, 200)
+        rows = json.loads(resp.read().decode())["inbox"]
+        self.assertEqual([t["id"] for t in rows], [tid])
+        # default inbox now empty; replaying the same handoff 404s
+        resp = self.srv.request(
+            "GET", "/v1/workspaces/demo/personas/default/inbox")
+        self.assertEqual(json.loads(resp.read().decode())["inbox"], [])
+        resp = self.srv.request(
+            "POST", f"/v1/workspaces/demo/personas/default/inbox/{tid}/handoff",
+            {"to": "ops"})
+        self.assertEqual(resp.status, 400)
+
+    def test_inbox_requires_title(self):
+        create_workspace("demo")
+        resp = self.srv.request(
+            "POST", "/v1/workspaces/demo/personas/default/inbox", {})
+        self.assertEqual(resp.status, 400)
+
 
 if __name__ == "__main__":
     unittest.main()
