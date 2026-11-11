@@ -241,3 +241,41 @@ class TestWorkspaceRoutes(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StateDirTests(unittest.TestCase):
+    def test_legacy_shared_dir_never_used(self) -> None:
+        """A present ~/.agents-relay must not steal state from a workspace."""
+        import warnings
+
+        from agents_relay.state import resolve_state_dir
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        home = root / "home"
+        home.mkdir()
+        (home / ".agents-relay").mkdir()
+        host = root / "host"
+        host.mkdir()
+
+        env = {"AGENTS_HOST_DIR": str(host), "AGENTS_WORKSPACE": ""}
+        import agents_relay.state as state_mod
+
+        state_mod._legacy_warned = False
+        with patch.dict(os.environ, env, clear=False), patch(
+            "pathlib.Path.home", return_value=home
+        ), warnings.catch_warnings(record=True) as seen:
+            warnings.simplefilter("always")
+            out = resolve_state_dir()
+        self.assertTrue(str(out).startswith(str(host)), out)
+        self.assertTrue(out.is_dir())
+        self.assertTrue(any("agents-workspace migrate" in str(w.message) for w in seen))
+
+    def test_explicit_config_state_dir_wins(self) -> None:
+        from agents_relay.state import resolve_state_dir
+
+        cfg = _cfg(state_dir="C:/tmp/custom-relay-state")
+        self.assertEqual(
+            resolve_state_dir(cfg), Path("C:/tmp/custom-relay-state")
+        )

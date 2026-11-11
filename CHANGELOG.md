@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `workdir` field on `/v1/turn`, `/v1/stream`, `/v1/chat/stream`, `TurnParams`, and both `run_loop_turn` variants — sets the child turn's session cwd (`AGENTS_WORKDIR`) independent of the workspace.
 
 ### Changed
+- `resolve_state_dir` never falls back to the shared legacy `~/.agents-relay` anymore. Relay state (approvals, inbox, attachments) always lives under the selected workspace's `relay/` domain and is created on demand. A present legacy dir triggers one `DeprecationWarning` pointing at `agents-workspace migrate`.
 - `workspace` and `persona` on `/v1/turn`, `/v1/alert`, `/v1/stream`, and `/v1/chat/stream` are strict ids now: paths, labels, and traversal (`../x`) are rejected with HTTP 400. The workspace resolves via `Host` per request and the child gets `ws.env()` — no process-global env mutation.
 - Attachments materialize into the selected workspace's `relay/inbox`, never the server workspace's.
 
