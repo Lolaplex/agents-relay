@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import re
 import threading
 import time
@@ -305,20 +306,20 @@ def handle_inbound_text(
         raise ValueError("TELEGRAM_BOT_TOKEN is not set")
     loop_user = (user or str(chat_id)).strip() or str(chat_id)
 
-    thinking_msg = send_message(token, chat_id, status_html("thinking"), parse_mode="HTML")
+    thinking_msg = send_message(token, chat_id, "<i>thinking.</i>", parse_mode="HTML")
     thinking_id = (thinking_msg.get("result") or {}).get("message_id") if isinstance(thinking_msg, dict) else None
 
     # Generic liveness only: rotate dots on a timer. Tool-call details stay in
     # traces / dashboard streams, not in the chat UI.
     anim_done = threading.Event()
-    phase = [0]
+    phase = [random.randint(0, 2)]
 
     def _animate() -> None:
-        while not anim_done.wait(1.4):
+        while not anim_done.wait(0.9):
             if not thinking_id:
                 continue
-            phase[0] = (phase[0] + 1) % 4
-            dots = "." * phase[0]
+            phase[0] = (phase[0] + 1) % 3
+            dots = "." * (phase[0] + 1)
             try:
                 edit_message(
                     token, chat_id, thinking_id,
