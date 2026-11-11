@@ -281,6 +281,23 @@ def handle_chat_stream(handler: BaseHTTPRequestHandler, body: dict) -> None:
     with _ACTIVE_LOCK:
         _ACTIVE[run] = cancel
 
+    ws_ref = str(body.get("workspace") or "").strip()
+    persona_ref = str(body.get("persona") or "").strip()
+    if ws_ref:
+        from .turn import resolve_workspace_id
+
+        try:
+            resolve_workspace_id(ws_ref)
+        except ValueError as exc:
+            handler._write_json({"ok": False, "error": str(exc)}, 400)  # type: ignore[attr-defined]
+            return
+    if persona_ref:
+        from .turn import valid_id
+
+        if not valid_id(persona_ref):
+            handler._write_json({"ok": False, "error": f"invalid persona id: {persona_ref!r}"}, 400)  # type: ignore[attr-defined]
+            return
+
     params = TurnParams(
         channel="web",
         user=config.web_user,
@@ -288,9 +305,10 @@ def handle_chat_stream(handler: BaseHTTPRequestHandler, body: dict) -> None:
         session=str(body.get("session") or "").strip(),
         new_session=bool(body.get("new_session")),
         provider=str(body.get("provider") or "").strip(),
-        persona=str(body.get("persona") or "").strip(),
+        persona=persona_ref,
         project=str(body.get("project") or "").strip(),
-        workspace=str(body.get("workspace") or "").strip(),
+        workspace=ws_ref,
+        workdir=str(body.get("workdir") or "").strip(),
     )
 
     handler.send_response(200)

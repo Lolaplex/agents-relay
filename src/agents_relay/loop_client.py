@@ -77,6 +77,7 @@ def run_loop_turn(
     persona: str = "",
     project: str = "",
     workspace: str = "",
+    workdir: str = "",
 ) -> LoopTurnResult:
     cfg = config or RelayConfig.from_env()
     argv = list(cfg.loop_cmd)
@@ -119,7 +120,7 @@ def run_loop_turn(
                 text=True,
                 timeout=wait,
                 shell=False,
-                env=workspace_env(workspace),
+                env=workspace_env(workspace, workdir),
             )
         except subprocess.TimeoutExpired as exc:
             err = exc.stderr or ""
@@ -149,7 +150,7 @@ def run_loop_turn(
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
-        env=workspace_env(workspace),
+        env=workspace_env(workspace, workdir),
         **popen_kwargs,
     )
     if on_pid is not None and proc.pid:
