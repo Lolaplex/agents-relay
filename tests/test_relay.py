@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import unittest
 from dataclasses import dataclass
 from http.client import HTTPConnection
@@ -17,7 +18,7 @@ from agents_relay.webhooks import handle_webhook
 
 def _test_config(**overrides) -> RelayConfig:
     base = dict(
-        loop_cmd=("python", "-c", "print('skip')"),
+        loop_cmd=(sys.executable, "-c", "print('skip')"),
         loop_provider="echo",
         relay_secret="expected",
         telegram_bot_token="",
@@ -116,7 +117,7 @@ class TestLoopSubprocess(unittest.TestCase):
 
     def test_timeout_reply_hides_command(self):
         cfg = RelayConfig(
-            loop_cmd=("python", "-c", "import time; time.sleep(30)"),
+            loop_cmd=(sys.executable, "-c", "import time; time.sleep(30)"),
             loop_provider="echo",
             relay_secret="",
             telegram_bot_token="",

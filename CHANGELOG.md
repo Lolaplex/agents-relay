@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Tests: `sys.executable` replaces bare `python` in `loop_cmd` (python3-only
+  images); `test_cli_local_decide` detaches a closed stdin pipe before
+  `communicate()` instead of flushing it.
+
 ### Changed
 - Docs updated to the Host > Workspace layout (`<ws>/relay`, `<host>/clients`,
   `AGENTS_HOST_DIR`). Historic entries below keep the old names.
