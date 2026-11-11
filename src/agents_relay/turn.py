@@ -26,6 +26,7 @@ class TurnParams:
     user_id: str = ""
     new_session: bool = False
     provider: str = ""
+    model: str = ""
     persona: str = ""
     project: str = ""
     workspace: str = ""
@@ -84,6 +85,7 @@ def turn_params_from_body(body: dict[str, Any]) -> TurnParams:
         user_id=str(body.get("user_id") or ""),
         new_session=bool(body.get("new_session")),
         provider=str(body.get("provider") or ""),
+        model=str(body.get("model") or ""),
         persona=str(body.get("persona") or ""),
         project=str(body.get("project") or ""),
         workspace=str(body.get("workspace") or ""),
@@ -109,6 +111,8 @@ def build_loop_argv(params: TurnParams, config: GatewayConfig) -> list[str]:
             params.deliver,
         ]
     )
+    if params.model:
+        argv.extend(["--model", params.model])
     if params.session:
         argv.extend(["--session", params.session])
     if params.user_id:
@@ -167,6 +171,7 @@ def run_loop_turn(
     user_id: str = "",
     new_session: bool = False,
     provider: str = "",
+    model: str = "",
     persona: str = "",
     project: str = "",
     workspace: str = "",
@@ -181,6 +186,7 @@ def run_loop_turn(
         user_id=user_id,
         new_session=new_session,
         provider=provider,
+        model=model,
         persona=persona,
         project=project,
         workspace=workspace,

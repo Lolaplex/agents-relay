@@ -51,6 +51,7 @@ _ENVELOPE_KEYS = frozenset({
     "secret",
     "token",
     "provider",
+    "model",
     "persona",
     "project",
 })
@@ -176,7 +177,7 @@ def _sse_event(payload: dict) -> bytes:
 
 # Kwargs accepted by loop_client.run_loop_turn beyond the core turn fields.
 # turn_hook callables (e.g. telegram inbound) may not accept them.
-_OPTIONAL_TURN_KWARGS = ("attachments", "provider", "persona", "project", "workdir")
+_OPTIONAL_TURN_KWARGS = ("attachments", "provider", "model", "persona", "project", "workdir")
 
 
 class TurnHandler(BaseHTTPRequestHandler):
@@ -507,7 +508,7 @@ class TurnHandler(BaseHTTPRequestHandler):
             "user_id": user_id,
             "new_session": new_session,
         }
-        for key in ("provider", "persona", "project", "workspace", "workdir"):
+        for key in ("provider", "model", "persona", "project", "workspace", "workdir"):
             val = str(body.get(key) or "").strip()
             if val:
                 turn_kwargs[key] = val

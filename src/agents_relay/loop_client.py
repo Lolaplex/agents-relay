@@ -74,6 +74,7 @@ def run_loop_turn(
     attachments: list[str] | None = None,
     on_pid: Callable[[int], None] | None = None,
     provider: str = "",
+    model: str = "",
     persona: str = "",
     project: str = "",
     workspace: str = "",
@@ -96,6 +97,8 @@ def run_loop_turn(
             "buffered",
         ]
     )
+    if model:
+        argv.extend(["--model", model])
     if session:
         argv.extend(["--session", session])
     if user_id:
