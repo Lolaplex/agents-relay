@@ -27,7 +27,10 @@ def get_workspace(ws_id: str) -> Workspace:
 
 
 def select_workspace() -> Workspace:
-    return Host.from_env().select_workspace()
+    """AGENTS_WORKSPACE (serve-pinned) > single existing workspace."""
+    import os
+
+    return Host.from_env().select_workspace(env=dict(os.environ))
 
 
 def list_personas(ws: Workspace) -> list[dict]:

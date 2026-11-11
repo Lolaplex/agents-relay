@@ -97,6 +97,29 @@ class TestWorkspaceEnv(unittest.TestCase):
             self.assertEqual(captured["env"]["AGENTS_WORKSPACE"], "demo")
             self.assertEqual(captured["env"]["AGENTS_HOST_DIR"], str(ws.host.dir))
 
+    def test_select_prefers_agents_workspace_env(self):
+        from agents_relay.workspaces import select_workspace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"AGENTS_WORKSPACES_DIR": tmp}
+            with patch.dict(os.environ, env, clear=False):
+                Workspace.create("a")
+                Workspace.create("b")
+                with patch.dict(os.environ, {"AGENTS_WORKSPACE": "b"}, clear=False):
+                    self.assertEqual(select_workspace().id, "b")
+
+    def test_select_ambiguous_without_env(self):
+        from agents_relay.workspaces import select_workspace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"AGENTS_WORKSPACES_DIR": tmp}
+            with patch.dict(os.environ, env, clear=False):
+                os.environ.pop("AGENTS_WORKSPACE", None)
+                Workspace.create("a")
+                Workspace.create("b")
+                with self.assertRaises(ValueError):
+                    select_workspace()
+
 
 class TestTurnWorkspaceHttp(unittest.TestCase):
     """Per-turn workspace ids and attachment isolation."""
