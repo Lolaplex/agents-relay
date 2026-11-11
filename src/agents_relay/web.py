@@ -1,6 +1,6 @@
 """Cookie auth, static assets, and streaming chat for a browser client.
 
-The relay stays a dumb gateway: it serves whatever directory ``RELAY_STATIC_DIR``
+The relay stays a dumb gateway: it serves whatever directory ``AGENTS_RELAY_WEB_DIR``
 points at and never ships a UI of its own. The dashboard is built elsewhere and
 mounted here, so the browser talks to the same origin as the API and needs no
 CORS.

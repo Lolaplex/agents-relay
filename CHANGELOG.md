@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `workdir` field on `/v1/turn`, `/v1/stream`, `/v1/chat/stream`, `TurnParams`, and both `run_loop_turn` variants — sets the child turn's session cwd (`AGENTS_WORKDIR`) independent of the workspace.
 
 ### Changed
+- Env renames via `agents_workspace.compat.read_alias`: `AGENTS_RELAY_DIR` (alias `AGENTS_RELAY_STATE`), `AGENTS_RELAY_WEB_DIR` (alias `RELAY_STATIC_DIR`), `RELAY_SECRET`/`RELAY_HOST`/`RELAY_PORT` canonical with `GATEWAY_*` deprecated aliases. `GatewayConfig` is a deprecated module-level alias for `RelayConfig` (warns on import).
 - Client-app paths resolve on the host: `paths.host_dir()`/`clients_dir()` return `<host>` / `<host>/clients` via `agents_workspace.Host` (helper `agents_home()` removed). `migrate_legacy_dot_client` still lifts `~/.client` once with a DeprecationWarning.
 - Update-check cache lives at `<host>/cache/updates/`.
 - `resolve_state_dir` never falls back to the shared legacy `~/.agents-relay` anymore. Relay state (approvals, inbox, attachments) always lives under the selected workspace's `relay/` domain and is created on demand. A present legacy dir triggers one `DeprecationWarning` pointing at `agents-workspace migrate`.

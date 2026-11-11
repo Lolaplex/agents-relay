@@ -10,11 +10,11 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
-from .config import GatewayConfig
+from .config import RelayConfig
 
 
 def _board_request(
-    cfg: GatewayConfig,
+    cfg: RelayConfig,
     *,
     verb: str,
     project: str,
@@ -58,9 +58,9 @@ def mail_put(
     to: str,
     body: dict[str, Any],
     project: str = "",
-    config: GatewayConfig | None = None,
+    config: RelayConfig | None = None,
 ) -> dict[str, Any]:
-    cfg = config or GatewayConfig.from_env()
+    cfg = config or RelayConfig.from_env()
     return _board_request(
         cfg,
         verb="mail.put",
@@ -72,22 +72,22 @@ def mail_put(
 def mail_get(
     *,
     project: str = "",
-    config: GatewayConfig | None = None,
+    config: RelayConfig | None = None,
 ) -> dict[str, Any]:
-    cfg = config or GatewayConfig.from_env()
+    cfg = config or RelayConfig.from_env()
     return _board_request(cfg, verb="mail.get", project=project, payload={})
 
 
 def list_peers(
     *,
     project: str = "",
-    config: GatewayConfig | None = None,
+    config: RelayConfig | None = None,
 ) -> dict[str, Any]:
-    cfg = config or GatewayConfig.from_env()
+    cfg = config or RelayConfig.from_env()
     return _board_request(cfg, verb="peers", project=project, payload={})
 
 
-def handle_a2a_mail(body: dict[str, Any], config: GatewayConfig | None = None) -> dict[str, Any]:
+def handle_a2a_mail(body: dict[str, Any], config: RelayConfig | None = None) -> dict[str, Any]:
     verb = str(body.get("verb") or "mail.put")
     project = str(body.get("project") or "")
     if verb == "mail.get":
