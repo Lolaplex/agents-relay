@@ -469,11 +469,15 @@ class TurnHandler(BaseHTTPRequestHandler):
             from .state import inbox_dir
 
             dest = (ws.relay_state / "inbox") if ws is not None else inbox_dir(self._cfg())
+            allowed_root = (
+                ws.relay_state if ws is not None
+                else allowed_attach_root(self._cfg())
+            )
             try:
                 turn_kwargs["attachments"] = materialize_attachments(
                     raw_attachments,
                     dest,
-                    allowed_root=allowed_attach_root(self._cfg()),
+                    allowed_root=allowed_root,
                 )
             except AttachmentRejected:
                 self.send_error(400, "attachment path outside allowed directory")
@@ -557,7 +561,61 @@ class TurnHandler(BaseHTTPRequestHandler):
                 return
             self._write_json({"ok": True, "session": rec}, 201)
             return
+        if len(parts) == 7 and parts[6] == "inbox":
+            # POST .../personas/<p>/inbox {title, note, user}
+            title = str(body.get("title") or "").strip()
+            if not title:
+                self.send_error(400, "title is required")
+                return
+            from agents_workspace.inbox import create_task
+            try:
+                task = create_task(
+                    ws, persona, title,
+                    note=str(body.get("note") or ""),
+                    user=str(body.get("user") or ""),
+                    task_id=str(body.get("id") or ""),
+                )
+            except ValueError as exc:
+                self.send_error(400, str(exc))
+                return
+            self._write_json({"ok": True, "task": task}, 201)
+            return
+        if (len(parts) == 9 and parts[6] == "inbox"
+                and parts[8] == "handoff"):
+            # POST .../inbox/<task>/handoff {to, note}
+            to = str(body.get("to") or "").strip()
+            if not to or not valid_id(to):
+                self.send_error(400, "handoff 'to' persona id is required")
+                return
+            from agents_workspace.inbox import handoff
+            try:
+                task = handoff(
+                    ws, parts[7], to,
+                    from_persona=persona,
+                    note=str(body.get("note") or ""),
+                )
+            except ValueError as exc:
+                msg = str(exc)
+                self.send_error(404 if "unknown task" in msg else 400, msg)
+                return
+            self._write_json({"ok": True, "task": task}, 200)
+            return
         self.send_error(404)
+
+    def _handle_inbox_get(self, parts: list[str]) -> None:
+        try:
+            ws, persona = self._ws_and_persona(parts)
+        except KeyError:
+            self.send_error(404, "unknown workspace")
+            return
+        except ValueError as exc:
+            self.send_error(400, str(exc))
+            return
+        from agents_workspace.inbox import list_inbox
+
+        self._write_json(
+            {"ok": True, "workspace": ws.id, "persona": persona,
+             "inbox": list_inbox(ws, persona)}, 200)
 
     def _handle_session_get(self, parts: list[str], query_params: dict) -> None:
         try:
@@ -690,6 +748,15 @@ class TurnHandler(BaseHTTPRequestHandler):
                  "personas": list_personas(ws)}, 200)
             return
         parts = path.split("/")
+        # GET /v1/workspaces/<ws>/personas/<p>/inbox
+        if (len(parts) == 7 and parts[1] == "v1"
+                and parts[2] == "workspaces" and parts[4] == "personas"
+                and parts[6] == "inbox"):
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            self._handle_inbox_get(parts)
+            return
         # GET /v1/workspaces/<ws>/personas/<p>/sessions[/<s>]
         if (len(parts) in (7, 8) and parts[1] == "v1"
                 and parts[2] == "workspaces" and parts[4] == "personas"
