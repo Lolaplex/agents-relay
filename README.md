@@ -10,7 +10,7 @@
 <p align="center">
   <strong>Stdlib HTTP and Telegram relay in front of agents-harness runner.loop.</strong><br>
   One subprocess per turn. Trailer parsing for session metadata. No identity store, no traces, no writes under <code>~/.agents</code>.
-  Approval decisions and downloaded files live in the relay state dir (<code>AGENTS_RELAY_STATE</code>, default <code>~/.agents-relay</code>).
+  Approval decisions and downloaded files live in the workspace relay dir (<code>AGENTS_RELAY_STATE</code>, default <code>&lt;ws&gt;/relay</code>).
 </p>
 
 ---
@@ -102,7 +102,7 @@ Telegram chats can send `/jobs`, `/stop`, and `/stop <id>` while `serve` is poll
 | `TELEGRAM_BOT_TOKEN` | Enables poll + `send` |
 | `TELEGRAM_ALLOWED_CHAT_IDS` | Comma-separated numeric IDs. Empty refuses the Telegram adapter unless `AGENTS_RELAY_ALLOW_ANYONE=1` |
 | `AGENTS_RELAY_ALLOW_ANYONE` | `1` opts in to an empty allowlist. Logs a loud warning. Anyone who can message the bot can run turns and approve tools |
-| `AGENTS_RELAY_STATE` | Relay files (default `~/.agents-relay`). Approvals: `$AGENTS_RELAY_STATE/approvals/<id>.json`. Inbox: `.../inbox/` |
+| `AGENTS_RELAY_STATE` | Relay files (default `<ws>/relay`, resolved per workspace). Approvals: `$AGENTS_RELAY_STATE/approvals/<id>.json`. Inbox: `.../inbox/` |
 | `AGENTS_RELAY_APPROVER` | Chat id used by `approve` when `--user` is missing or not numeric (HTTP turns often pass `anonymous`) |
 | `AGENTS_RELAY_ATTACH_DIR` | Only local `/v1/turn` attachment paths under this directory are accepted (default: the relay state dir) |
 | `AGENTS_RELAY_MAX_JOBS` | Global cap on parallel Telegram turns (default 8) |
@@ -215,7 +215,7 @@ Or via CLI: `python -m agents_relay client turn "hello" --url http://127.0.0.1:8
 
 ## Client config layout
 
-Human `client-*` apps store **UI prefs only** under **`~/.agents/clients/`** (honours `AGENTS_HOME`):
+Human `client-*` apps store **UI prefs only** under **`<host>/clients/`** (`AGENTS_HOST_DIR`, default `~/.agents`):
 
 | Path | App |
 |------|-----|

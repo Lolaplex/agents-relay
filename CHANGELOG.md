@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Docs updated to the Host > Workspace layout (`<ws>/relay`, `<host>/clients`,
+  `AGENTS_HOST_DIR`). Historic entries below keep the old names.
+
 ### Added
 - `GatewayClient.workspace` — sent as the `workspace` field on `/v1/turn` and `/v1/stream` and persisted in repl prefs.
 - `workdir` field on `/v1/turn`, `/v1/stream`, `/v1/chat/stream`, `TurnParams`, and both `run_loop_turn` variants — sets the child turn's session cwd (`AGENTS_WORKDIR`) independent of the workspace.
