@@ -303,27 +303,34 @@ def handle_inbound_text(
         raise ValueError("TELEGRAM_BOT_TOKEN is not set")
     loop_user = (user or str(chat_id)).strip() or str(chat_id)
 
-    thinking_msg = send_message(token, chat_id, status_html("thinking..."), parse_mode="HTML")
+    thinking_msg = send_message(token, chat_id, status_html("thinking"), parse_mode="HTML")
     thinking_id = (thinking_msg.get("result") or {}).get("message_id") if isinstance(thinking_msg, dict) else None
 
-    last_status_time = [0.0]
-    last_status_val = [""]
+    # Generic liveness only: rotate dots on a timer. Tool-call details stay in
+    # traces / dashboard streams, not in the chat UI.
+    anim_done = threading.Event()
+    phase = [0]
+
+    def _animate() -> None:
+        while not anim_done.wait(1.4):
+            if not thinking_id:
+                continue
+            phase[0] = (phase[0] + 1) % 4
+            dots = "." * phase[0]
+            try:
+                edit_message(
+                    token, chat_id, thinking_id,
+                    f"<i>thinking{dots}</i>", parse_mode="HTML",
+                )
+            except Exception:
+                pass
+
+    if thinking_id:
+        threading.Thread(target=_animate, daemon=True).start()
 
     def handle_status(status_text: str) -> None:
-        if not thinking_id:
-            return
-        cleaned = humanize_status(status_text)
-        if not cleaned or cleaned == last_status_val[0]:
-            return
-        now = time.monotonic()
-        if now - last_status_time[0] < 1.5:
-            return
-        last_status_time[0] = now
-        last_status_val[0] = cleaned
-        try:
-            edit_message(token, chat_id, thinking_id, status_html(cleaned), parse_mode="HTML")
-        except Exception:
-            pass
+        # Status events only pace the animation; never surface tool details.
+        return
 
     raw_lower = (text or "").strip().lower()
     is_new = raw_lower in ("/new", "/reset") or raw_lower.startswith(("/new ", "/reset "))
@@ -390,6 +397,7 @@ def handle_inbound_text(
             stderr="",
         )
 
+    anim_done.set()
     deliver_html(token, chat_id, reply_html, thinking_id=thinking_id if isinstance(thinking_id, int) else None)
     return result
 
