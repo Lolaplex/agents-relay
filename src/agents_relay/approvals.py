@@ -1,6 +1,6 @@
 """Approval files under the relay state dir.
 
-`agents-relay approve` writes `$AGENTS_RELAY_STATE/approvals/<id>.json` and
+`agents-relay approve` writes `$AGENTS_RELAY_DIR/approvals/<id>.json` and
 blocks. Telegram inline buttons and `approve --decide` both call
 `record_decision`. `--local` skips Telegram and waits on that same file.
 No HTTP endpoint.
