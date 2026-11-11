@@ -328,13 +328,31 @@ class TurnHandler(BaseHTTPRequestHandler):
             if body is None:
                 return
             label = str(body.get("label") or "").strip()
-            if not label:
-                self.send_error(400, "label is required")
+            ws_id = str(body.get("id") or "").strip()
+            if ws_id and not valid_id(ws_id):
+                self.send_error(400, f"invalid workspace id: {ws_id!r}")
+                return
+            if not ws_id and not label:
+                self.send_error(400, "id or label is required")
                 return
             from .workspaces import create_workspace
 
-            ws = create_workspace(label)
+            try:
+                ws = create_workspace(label, ws_id)
+            except ValueError as exc:
+                self.send_error(400, str(exc))
+                return
             self._write_json({"ok": True, "workspace": ws.to_dict()}, 201)
+            return
+
+        parts = path.split("/")
+        # /v1/workspaces/<ws>/personas[/<p>[/sessions[/<s>]]]
+        if (len(parts) >= 5 and parts[1] == "v1"
+                and parts[2] == "workspaces" and parts[4] == "personas"):
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            self._handle_persona_post(parts, query_params)
             return
 
         if path == "/v1/chat/stream":
@@ -491,6 +509,105 @@ class TurnHandler(BaseHTTPRequestHandler):
         }
         self._write_json(payload, 200 if result.returncode == 0 else 502)
 
+    def _ws_and_persona(self, parts: list[str]):
+        """(Workspace, persona id) from route segments; ids only (C22 rules)."""
+        from .workspaces import get_workspace
+
+        ws_id, persona = parts[3], parts[5] if len(parts) > 5 else ""
+        for label, ref in (("workspace", ws_id), ("persona", persona)):
+            if ref and not valid_id(ref):
+                raise ValueError(f"invalid {label} id: {ref!r}")
+        ws = get_workspace(ws_id)
+        return ws, persona
+
+    def _handle_persona_post(self, parts: list[str], query_params: dict) -> None:
+        body = self._read_json()
+        if body is None:
+            return
+        try:
+            ws, persona = self._ws_and_persona(parts)
+        except KeyError:
+            self.send_error(404, "unknown workspace")
+            return
+        except ValueError as exc:
+            self.send_error(400, str(exc))
+            return
+        from .workspaces import create_persona, create_session, list_sessions
+
+        if len(parts) == 5:
+            # POST /v1/workspaces/<ws>/personas {id, ...manifest fields}
+            pid = str(body.get("id") or "").strip()
+            if not pid or not valid_id(pid):
+                self.send_error(400, "persona id is required (ids only)")
+                return
+            row = create_persona(ws, pid, body)
+            self._write_json({"ok": True, "persona": row}, 201)
+            return
+        if len(parts) == 7 and parts[6] == "sessions":
+            # POST .../personas/<p>/sessions {user, channel, workdir}
+            try:
+                rec = create_session(
+                    ws, persona,
+                    user=str(body.get("user") or body.get("user_id") or ""),
+                    channel=str(body.get("channel") or ""),
+                    workdir=str(body.get("workdir") or ""),
+                )
+            except RuntimeError as exc:
+                self.send_error(501, str(exc))
+                return
+            self._write_json({"ok": True, "session": rec}, 201)
+            return
+        self.send_error(404)
+
+    def _handle_session_get(self, parts: list[str], query_params: dict) -> None:
+        try:
+            ws, persona = self._ws_and_persona(parts)
+        except KeyError:
+            self.send_error(404, "unknown workspace")
+            return
+        except ValueError as exc:
+            self.send_error(400, str(exc))
+            return
+        from .workspaces import get_session, list_sessions
+
+        if len(parts) == 7:
+            user = str(query_params.get("user") or "").strip()
+            try:
+                rows = list_sessions(ws, persona=persona, user=user)
+            except RuntimeError as exc:
+                self.send_error(501, str(exc))
+                return
+            self._write_json(
+                {"ok": True, "workspace": ws.id, "persona": persona,
+                 "sessions": rows}, 200)
+            return
+        sid = parts[7]
+        if not valid_id(sid) and not sid.startswith(("ses_", "proc-", "telegram-", "repl-")):
+            self.send_error(400, f"invalid session id: {sid!r}")
+            return
+        try:
+            rec = get_session(ws, persona, sid)
+        except RuntimeError as exc:
+            self.send_error(501, str(exc))
+            return
+        if rec is None:
+            self.send_error(404, "unknown session")
+            return
+        payload = {"ok": True, "session": rec}
+        # history = session record + its trace events (lazy traces dep)
+        try:
+            from agents_traces.store import TraceStore
+            events = [
+                e.to_dict() if hasattr(e, "to_dict") else dict(e)
+                for e in TraceStore(ws.traces).iter_events(session_id=sid)
+            ]
+            payload["events"] = events
+        except ImportError:
+            pass
+        except Exception as exc:
+            log.warning("session events unavailable: %s", exc)
+        self._write_json(payload, 200)
+
     def _handle_stream(self, body: dict) -> None:
         params = turn_params_from_body(body)
         if params.workspace:
@@ -555,6 +672,32 @@ class TurnHandler(BaseHTTPRequestHandler):
 
             rows = [ws.to_dict() for ws in list_workspaces()]
             self._write_json({"ok": True, "workspaces": rows}, 200)
+            return
+        if path == "/v1/personas":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            from .workspaces import get_workspace, list_personas, select_workspace
+
+            ws_ref = str(query_params.get("workspace") or "").strip()
+            try:
+                ws = get_workspace(ws_ref) if ws_ref else select_workspace()
+            except (KeyError, ValueError) as exc:
+                self.send_error(400, f"unknown workspace: {ws_ref!r}")
+                return
+            self._write_json(
+                {"ok": True, "workspace": ws.id,
+                 "personas": list_personas(ws)}, 200)
+            return
+        parts = path.split("/")
+        # GET /v1/workspaces/<ws>/personas/<p>/sessions[/<s>]
+        if (len(parts) in (7, 8) and parts[1] == "v1"
+                and parts[2] == "workspaces" and parts[4] == "personas"
+                and parts[6] == "sessions"):
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            self._handle_session_get(parts, query_params)
             return
         if path in ("/health", "/"):
             if path == "/" and web_enabled(cfg) and serve_static(self, "index.html"):

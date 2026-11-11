@@ -238,6 +238,68 @@ class TestWorkspaceRoutes(unittest.TestCase):
         conn.request("GET", "/v1/workspaces")
         self.assertEqual(conn.getresponse().status, 401)
 
+    def test_post_creates_workspace_by_id(self):
+        resp = self.srv.request(
+            "POST", "/v1/workspaces", {"id": "proj-b", "label": "Proj B"})
+        self.assertEqual(resp.status, 201)
+        data = json.loads(resp.read().decode())
+        self.assertEqual(data["workspace"]["id"], "proj-b")
+        # first persona 'default' created with the workspace
+        self.assertTrue((Path(data["workspace"]["root"]) / "personas"
+                         / "default" / "persona.json").is_file())
+
+    def test_get_personas_workspace_scoped(self):
+        create_workspace("demo")
+        resp = self.srv.request("GET", "/v1/personas?workspace=demo")
+        self.assertEqual(resp.status, 200)
+        data = json.loads(resp.read().decode())
+        self.assertEqual(data["workspace"], "demo")
+        ids = {p["id"] for p in data["personas"]}
+        self.assertIn("default", ids)
+
+    def test_get_personas_bad_workspace_400(self):
+        resp = self.srv.request("GET", "/v1/personas?workspace=nope")
+        self.assertEqual(resp.status, 400)
+
+    def test_session_roundtrip(self):
+        create_workspace("demo")
+        base = "/v1/workspaces/demo/personas/cos"
+        # create the persona manifest explicitly (equal persona, not default)
+        resp = self.srv.request(
+            "POST", "/v1/workspaces/demo/personas", {"id": "cos"})
+        self.assertEqual(resp.status, 201)
+        # mint a session under it
+        resp = self.srv.request(
+            "POST", base + "/sessions", {"user": "me", "channel": "http"})
+        self.assertEqual(resp.status, 201)
+        data = json.loads(resp.read().decode())
+        ses = data["session"]
+        self.assertEqual(ses["persona"], "cos")
+        self.assertEqual(ses["workspace"], "demo")
+        self.assertTrue(ses["id"].startswith("ses_"))
+        sid = ses["id"]
+        # list sessions under the persona
+        resp = self.srv.request("GET", base + "/sessions")
+        self.assertEqual(resp.status, 200)
+        rows = json.loads(resp.read().decode())["sessions"]
+        self.assertEqual([r["id"] for r in rows], [sid])
+        # fetch the single session (record + events key)
+        resp = self.srv.request("GET", base + f"/sessions/{sid}")
+        self.assertEqual(resp.status, 200)
+        data = json.loads(resp.read().decode())
+        self.assertEqual(data["session"]["id"], sid)
+        self.assertIn("events", data)
+        # a second persona's session list stays separate
+        resp = self.srv.request("GET", "/v1/workspaces/demo/personas/ops/sessions")
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(json.loads(resp.read().decode())["sessions"], [])
+
+    def test_session_routes_reject_traversal(self):
+        create_workspace("demo")
+        resp = self.srv.request(
+            "GET", "/v1/workspaces/demo/personas/..%2Fevil/sessions")
+        self.assertIn(resp.status, (400, 404))
+
 
 if __name__ == "__main__":
     unittest.main()
