@@ -100,6 +100,10 @@ def get_session(ws: Workspace, persona: str, session_id: str) -> dict | None:
     return rec.to_dict() if rec else None
 
 
+def delete_session(ws: Workspace, persona: str, session_id: str) -> bool:
+    return _session_store(ws).delete(session_id, persona=persona)
+
+
 def create_session(ws: Workspace, persona: str, *, user: str = "",
                    channel: str = "", workdir: str = "") -> dict:
     """Mint a session via the identity resolve path (API/CLI only)."""

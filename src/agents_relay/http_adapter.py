@@ -1032,6 +1032,37 @@ class TurnHandler(BaseHTTPRequestHandler):
             self._write_json({"ok": True, "workspace": ws_id,
                               "archived": str(out)}, 200)
             return
+        # DELETE /v1/workspaces/<ws>/personas/<p>/sessions/<s>
+        if (len(parts) == 8 and parts[1] == "v1"
+                and parts[2] == "workspaces" and parts[4] == "personas"
+                and parts[6] == "sessions"):
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            try:
+                ws, persona = self._ws_and_persona(parts)
+            except KeyError:
+                self.send_error(404, "unknown workspace")
+                return
+            except ValueError as exc:
+                self.send_error(400, str(exc))
+                return
+            sid = parts[7]
+            if not valid_id(sid) and not sid.startswith(("ses_", "proc-", "telegram-", "repl-")):
+                self.send_error(400, f"invalid session id: {sid!r}")
+                return
+            from .workspaces import delete_session
+
+            try:
+                removed = delete_session(ws, persona, sid)
+            except RuntimeError as exc:
+                self.send_error(501, str(exc))
+                return
+            if not removed:
+                self.send_error(404, "unknown session")
+                return
+            self._write_json({"ok": True, "session": sid}, 200)
+            return
         self.send_error(404)
 
 
