@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Persona + session HTTP routes (P2): `GET /v1/personas?workspace=<id>` (workspace-scoped, equal personas), `POST /v1/workspaces` accepts `{id,label}` (create yields the workspace's first persona `default`), `GET/POST /v1/workspaces/<ws>/personas[/<p>]` and `GET/POST /v1/workspaces/<ws>/personas/<p>/sessions[/<s>]` (list, mint, history incl. trace events). Ids only - traversal/path/label refs are 400. Session routes use agents-traces lazily; 501 when unavailable.
+
 ### Fixed
 - Tests: `sys.executable` replaces bare `python` in `loop_cmd` (python3-only
   images); `test_cli_local_decide` detaches a closed stdin pipe before
