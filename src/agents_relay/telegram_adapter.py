@@ -206,6 +206,8 @@ def send_to_user(
                 channel="telegram",
                 user=str(chat_id),
                 user_id=resolved.user.id,
+                workspace=resolved.session.workspace,
+                persona=resolved.session.persona,
             )
         except Exception:
             pass
