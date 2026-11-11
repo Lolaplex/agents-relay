@@ -17,16 +17,30 @@ from .config import RelayConfig
 def resolve_state_dir(config: RelayConfig | None = None) -> Path:
     """Directory for approvals and downloaded attachments.
 
-    `AGENTS_RELAY_STATE` wins, then the workspace relay domain. The legacy
-    `~/.agents-relay` is read while it still holds pending approvals.
+    `AGENTS_RELAY_STATE`/`AGENTS_RELAY_DIR` wins, then the workspace relay
+    domain. The legacy `~/.agents-relay` is never read at runtime; run
+    `agents-workspace migrate` to fold it into a workspace.
     """
     if config is not None and config.state_dir:
         return Path(config.state_dir).expanduser()
     ws = Workspace.from_env()
     legacy = Path.home() / ".agents-relay"
-    if not ws.relay_state.exists() and legacy.is_dir():
-        return legacy
+    global _legacy_warned
+    if legacy.is_dir() and not _legacy_warned:
+        _legacy_warned = True
+        import warnings
+
+        warnings.warn(
+            f"legacy relay state dir {legacy} is ignored; run "
+            "`agents-workspace migrate` to fold it into a workspace",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    ws.relay_state.mkdir(parents=True, exist_ok=True)
     return ws.relay_state
+
+
+_legacy_warned = False
 
 
 def approval_dir(config: RelayConfig | None = None) -> Path:
