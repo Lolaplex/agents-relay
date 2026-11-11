@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - `.mailmap` maps legacy `Klix`/`Felix Kempf` author names to `Klix927` (no history rewrite; display only).
-- Telegram progress UX: the thinking message now animates rotating dots (`thinking.` → `thinking...`) on a timer instead of echoing tool-call status. Tool detail stays in traces and `/v1/stream` for dashboard clients.
+- Telegram progress UX: the thinking message animates rotating dots (1-3 dots, random start, 0.9s cadence) on a timer instead of echoing tool-call status. Tool detail stays in traces and `/v1/stream` for dashboard clients.
 
 ### Fixed
 - `humanize_status` drops machine noise (Python `*.py:NN: Warning`, `Traceback`, `File "..."` frames, `*Error:` lines) so interpreter warnings can no longer surface as chat messages.
