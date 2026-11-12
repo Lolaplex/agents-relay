@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .config import RelayConfig
-from .turn import workspace_env
+from .turn import resolve_workspace_id, workspace_env
 
 LOOP_TRAILER_MARKER = "---agents-loop-trailer---"
 
@@ -115,21 +115,41 @@ def run_loop_turn(
 
     wait = timeout_sec if timeout_sec and timeout_sec > 0 else None
 
-    if on_status is None and on_pid is None:
+    ws = None
+    if workspace:
         try:
+            ws = resolve_workspace_id(workspace)
+        except Exception:
+            ws = None
+    container = False
+    child_env = workspace_env(workspace, workdir)
+    if ws is not None:
+        try:
+            from agents_workspace.runtime import (
+                isolation_of, to_container_argv, to_container_env,
+            )
+            if isolation_of(ws) == "container":
+                child_env = to_container_env(ws, child_env)
+                argv = to_container_argv(ws, argv)
+                container = True
+        except ImportError:
+            pass
+
+    def _run_blocking() -> LoopTurnResult:
+        if container:
+            from agents_workspace.runtime import run as ws_run
+
+            assert ws is not None
+            proc = ws_run(ws, argv, child_env, capture=True, timeout=wait or 0)
+        else:
             proc = subprocess.run(
                 argv,
                 capture_output=True,
                 text=True,
                 timeout=wait,
                 shell=False,
-                env=workspace_env(workspace, workdir),
+                env=child_env,
             )
-        except subprocess.TimeoutExpired as exc:
-            err = exc.stderr or ""
-            if isinstance(err, bytes):
-                err = err.decode("utf-8", errors="replace")
-            return _stopped(err)
         parsed = parse_loop_stdout(proc.stdout or "")
         return LoopTurnResult(
             reply=parsed["reply"],
@@ -140,6 +160,19 @@ def run_loop_turn(
             stderr=proc.stderr or "",
         )
 
+    if on_status is None and on_pid is None:
+        try:
+            return _run_blocking()
+        except subprocess.TimeoutExpired as exc:
+            err = exc.stderr or ""
+            if isinstance(err, bytes):
+                err = err.decode("utf-8", errors="replace")
+            return _stopped(err)
+        except RuntimeError as exc:
+            return LoopTurnResult(
+                reply=f"Turn failed: {exc}", session="", user_id="",
+                alias="", returncode=1, stderr=str(exc),
+            )
     import threading
 
     popen_kwargs: dict[str, Any] = {}
@@ -147,15 +180,21 @@ def run_loop_turn(
         # Own process group so /stop can kill the loop and its tool children
         # without signaling the relay.
         popen_kwargs["start_new_session"] = True
-    proc = subprocess.Popen(
-        argv,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-        env=workspace_env(workspace, workdir),
-        **popen_kwargs,
-    )
+    if container:
+        from agents_workspace.runtime import spawn as ws_spawn
+
+        assert ws is not None
+        proc = ws_spawn(ws, argv, child_env, pipes=True)
+    else:
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            env=child_env,
+            **popen_kwargs,
+        )
     if on_pid is not None and proc.pid:
         try:
             on_pid(int(proc.pid))

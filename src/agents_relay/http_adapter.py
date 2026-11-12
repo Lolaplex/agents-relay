@@ -1118,6 +1118,14 @@ def serve_http(config: RelayConfig, *, on_turn: Callable[..., LoopTurnResult] | 
     }
     if on_turn is not None:
         attrs["turn_hook"] = _TurnHook(on_turn)
+    try:
+        from agents_workspace.runtime import sweep
+
+        removed = sweep()
+        if removed:
+            log.info("swept %d stale klanker-ws containers", len(removed))
+    except Exception:
+        pass
     handler = type("ConfiguredRelayHandler", (TurnHandler,), attrs)
     server = ThreadingHTTPServer((config.relay_host, config.relay_port), handler)
     log.info("HTTP listening on %s:%s", config.relay_host, config.relay_port)
