@@ -971,6 +971,22 @@ class TurnHandler(BaseHTTPRequestHandler):
                 return
             self._handle_approvals_get(query_params)
             return
+        if path == "/v1/providers":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            try:
+                from runner.providers import list_providers
+                rows = [
+                    {"name": r.get("name"), "kind": r.get("kind"),
+                     "model": r.get("model"), "when": r.get("when")}
+                    for r in list_providers()
+                ]
+            except Exception as exc:
+                self.send_error(500, f"providers unavailable: {exc}")
+                return
+            self._write_json({"ok": True, "providers": rows}, 200)
+            return
         parts = path.split("/")
         # GET /v1/workspaces/<ws>/personas/<p>/inbox
         if (len(parts) == 7 and parts[1] == "v1"
@@ -1031,6 +1047,34 @@ class TurnHandler(BaseHTTPRequestHandler):
                 self.send_error(code, msg)
                 return
             self._write_json({"ok": True, "workspace": ws_id,
+                              "archived": str(out)}, 200)
+            return
+        # DELETE /v1/workspaces/<ws>/personas/<p>[?hard=1]
+        if (len(parts) == 6 and parts[1] == "v1"
+                and parts[2] == "workspaces" and parts[4] == "personas"):
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            try:
+                ws, _persona = self._ws_and_persona(parts)
+            except KeyError:
+                self.send_error(404, "unknown workspace")
+                return
+            except ValueError as exc:
+                self.send_error(400, str(exc))
+                return
+            pid = parts[5]
+            if not valid_id(pid):
+                self.send_error(400, f"invalid persona id: {pid!r}")
+                return
+            from .workspaces import delete_persona
+
+            out = delete_persona(
+                ws, pid, hard=str(query_params.get("hard") or "") == "1")
+            if out is None:
+                self.send_error(404, "unknown persona")
+                return
+            self._write_json({"ok": True, "persona": pid,
                               "archived": str(out)}, 200)
             return
         # DELETE /v1/workspaces/<ws>/personas/<p>/sessions/<s>

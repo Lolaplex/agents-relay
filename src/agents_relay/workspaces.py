@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 
 from agents_workspace import Host, Workspace
@@ -80,6 +82,25 @@ def create_persona(ws: Workspace, persona_id: str, body: dict | None = None) -> 
     manifest.write_text(
         json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return data
+
+
+def delete_persona(ws: Workspace, persona_id: str, *, hard: bool = False) -> Path | None:
+    """Archive ``<ws>/personas/<id>`` to ``personas/.trash/<id>-<utc>`` (default)
+    or remove it entirely (``hard=True``). Returns the archive path or the
+    removed dir; None when the persona does not exist."""
+    _valid_id(persona_id)
+    pdir = Path(ws.personas) / persona_id
+    if not pdir.is_dir():
+        return None
+    if hard:
+        shutil.rmtree(pdir)
+        return pdir
+    trash = Path(ws.personas) / ".trash"
+    trash.mkdir(exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    dst = trash / f"{persona_id}-{stamp}"
+    shutil.move(str(pdir), str(dst))
+    return dst
 
 
 def _session_store(ws: Workspace):
