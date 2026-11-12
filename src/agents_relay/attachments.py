@@ -79,6 +79,7 @@ def materialize_attachments(
             continue
         raw_path = str(item.get("path") or "").strip()
         raw_url = str(item.get("url") or "").strip()
+        raw_data = str(item.get("data") or "").strip()
         mime = str(item.get("mime") or "").split(";", 1)[0].strip().lower()
         if raw_path:
             try:
@@ -87,11 +88,43 @@ def materialize_attachments(
                 continue
             paths.append(str(saved))
             continue
+        if raw_data:
+            saved = _save_b64(
+                raw_data, dest_dir, mime=mime,
+                name=str(item.get("name") or ""))
+            if saved is not None:
+                paths.append(str(saved))
+            continue
         if raw_url:
             saved = download_http(raw_url, dest_dir, mime=mime)
             if saved is not None:
                 paths.append(str(saved))
     return paths
+
+
+_MAX_B64 = 25 * 1024 * 1024
+
+
+def _save_b64(data: str, dest_dir: Path, *, mime: str = "", name: str = "") -> Path | None:
+    """Decode a base64 upload from HTTP clients into the turn inbox."""
+    import base64
+
+    if len(data) > _MAX_B64 * 2:
+        log.warning("attachment data too large")
+        return None
+    try:
+        blob = base64.b64decode(data, validate=True)
+    except Exception:
+        log.warning("attachment data is not base64")
+        return None
+    if not blob or len(blob) > _MAX_B64:
+        return None
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    ext = extension_for_mime(mime) or Path(name).suffix or ".bin"
+    stem = safe_filename(Path(name).stem) if name else "upload"
+    target = dest_dir / f"{stem}_{uuid.uuid4().hex[:6]}{ext}"
+    target.write_bytes(blob)
+    return target
 
 
 class _SkipAttachment(Exception):

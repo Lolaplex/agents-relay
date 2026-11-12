@@ -385,6 +385,57 @@ class TurnHandler(BaseHTTPRequestHandler):
             self._write_json({"ok": True, "workspace": ws.to_dict()}, 201)
             return
 
+        if path == "/v1/jobs":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            body = self._read_json()
+            if body is None:
+                return
+            ws_ref = str(body.get("workspace") or "").strip()
+            persona = str(body.get("persona") or "").strip()
+            goal = str(body.get("goal") or "").strip()
+            if not ws_ref or not valid_id(ws_ref):
+                self.send_error(400, "workspace id is required")
+                return
+            if not persona or not valid_id(persona):
+                self.send_error(400, "persona id is required")
+                return
+            if not goal:
+                self.send_error(400, "goal is required")
+                return
+            from agents_workspace import Host
+
+            host = Host.from_env()
+            if not host.workspace_exists(ws_ref):
+                self.send_error(404, f"unknown workspace: {ws_ref}")
+                return
+            ws = host.workspace(ws_ref)
+            if not (ws.personas / persona / "persona.json").is_file():
+                self.send_error(404, f"unknown persona: {persona}")
+                return
+            from .coding_jobs import create_job
+            from .loop_client import run_loop_turn
+
+            runner = (self.turn_hook.fn if self.turn_hook else None) or run_loop_turn
+
+            def _job_turn(**kw):
+                kw.setdefault("config", self._cfg())
+                return runner(**kw)
+
+            job = create_job(
+                ws,
+                persona=persona,
+                goal=goal,
+                workdir=str(body.get("workdir") or ""),
+                provider=str(body.get("provider") or ""),
+                model=str(body.get("model") or ""),
+                user=str(body.get("user") or ""),
+                run_turn=_job_turn,
+            )
+            self._write_json({"ok": True, "job": job}, 201)
+            return
+
         parts = path.split("/")
         # /v1/workspaces/<ws>/personas[/<p>[/sessions[/<s>]]]
         if (len(parts) >= 5 and parts[1] == "v1"
@@ -795,6 +846,36 @@ class TurnHandler(BaseHTTPRequestHandler):
                         tail.append(line.rstrip("\r\n"))
         self._write_json({"ok": True, "lines": list(tail), "note": ""}, 200)
 
+    def _handle_jobs_get(self, path: str, query_params: dict) -> None:
+        """List or fetch goal-sessions (jobs) under ?workspace=<id>."""
+        from agents_workspace import Host
+
+        from .coding_jobs import get_job, list_jobs
+        from .workspaces import get_workspace
+
+        ws_ref = str(query_params.get("workspace") or "").strip()
+        if not ws_ref or not valid_id(ws_ref):
+            self.send_error(400, "workspace id is required")
+            return
+        if not Host.from_env().workspace_exists(ws_ref):
+            self.send_error(404, f"unknown workspace: {ws_ref}")
+            return
+        ws = get_workspace(ws_ref)
+        persona = str(query_params.get("persona") or "").strip()
+        if persona and not valid_id(persona):
+            self.send_error(400, f"invalid persona id: {persona!r}")
+            return
+        job_id = path.rsplit("/", 1)[-1] if "/" in path[7:] else ""
+        if job_id and job_id != "jobs":
+            job = get_job(ws, job_id, persona=persona)
+            if job is None:
+                self.send_error(404, "unknown job")
+                return
+            self._write_json({"ok": True, "job": job}, 200)
+            return
+        self._write_json(
+            {"ok": True, "jobs": list_jobs(ws, persona=persona)}, 200)
+
     def _approvals_dir(self, query_params: dict) -> Path:
         """``<ws>/relay/approvals`` for ?workspace=<id>, else the serve state dir."""
         from .state import approval_dir
@@ -958,6 +1039,12 @@ class TurnHandler(BaseHTTPRequestHandler):
             self._write_json(
                 {"ok": True, "workspace": ws.id,
                  "personas": list_personas(ws)}, 200)
+            return
+        if path == "/v1/jobs" or path.startswith("/v1/jobs/"):
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            self._handle_jobs_get(path, query_params)
             return
         if path == "/v1/traces":
             if not _check_secret(self, self.relay_secret, query_params):
