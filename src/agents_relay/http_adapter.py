@@ -423,16 +423,20 @@ class TurnHandler(BaseHTTPRequestHandler):
                 kw.setdefault("config", self._cfg())
                 return runner(**kw)
 
-            job = create_job(
-                ws,
-                persona=persona,
-                goal=goal,
-                workdir=str(body.get("workdir") or ""),
-                provider=str(body.get("provider") or ""),
-                model=str(body.get("model") or ""),
-                user=str(body.get("user") or ""),
-                run_turn=_job_turn,
-            )
+            try:
+                job = create_job(
+                    ws,
+                    persona=persona,
+                    goal=goal,
+                    workdir=str(body.get("workdir") or ""),
+                    provider=str(body.get("provider") or ""),
+                    model=str(body.get("model") or ""),
+                    user=str(body.get("user") or ""),
+                    run_turn=_job_turn,
+                )
+            except RuntimeError as exc:
+                self.send_error(501, str(exc))
+                return
             self._write_json({"ok": True, "job": job}, 201)
             return
 

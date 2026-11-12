@@ -32,6 +32,7 @@ class TurnParams:
     workspace: str = ""
     workdir: str = ""
     deliver: str = "buffered"
+    attachments: tuple[str, ...] = ()
 
 
 @dataclass
@@ -123,7 +124,33 @@ def build_loop_argv(params: TurnParams, config: GatewayConfig) -> list[str]:
         argv.extend(["--project", params.project])
     if params.persona:
         argv.extend(["--persona", params.persona])
+    for path in params.attachments:
+        if path:
+            argv.extend(["--attach", str(path)])
     return argv
+
+
+def _container_rewrite(
+    argv: list[str], workspace: str, workdir: str
+) -> tuple[list[str], dict[str, str], "Workspace | None"]:
+    """Resolve workspace isolation. Returns (argv, env, ws) — ws set only
+    when isolation=container so callers can dispatch via runtime.spawn/run.
+    Without docker + container isolation the runtime raises (loud, no
+    silent local fallback)."""
+    env = workspace_env(workspace, workdir)
+    if not workspace:
+        return argv, env, None
+    try:
+        ws = resolve_workspace_id(workspace)
+    except Exception:
+        return argv, env, None
+    try:
+        from agents_workspace.runtime import isolation_of, to_container_argv, to_container_env
+    except ImportError:
+        return argv, env, None
+    if isolation_of(ws) != "container":
+        return argv, env, None
+    return to_container_argv(ws, argv), to_container_env(ws, env), ws
 
 
 _ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
@@ -195,14 +222,20 @@ def run_loop_turn(
     )
     cfg = config or GatewayConfig.from_env()
     argv = build_loop_argv(params, cfg)
-    proc = subprocess.run(
-        argv,
-        capture_output=True,
-        text=True,
-        timeout=timeout_sec,
-        shell=False,
-        env=workspace_env(workspace, workdir),
-    )
+    argv, env, ws = _container_rewrite(argv, workspace, workdir)
+    if ws is not None:
+        from agents_workspace.runtime import run as ws_run
+
+        proc = ws_run(ws, argv, env, capture=True, timeout=timeout_sec)
+    else:
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+            shell=False,
+            env=env,
+        )
     parsed = parse_loop_stdout(proc.stdout or "")
     return LoopTurnResult(
         reply=parsed["reply"],
@@ -223,14 +256,20 @@ def iter_loop_stream(
     cfg = config or GatewayConfig.from_env()
     stream_params = replace(params, deliver="stream")
     argv = build_loop_argv(stream_params, cfg)
-    proc = subprocess.Popen(
-        argv,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-        env=workspace_env(params.workspace, params.workdir),
-    )
+    argv, env, ws = _container_rewrite(argv, params.workspace, params.workdir)
+    if ws is not None:
+        from agents_workspace.runtime import spawn as ws_spawn
+
+        proc = ws_spawn(ws, argv, env, pipes=True)
+    else:
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
     assert proc.stdout is not None
     marker = LOOP_TRAILER_MARKER
     pending = ""
@@ -340,19 +379,25 @@ def iter_loop_stream_live(
     """
     cfg = config or GatewayConfig.from_env()
     argv = build_loop_argv(replace(params, deliver="stream"), cfg)
-    popen_kwargs: dict[str, Any] = {}
-    if os.name != "nt":
-        # Own process group so cancel kills the loop and its tool children.
-        popen_kwargs["start_new_session"] = True
-    proc = subprocess.Popen(
-        argv,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-        env=workspace_env(params.workspace, params.workdir),
-        **popen_kwargs,
-    )
+    argv, child_env, ws = _container_rewrite(argv, params.workspace, params.workdir)
+    if ws is not None:
+        from agents_workspace.runtime import spawn as ws_spawn
+
+        proc = ws_spawn(ws, argv, child_env, pipes=True)
+    else:
+        popen_kwargs: dict[str, Any] = {}
+        if os.name != "nt":
+            # Own process group so cancel kills the loop and its tool children.
+            popen_kwargs["start_new_session"] = True
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            env=child_env,
+            **popen_kwargs,
+        )
     if on_pid is not None and proc.pid:
         try:
             on_pid(int(proc.pid))

@@ -72,6 +72,8 @@ def create_job(
     rec = create_session(ws, persona, user=user or _JOB_USER)
     store = _store(ws)
     s = store.get(rec["id"], persona=persona)
+    if s is None:
+        raise RuntimeError(f"session {rec['id']} not persisted")
     s.goal = goal
     s.status = "queued"
     s.workspace = ws.id
@@ -80,8 +82,8 @@ def create_job(
     store.put(s, persona=persona)
 
     def _run() -> None:
-        _set_status(ws, persona, s.id, "running")
         try:
+            _set_status(ws, persona, s.id, "running")
             res = run_turn(
                 message=goal,
                 user=user or _JOB_USER,

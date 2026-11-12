@@ -265,11 +265,12 @@ def handle_chat_stream(handler: BaseHTTPRequestHandler, body: dict) -> None:
 
     ws_ref = str(body.get("workspace") or "").strip()
     persona_ref = str(body.get("persona") or "").strip()
+    ws = None
     if ws_ref:
         from .turn import resolve_workspace_id
 
         try:
-            resolve_workspace_id(ws_ref)
+            ws = resolve_workspace_id(ws_ref)
         except ValueError as exc:
             handler._write_json({"ok": False, "error": str(exc)}, 400)  # type: ignore[attr-defined]
             return
@@ -280,6 +281,20 @@ def handle_chat_stream(handler: BaseHTTPRequestHandler, body: dict) -> None:
             handler._write_json({"ok": False, "error": f"invalid persona id: {persona_ref!r}"}, 400)  # type: ignore[attr-defined]
             return
 
+    raw_attachments = body.get("attachments")
+    attach_paths: tuple[str, ...] = ()
+    if raw_attachments:
+        from .attachments import AttachmentRejected, allowed_attach_root, materialize_attachments
+        from .state import inbox_dir
+
+        dest = (ws.relay_state / "inbox") if ws is not None else inbox_dir(config)
+        allowed_root = ws.relay_state if ws is not None else allowed_attach_root(config)
+        try:
+            attach_paths = tuple(materialize_attachments(raw_attachments, dest, allowed_root=allowed_root))
+        except AttachmentRejected:
+            handler._write_json({"ok": False, "error": "attachment path outside allowed directory"}, 400)  # type: ignore[attr-defined]
+            return
+
     params = TurnParams(
         channel="web",
         user=config.web_user,
@@ -287,10 +302,12 @@ def handle_chat_stream(handler: BaseHTTPRequestHandler, body: dict) -> None:
         session=str(body.get("session") or "").strip(),
         new_session=bool(body.get("new_session")),
         provider=str(body.get("provider") or "").strip(),
+        model=str(body.get("model") or "").strip(),
         persona=persona_ref,
         project=str(body.get("project") or "").strip(),
         workspace=ws_ref,
         workdir=str(body.get("workdir") or "").strip(),
+        attachments=attach_paths,
     )
 
     handler.send_response(200)
