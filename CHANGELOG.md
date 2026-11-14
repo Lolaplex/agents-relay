@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `AGENTS_RELAY_VISION` (`auto`, `on`, `off`). `auto` follows `AGENTS_VISION` when set, otherwise the provider manifest (`vision: true` or `capabilities` containing `vision`) from `AGENTS_PROVIDERS_DIR` or the installed agents-harness provider data. An image with vision off or unsupported is named in the reply. `on` and `off` are passed to the child as `AGENTS_VISION`.
 
 ### Fixed
-- `.relay-inbox/.gitignore` contains `*` so a workdir `git add` does not commit attachment copies. Workspace file listings skip `.relay-inbox` (`DEFAULT_SKIP_DIRS`).
+- `.relay-inbox/.gitignore` contains `*` so a workdir `git add` does not commit attachment copies.
 - `AGENTS_RELAY_VISION=auto` passes the resolved decision to the child as `AGENTS_VISION=1` or `0`, so the harness does not send an image the relay has already reported as not shown.
 - A missing, oversized, malformed, or failed attachment is reported on the reply instead of being omitted. Telegram downloads and inline base64 uploads use the same 20 MB cap as URL downloads.
 - `POST /v1/stream` materializes `attachments` the same way as `/v1/turn`. A web chat turn can send an attachment without text.

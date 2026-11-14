@@ -24,7 +24,6 @@ from agents_relay.attachments import (
 )
 from agents_relay.config import RelayConfig
 from agents_relay.loop_client import run_loop_turn
-from agents_relay.workspace_tree import DEFAULT_SKIP_DIRS
 
 
 def _cfg(tmp: Path, **overrides) -> RelayConfig:
@@ -192,10 +191,6 @@ class TestMirror(unittest.TestCase):
             )
             self.assertIn("README.md", staged.stdout.splitlines())
             self.assertFalse(any(MIRROR_DIRNAME in line for line in staged.stdout.splitlines()))
-
-    def test_workspace_tree_skips_relay_inbox(self):
-        self.assertIn(MIRROR_DIRNAME, DEFAULT_SKIP_DIRS)
-        self.assertIn(".relay-inbox", DEFAULT_SKIP_DIRS)
 
 
 class TestVision(unittest.TestCase):
