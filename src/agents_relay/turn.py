@@ -134,8 +134,9 @@ def prepare_loop(params: TurnParams, config: GatewayConfig) -> tuple[TurnParams,
     """Mirror attachments into the workdir and decide the vision notice.
 
     The returned env is merged into the child before container path rewrite.
-    `on`/`off` from `AGENTS_RELAY_VISION` becomes `AGENTS_VISION` so the
-    harness shows or withholds image parts the same way the reply explains.
+    `AGENTS_RELAY_VISION` (`on`, `off`, and the resolved `auto` decision)
+    becomes `AGENTS_VISION` so the harness shows or withholds image parts
+    the same way the reply explains.
     """
     from .attachments import prepare_turn_files, vision_active, vision_env, vision_notice
 
@@ -153,7 +154,7 @@ def prepare_loop(params: TurnParams, config: GatewayConfig) -> tuple[TurnParams,
     if notice:
         notes.append(notice)
         message = f"{message}\n\n{notice}".strip() if message else notice
-    extra = vision_env(config)
+    extra = vision_env(config, active=active, provider=provider)
     if prepared.allow_root:
         extra["AGENTS_WORKDIR_ALLOW"] = prepared.allow_root
     updated = replace(

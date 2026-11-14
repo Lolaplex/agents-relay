@@ -398,14 +398,28 @@ def vision_notice(paths: list[str] | tuple[str, ...], *, active: bool) -> str:
     return text
 
 
-def vision_env(config: RelayConfig | None) -> dict[str, str]:
-    """Child env so the harness applies the same on/off decision."""
+def vision_env(
+    config: RelayConfig | None,
+    *,
+    active: bool | None = None,
+    provider: str = "",
+) -> dict[str, str]:
+    """Child ``AGENTS_VISION`` for this turn.
+
+    ``on`` and ``off`` force the flag. ``auto`` still passes the resolved
+    decision (``1`` or ``0``) so the harness cannot send an image the relay
+    has already told the user it withheld.
+    """
     mode = vision_mode(config)
     if mode == "on":
-        return {"AGENTS_VISION": "1"}
-    if mode == "off":
-        return {"AGENTS_VISION": "0"}
-    return {}
+        decided = True
+    elif mode == "off":
+        decided = False
+    elif active is not None:
+        decided = active
+    else:
+        decided = vision_active(config, provider)
+    return {"AGENTS_VISION": "1" if decided else "0"}
 
 
 def find_provider_manifest(name: str) -> dict | None:
@@ -722,4 +736,58 @@ def _mirror_root(workdir: Path) -> Path | None:
             return None
     except OSError:
         return None
+    if not _ensure_gitignore(real):
+        return None
     return real
+
+
+def _ensure_gitignore(mirror: Path) -> bool:
+    """Keep ``git add`` in the workdir from committing attachment copies.
+
+    The file contains ``*``. A symlink is not followed.
+    """
+    target = mirror / ".gitignore"
+    try:
+        info = target.lstat()
+    except FileNotFoundError:
+        return _write_gitignore(target)
+    except OSError:
+        return False
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        return False
+    try:
+        text = target.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    if "*" in {line.strip() for line in text.splitlines()}:
+        return True
+    try:
+        with target.open("a", encoding="utf-8") as handle:
+            if text and not text.endswith("\n"):
+                handle.write("\n")
+            handle.write("*\n")
+    except OSError:
+        return False
+    return True
+
+
+def _write_gitignore(target: Path) -> bool:
+    nofollow = getattr(os, "O_NOFOLLOW", 0) or 0
+    try:
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, 0o644)
+    except OSError:
+        return False
+    try:
+        os.write(fd, b"*\n")
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        target.unlink(missing_ok=True)
+        return False
+    try:
+        os.close(fd)
+    except OSError:
+        return False
+    return True

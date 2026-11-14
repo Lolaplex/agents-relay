@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import stat
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -23,6 +24,7 @@ from agents_relay.attachments import (
 )
 from agents_relay.config import RelayConfig
 from agents_relay.loop_client import run_loop_turn
+from agents_relay.workspace_tree import DEFAULT_SKIP_DIRS
 
 
 def _cfg(tmp: Path, **overrides) -> RelayConfig:
@@ -97,6 +99,8 @@ class TestMirror(unittest.TestCase):
                 self.assertEqual(saved.stat().st_mode & 0o222, 0)
             self.assertEqual(prepared.allow_root, "")
             self.assertFalse(prepared.notes)
+            gitignore = work / MIRROR_DIRNAME / ".gitignore"
+            self.assertEqual(gitignore.read_text(encoding="utf-8").strip(), "*")
 
     def test_outside_trust_root_is_unchanged(self):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as other:
@@ -161,6 +165,37 @@ class TestMirror(unittest.TestCase):
             self.assertEqual(list(Path(outside).iterdir()), [secret])
             self.assertTrue(any("may not read" in note for note in again.notes))
             self.assertEqual(again.paths, (str(plain),))
+
+    def test_gitignore_star_blocks_git_add(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work = root / "work"
+            work.mkdir()
+            subprocess.run(["git", "init"], cwd=work, check=True, capture_output=True)
+            (work / "README.md").write_text("hi\n", encoding="utf-8")
+            src = root / "state" / "inbox" / "pic.png"
+            src.parent.mkdir(parents=True)
+            src.write_bytes(b"png-bytes")
+            prepared = prepare_turn_files(
+                [str(src)], config=_cfg(root / "state"), workdir=str(work),
+            )
+            self.assertEqual(len(prepared.paths), 1)
+            gitignore = work / MIRROR_DIRNAME / ".gitignore"
+            self.assertEqual(gitignore.read_text(encoding="utf-8").strip(), "*")
+            subprocess.run(["git", "add", "-A"], cwd=work, check=True, capture_output=True)
+            staged = subprocess.run(
+                ["git", "diff", "--cached", "--name-only"],
+                cwd=work,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertIn("README.md", staged.stdout.splitlines())
+            self.assertFalse(any(MIRROR_DIRNAME in line for line in staged.stdout.splitlines()))
+
+    def test_workspace_tree_skips_relay_inbox(self):
+        self.assertIn(MIRROR_DIRNAME, DEFAULT_SKIP_DIRS)
+        self.assertIn(".relay-inbox", DEFAULT_SKIP_DIRS)
 
 
 class TestVision(unittest.TestCase):
@@ -232,6 +267,58 @@ class TestVision(unittest.TestCase):
             child_env = run.call_args.kwargs["env"]
             self.assertEqual(child_env["AGENTS_VISION"], "0")
             self.assertIn(IMAGE_UNAVAILABLE_PREFIX, argv[argv.index("--message") + 1])
+
+    def test_auto_passes_resolved_vision_to_child(self):
+        trailer = '{"session":"s","user_id":"u","alias":"a"}'
+
+        class FakeProc:
+            returncode = 0
+            stdout = f"pong\n---agents-loop-trailer---\n{trailer}\n"
+            stderr = ""
+
+        def _run(folder: Path, src: Path, work: Path):
+            env = {
+                k: v
+                for k, v in os.environ.items()
+                if k not in ("AGENTS_VISION", "AGENTS_RELAY_VISION", "AGENTS_PROVIDERS_DIR", "AGENTS_WORKDIR")
+            }
+            env["AGENTS_PROVIDERS_DIR"] = str(folder)
+            with patch.dict(os.environ, env, clear=True):
+                with patch("agents_relay.loop_client.subprocess.run", return_value=FakeProc()) as run:
+                    result = run_loop_turn(
+                        channel="http",
+                        user="u",
+                        message="look",
+                        config=_cfg(src.parent.parent, vision="auto"),
+                        attachments=[str(src)],
+                        workdir=str(work),
+                        provider="openai.default",
+                    )
+            return run.call_args.kwargs["env"], result
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            folder = root / "providers"
+            folder.mkdir()
+            (folder / "openai.default.json").write_text(
+                '{"name":"openai.default","capabilities":["tools"]}\n',
+                encoding="utf-8",
+            )
+            src = root / "state" / "inbox" / "pic.png"
+            src.parent.mkdir(parents=True)
+            src.write_bytes(b"png")
+            work = root / "work"
+            child_env, result = _run(folder, src, work)
+            self.assertEqual(child_env["AGENTS_VISION"], "0")
+            self.assertIn(IMAGE_UNAVAILABLE_PREFIX, result.reply)
+
+            (folder / "openai.default.json").write_text(
+                '{"name":"openai.default","vision":true}\n',
+                encoding="utf-8",
+            )
+            child_env, result = _run(folder, src, work)
+            self.assertEqual(child_env["AGENTS_VISION"], "1")
+            self.assertNotIn(IMAGE_UNAVAILABLE_PREFIX, result.reply)
 
 
 class TestMaterializeNotes(unittest.TestCase):
