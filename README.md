@@ -105,6 +105,7 @@ Telegram chats can send `/jobs`, `/stop`, and `/stop <id>` while `serve` is poll
 | `AGENTS_RELAY_STATE` | Relay files (default `<ws>/relay`, resolved per workspace). Approvals: `$AGENTS_RELAY_STATE/approvals/<id>.json`. Inbox: `.../inbox/` |
 | `AGENTS_RELAY_APPROVER` | Chat id used by `approve` when `--user` is missing or not numeric (HTTP turns often pass `anonymous`) |
 | `AGENTS_RELAY_ATTACH_DIR` | Only local `/v1/turn` attachment paths under this directory are accepted (default: the relay state dir) |
+| `AGENTS_RELAY_VISION` | `auto` (default), `on`, or `off`. `auto` uses `AGENTS_VISION` if set, otherwise the provider manifest's `vision` / `capabilities`. `on` and `off` are passed to the child as `AGENTS_VISION` |
 | `AGENTS_RELAY_MAX_JOBS` | Global cap on parallel Telegram turns (default 8) |
 | `AGENTS_RELAY_MAX_JOBS_PER_CHAT` | Parallel turns per chat before extra messages queue (default 3, queue cap 20) |
 | `AGENTS_RELAY_WAIT_TEXT` | Telegram placeholder while a turn runs (default `One moment …`). Status and fallback lines are English |
@@ -116,7 +117,11 @@ Telegram chats can send `/jobs`, `/stop`, and `/stop <id>` while `serve` is poll
 | `RELAY_STATIC_DIR` | Directory served at `/` (the dashboard build). Empty = no static assets |
 | `RELAY_WEB_SECURE` | `0` drops the `Secure` cookie flag for plain-HTTP local testing (default on) |
 
-`POST /v1/turn` accepts `attachments`: a list of `{"path": "/abs/file", "mime": "image/png"}` or `{"url": "https://...", "mime": "..."}`. A local `path` must already exist and must resolve inside `AGENTS_RELAY_ATTACH_DIR` (default: the relay state dir). Paths outside that directory are rejected with HTTP 400. `url` must be `http` or `https` and is downloaded into the relay inbox (20 MB cap). When `mime` is set, the saved file extension matches it (`image/jpeg` → `.jpg`) so the harness can infer the type. Each file is passed to the loop as `--attach`. Photos and documents from Telegram take the same `--attach` path. The loop `--user` for a Telegram turn is the numeric chat id so `AGENTS_APPROVAL_CMD` can substitute `{user}`.
+`POST /v1/turn` accepts `attachments`: a list of `{"path": "/abs/file", "mime": "image/png"}`, `{"url": "https://...", "mime": "..."}`, or `{"data": "<base64>", "mime": "...", "name": "shot.png"}`. A local `path` must already exist and must resolve inside `AGENTS_RELAY_ATTACH_DIR` (default: the relay state dir). Paths outside that directory are rejected with HTTP 400. `url` must be `http` or `https`. Downloads, inline data, and Telegram files are capped at 20 MB. When `mime` is set, the saved file extension matches it (`image/jpeg` → `.jpg`) so the harness can infer the type. A file that fails to land is named in the reply.
+
+Each accepted file is copied into the session workdir at `<workdir>/.relay-inbox/<generated-name>` and that copy is the `--attach` path. The copy is a regular file under that directory only: generated name, no symlink follow, same 20 MB cap. The directory's `.gitignore` is `*`, so a `git add` in the workdir does not commit the copies. Workdir file tools can still read them. The relay inbox keeps the original. With no session workdir, the inbox directory is added to the child `AGENTS_WORKDIR_ALLOW` instead. Photos and documents from Telegram take the same path. The loop `--user` for a Telegram turn is the numeric chat id so `AGENTS_APPROVAL_CMD` can substitute `{user}`.
+
+Image parts are decided by the harness from `AGENTS_VISION` and the provider manifest (`vision: true` or `capabilities` containing `vision`). `AGENTS_RELAY_VISION=on|off` forces that flag for the child. When an image arrives and vision is off or the manifest does not claim it, the reply says the image was not shown and lists the path. A per-model catalog (for example which OpenRouter ids accept images) belongs on the provider manifest or in `AGENTS_VISION`, not in this package.
 
 `approve --user` may be a non-numeric turn id (HTTP defaults to `anonymous`). Then the prompt goes to `AGENTS_RELAY_APPROVER`, or to the only entry in `TELEGRAM_ALLOWED_CHAT_IDS` when that list has exactly one chat. Otherwise approve exits 2 and prints `{"note":"..."}`. A numeric `--user` is used as given.
 
@@ -181,8 +186,9 @@ agents-relay serve
 
 `text` or `message` carries the prompt. `provider`/`persona`/`project` are
 passed through to `runner.loop` when set (otherwise `LOOP_PROVIDER` applies).
-`attachments` accepts local paths under `AGENTS_RELAY_ATTACH_DIR` or `http(s)`
-URLs. Response: `{ "reply", "session", "user_id", "alias", "returncode",
+`attachments` accepts local paths under `AGENTS_RELAY_ATTACH_DIR`, `http(s)`
+URLs, or base64 `data`. A copy is placed in the session workdir
+`.relay-inbox` so file tools can read it. Response: `{ "reply", "session", "user_id", "alias", "returncode",
 "notified" }` — HTTP 200, or 502 when `returncode != 0`.
 
 ### POST /v1/stream

@@ -377,6 +377,8 @@ class TestApproval(unittest.TestCase):
                 assert proc.stdin is not None
                 proc.stdin.write(json.dumps(request))
                 proc.stdin.close()
+                # communicate() flushes stdin; a closed pipe raises.
+                proc.stdin = None
                 path = Path(tmp) / "approvals" / "cli-local-1.json"
                 deadline = time.time() + 3
                 while time.time() < deadline and not path.is_file():

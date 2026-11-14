@@ -254,7 +254,8 @@ def _status_text(raw: str) -> str:
 def handle_chat_stream(handler: BaseHTTPRequestHandler, body: dict) -> None:
     config = handler._cfg()  # type: ignore[attr-defined]
     text = str(body.get("text") or "").strip()
-    if not text:
+    raw_attachments = body.get("attachments")
+    if not text and not raw_attachments:
         handler._write_json({"ok": False, "error": "text is required"}, 400)  # type: ignore[attr-defined]
         return
 
@@ -281,24 +282,34 @@ def handle_chat_stream(handler: BaseHTTPRequestHandler, body: dict) -> None:
             handler._write_json({"ok": False, "error": f"invalid persona id: {persona_ref!r}"}, 400)  # type: ignore[attr-defined]
             return
 
-    raw_attachments = body.get("attachments")
     attach_paths: tuple[str, ...] = ()
+    attachment_notes: list[str] = []
     if raw_attachments:
-        from .attachments import AttachmentRejected, allowed_attach_root, materialize_attachments
-        from .state import inbox_dir
+        from .attachments import AttachmentRejected, apply_notes, materialize_for_turn
 
-        dest = (ws.relay_state / "inbox") if ws is not None else inbox_dir(config)
-        allowed_root = ws.relay_state if ws is not None else allowed_attach_root(config)
         try:
-            attach_paths = tuple(materialize_attachments(raw_attachments, dest, allowed_root=allowed_root))
+            attach_paths = tuple(materialize_for_turn(
+                raw_attachments,
+                config=config,
+                workspace_id=ws.id if ws is not None else "",
+                notes=attachment_notes,
+            ))
         except AttachmentRejected:
             handler._write_json({"ok": False, "error": "attachment path outside allowed directory"}, 400)  # type: ignore[attr-defined]
+            return
+        if attachment_notes:
+            text = apply_notes(text, attachment_notes)
+        if not attach_paths and not str(body.get("text") or "").strip():
+            handler._write_json(  # type: ignore[attr-defined]
+                {"ok": False, "error": "; ".join(attachment_notes) or "attachment rejected"},
+                400,
+            )
             return
 
     params = TurnParams(
         channel="web",
         user=config.web_user,
-        message=text,
+        message=text or ("(attachment)" if attach_paths else ""),
         session=str(body.get("session") or "").strip(),
         new_session=bool(body.get("new_session")),
         provider=str(body.get("provider") or "").strip(),
@@ -320,6 +331,12 @@ def handle_chat_stream(handler: BaseHTTPRequestHandler, body: dict) -> None:
     try:
         handler.wfile.write(_sse({"type": "start", "run": run}))
         handler.wfile.flush()
+        if attachment_notes:
+            handler.wfile.write(_sse({
+                "type": "delta",
+                "text": "\n\n".join(attachment_notes) + "\n\n",
+            }))
+            handler.wfile.flush()
         for event in iter_loop_stream_live(params, config, cancel=cancel):
             if event.type == "status":
                 line = _status_text(event.text)

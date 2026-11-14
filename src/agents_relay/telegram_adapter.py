@@ -26,7 +26,7 @@ from .approvals import (
     status_exit_code,
     wait_for_decision,
 )
-from .attachments import safe_filename
+from .attachments import MAX_ATTACHMENT_BYTES, read_capped, safe_filename
 from .config import RelayConfig
 from .jobs import Job, JobRegistry, get_registry
 from .loop_client import LoopTurnResult, run_loop_turn
@@ -296,35 +296,44 @@ def _download_telegram_file(
         target = dest_dir / f"{uuid.uuid4().hex[:8]}_{name}"
         req = urllib.request.Request(file_url)
         with urllib.request.urlopen(req, timeout=30) as resp:
-            target.write_bytes(resp.read())
+            blob = read_capped(resp, MAX_ATTACHMENT_BYTES)
+        if blob is None:
+            target.unlink(missing_ok=True)
+            return None
+        target.write_bytes(blob)
         return target
     except Exception:
         log.warning("Failed to download telegram file")
         return None
 
 
-def _collect_attachments(message: dict, token: str, config: RelayConfig) -> list[str]:
+def _collect_attachments(
+    message: dict, token: str, config: RelayConfig
+) -> tuple[list[str], list[str]]:
     dest = inbox_dir(config)
     paths: list[str] = []
+    notes: list[str] = []
+
+    def _save(file_id: str, dest_name: str) -> None:
+        saved = _download_telegram_file(token, file_id, dest, dest_name=dest_name)
+        if saved is None:
+            notes.append(
+                "Attachment dropped: could not save the Telegram file "
+                "(missing, too large, or the download failed)."
+            )
+            return
+        paths.append(str(saved))
+
     photo_list = message.get("photo") or []
     if photo_list and isinstance(photo_list, list):
         largest = photo_list[-1]
         file_id = largest.get("file_id") if isinstance(largest, dict) else None
         if file_id:
-            saved = _download_telegram_file(token, str(file_id), dest, dest_name="photo.jpg")
-            if saved is not None:
-                paths.append(str(saved))
+            _save(str(file_id), "photo.jpg")
     document = message.get("document")
     if isinstance(document, dict) and document.get("file_id"):
-        saved = _download_telegram_file(
-            token,
-            str(document["file_id"]),
-            dest,
-            dest_name=str(document.get("file_name") or "document"),
-        )
-        if saved is not None:
-            paths.append(str(saved))
-    return paths
+        _save(str(document["file_id"]), str(document.get("file_name") or "document"))
+    return paths, notes
 
 
 def inbound_payload(result: LoopTurnResult) -> dict:
@@ -358,6 +367,7 @@ def handle_inbound_text(
     attachments: list[str] | None = None,
     on_pid: Callable[[int], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
+    attachment_notes: list[str] | None = None,
 ) -> LoopTurnResult:
     """Same Telegram lifecycle as a poll text update: thinking edit, then final."""
     token = config.telegram_bot_token
@@ -433,6 +443,10 @@ def handle_inbound_text(
                     result = runner(**slim)
                 except TypeError:
                     result = runner(channel="telegram", user=loop_user, message=turn_text)
+        if attachment_notes:
+            from .attachments import apply_notes
+
+            result.reply = apply_notes(result.reply, attachment_notes)
         _, err_traces = extract_traces(result.stderr or "")
         if cancelled and cancelled():
             reply_html = format_telegram_html("Stopped.", ())
@@ -515,11 +529,20 @@ def process_update(
     token = config.telegram_bot_token
     if not token:
         return
-    attachments = _collect_attachments(message, token, config)
+    attachments, attachment_notes = _collect_attachments(message, token, config)
+    if not text and not attachments and not attachment_notes:
+        return
     if not text and not attachments:
+        from .attachments import apply_notes
+
+        send_message(token, chat_id, apply_notes("", attachment_notes), parse_mode="")
         return
     if not text:
         text = "(attachment)"
+    if attachment_notes:
+        from .attachments import apply_notes
+
+        text = apply_notes(text, attachment_notes)
 
     # Numeric chat id: harness substitutes this into `approve --user {user}`.
     handle_inbound_text(
@@ -531,6 +554,7 @@ def process_update(
         attachments=attachments,
         on_pid=job.bind_pid if job is not None else None,
         cancelled=job.cancel.is_set if job is not None else None,
+        attachment_notes=attachment_notes,
     )
 
 
