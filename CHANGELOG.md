@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Accepted turn attachments are copied into `<workdir>/.relay-inbox/` (generated name, regular file only, 20 MB cap, symlinks refused) so workdir-jailed file tools can read them. With no session workdir, the inbox directory is appended to the child `AGENTS_WORKDIR_ALLOW`.
+- `AGENTS_RELAY_VISION` (`auto`, `on`, `off`). `auto` follows `AGENTS_VISION` when set, otherwise the provider manifest (`vision: true` or `capabilities` containing `vision`) from `AGENTS_PROVIDERS_DIR` or the installed agents-harness provider data. An image with vision off or unsupported is named in the reply. `on` and `off` are passed to the child as `AGENTS_VISION`.
+
+### Fixed
+- A missing, oversized, malformed, or failed attachment is reported on the reply instead of being omitted. Telegram downloads and inline base64 uploads use the same 20 MB cap as URL downloads.
+- `POST /v1/stream` materializes `attachments` the same way as `/v1/turn`. A web chat turn can send an attachment without text.
+
 ### Removed
 - Bundled hand-written PWA (`src/agents_relay/web/`); the relay serves only a configured static dir (`RELAY_STATIC_DIR`/`AGENTS_RELAY_WEB_DIR`) - the dashboard build comes from klanker `web/` (option 1b).
 

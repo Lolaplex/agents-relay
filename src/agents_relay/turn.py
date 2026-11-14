@@ -130,14 +130,69 @@ def build_loop_argv(params: TurnParams, config: GatewayConfig) -> list[str]:
     return argv
 
 
+def prepare_loop(params: TurnParams, config: GatewayConfig) -> tuple[TurnParams, list[str], dict[str, str]]:
+    """Mirror attachments into the workdir and decide the vision notice.
+
+    The returned env is merged into the child before container path rewrite.
+    `on`/`off` from `AGENTS_RELAY_VISION` becomes `AGENTS_VISION` so the
+    harness shows or withholds image parts the same way the reply explains.
+    """
+    from .attachments import prepare_turn_files, vision_active, vision_env, vision_notice
+
+    prepared = prepare_turn_files(
+        params.attachments,
+        config=config,
+        workspace=params.workspace,
+        workdir=params.workdir,
+    )
+    provider = (params.provider or config.loop_provider).strip() or config.loop_provider
+    active = vision_active(config, provider)
+    notice = vision_notice(prepared.paths, active=active)
+    notes = list(prepared.notes)
+    message = params.message
+    if notice:
+        notes.append(notice)
+        message = f"{message}\n\n{notice}".strip() if message else notice
+    extra = vision_env(config)
+    if prepared.allow_root:
+        extra["AGENTS_WORKDIR_ALLOW"] = prepared.allow_root
+    updated = replace(
+        params,
+        attachments=prepared.paths,
+        message=message,
+    )
+    return updated, notes, extra
+
+
+def _merge_extra_env(
+    base: dict[str, str] | None, extra: dict[str, str] | None
+) -> dict[str, str] | None:
+    if not extra:
+        return base
+    env = dict(os.environ if base is None else base)
+    for key, value in extra.items():
+        if key == "AGENTS_WORKDIR_ALLOW" and env.get(key):
+            parts = [part for part in env[key].split(os.pathsep) if part]
+            for piece in value.split(os.pathsep):
+                if piece and piece not in parts:
+                    parts.append(piece)
+            env[key] = os.pathsep.join(parts)
+        else:
+            env[key] = value
+    return env
+
+
 def _container_rewrite(
-    argv: list[str], workspace: str, workdir: str
-) -> tuple[list[str], dict[str, str], "Workspace | None"]:
+    argv: list[str],
+    workspace: str,
+    workdir: str,
+    extra_env: dict[str, str] | None = None,
+) -> tuple[list[str], dict[str, str] | None, "Workspace | None"]:
     """Resolve workspace isolation. Returns (argv, env, ws) — ws set only
     when isolation=container so callers can dispatch via runtime.spawn/run.
     Without docker + container isolation the runtime raises (loud, no
     silent local fallback)."""
-    env = workspace_env(workspace, workdir)
+    env = _merge_extra_env(workspace_env(workspace, workdir), extra_env)
     if not workspace:
         return argv, env, None
     try:
@@ -221,8 +276,9 @@ def run_loop_turn(
         deliver="buffered",
     )
     cfg = config or GatewayConfig.from_env()
+    params, notes, extra = prepare_loop(params, cfg)
     argv = build_loop_argv(params, cfg)
-    argv, env, ws = _container_rewrite(argv, workspace, workdir)
+    argv, env, ws = _container_rewrite(argv, params.workspace, params.workdir, extra)
     if ws is not None:
         from agents_workspace.runtime import run as ws_run
 
@@ -237,8 +293,10 @@ def run_loop_turn(
             env=env,
         )
     parsed = parse_loop_stdout(proc.stdout or "")
+    from .attachments import apply_notes
+
     return LoopTurnResult(
-        reply=parsed["reply"],
+        reply=apply_notes(parsed["reply"], notes),
         session=parsed["session"],
         user_id=parsed["user_id"],
         alias=parsed["alias"],
@@ -254,9 +312,10 @@ def iter_loop_stream(
 ) -> Iterator[StreamEvent]:
     """Yield SSE-shaped events from runner.loop --deliver stream."""
     cfg = config or GatewayConfig.from_env()
+    params, notes, extra = prepare_loop(params, cfg)
     stream_params = replace(params, deliver="stream")
     argv = build_loop_argv(stream_params, cfg)
-    argv, env, ws = _container_rewrite(argv, params.workspace, params.workdir)
+    argv, env, ws = _container_rewrite(argv, params.workspace, params.workdir, extra)
     if ws is not None:
         from agents_workspace.runtime import spawn as ws_spawn
 
@@ -296,6 +355,7 @@ def iter_loop_stream(
                     emitted = len(body)
                     meta = meta or {}
                     rc = int(proc.wait(timeout=timeout_sec))
+                    yield from _note_deltas(notes, body)
                     yield StreamEvent(
                         type="trailer",
                         session=str(meta.get("session") or ""),
@@ -325,6 +385,7 @@ def iter_loop_stream(
                 yield StreamEvent(type="delta", text=new_text)
             meta = meta or {}
             rc = int(proc.wait(timeout=timeout_sec))
+            yield from _note_deltas(notes, body)
             yield StreamEvent(
                 type="trailer",
                 session=str(meta.get("session") or ""),
@@ -339,6 +400,7 @@ def iter_loop_stream(
             if tail:
                 yield StreamEvent(type="delta", text=tail)
             parsed = parse_loop_stdout(pending)
+            yield from _note_deltas(notes, pending)
             yield StreamEvent(
                 type="trailer",
                 session=parsed["session"],
@@ -349,6 +411,18 @@ def iter_loop_stream(
     finally:
         if proc.poll() is None:
             proc.kill()
+
+
+def _note_deltas(notes: list[str], body: str) -> Iterator[StreamEvent]:
+    """Surface attachment notes the model reply did not already include."""
+    from .attachments import apply_notes
+
+    missing = [note for note in notes if note and note not in (body or "")]
+    extra = apply_notes("", missing)
+    if not extra:
+        return
+    prefix = "\n\n" if (body or "").strip() else ""
+    yield StreamEvent(type="delta", text=prefix + extra)
 
 
 def _parse_trailer(trailer_part: str) -> dict[str, Any]:
@@ -378,8 +452,9 @@ def iter_loop_stream_live(
     process tree, which is what a browser stop button needs.
     """
     cfg = config or GatewayConfig.from_env()
+    params, notes, extra = prepare_loop(params, cfg)
     argv = build_loop_argv(replace(params, deliver="stream"), cfg)
-    argv, child_env, ws = _container_rewrite(argv, params.workspace, params.workdir)
+    argv, child_env, ws = _container_rewrite(argv, params.workspace, params.workdir, extra)
     if ws is not None:
         from agents_workspace.runtime import spawn as ws_spawn
 
@@ -447,7 +522,9 @@ def iter_loop_stream_live(
                 return
             if time.monotonic() > deadline:
                 _kill()
-                yield StreamEvent(type="error", text="Turn timed out.")
+                from .attachments import apply_notes
+
+                yield StreamEvent(type="error", text=apply_notes("Turn timed out.", notes))
                 return
             try:
                 tag, data = events.get(timeout=0.25)
@@ -479,6 +556,7 @@ def iter_loop_stream_live(
                 emitted = len(body)
                 meta = _parse_trailer(trailer_part)
                 rc = proc.wait(timeout=5) if proc.poll() is None else int(proc.returncode or 0)
+                yield from _note_deltas(notes, body)
                 yield StreamEvent(
                     type="trailer",
                     session=str(meta.get("session") or ""),
@@ -512,6 +590,8 @@ def iter_loop_stream_live(
                 "user_id": parsed["user_id"],
                 "alias": parsed["alias"],
             }
+        shown = body if marker in pending else pending
+        yield from _note_deltas(notes, shown)
         yield StreamEvent(
             type="trailer",
             session=str(meta.get("session") or ""),
