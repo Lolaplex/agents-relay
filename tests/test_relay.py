@@ -1173,6 +1173,26 @@ class TestDashboardApi(unittest.TestCase):
         self.assertIsNone(resp.getheader("Access-Control-Allow-Origin"))
         resp.read()
 
+    def test_cors_tauri_origin_implicit(self):
+        # Tauri webview origins are always echoed on /v1/* so the bundled
+        # desktop shell works against any relay, adopted or spawned.
+        self._workspace()
+        host, port = self._serve(_test_config())
+        for tauri_origin in (
+                "tauri://localhost", "http://tauri.localhost"):
+            resp = self._req(
+                host, port, "GET", "/v1/traces?workspace=demo&session=ses_a",
+                headers={"Origin": tauri_origin})
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(resp.getheader("Access-Control-Allow-Origin"),
+                             tauri_origin)
+            resp.read()
+            resp = self._req(
+                host, port, "OPTIONS", "/v1/turn",
+                headers={"Origin": tauri_origin}, secret=False)
+            self.assertEqual(resp.status, 204)
+            resp.read()
+
     def test_cors_origins_from_env(self):
         with patch.dict(
                 "os.environ",

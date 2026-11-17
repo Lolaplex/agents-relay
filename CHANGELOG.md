@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Tauri webview origins (`tauri://localhost`, `http(s)://tauri.localhost`) are always echoed on `/v1/*` CORS so the bundled desktop shell works against any relay without `RELAY_CORS_ORIGINS`. Browsers cannot produce these origins, and `/v1/*` still requires its token, so exposure is unchanged.
+
 ### Removed
 - Bundled hand-written PWA (`src/agents_relay/web/`); the relay serves only a configured static dir (`RELAY_STATIC_DIR`/`AGENTS_RELAY_WEB_DIR`) - the dashboard build comes from klanker `web/` (option 1b).
 

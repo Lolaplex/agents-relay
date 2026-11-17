@@ -208,17 +208,25 @@ class TurnHandler(BaseHTTPRequestHandler):
     def _cfg(self) -> RelayConfig:
         return self.config or RelayConfig.from_env()
 
+    #: Origins only a Tauri webview can produce — browsers never send these,
+    #: so echoing them is safe for the bundled desktop shell.
+    _TAURI_ORIGINS = (
+        "tauri://localhost",
+        "http://tauri.localhost",
+        "https://tauri.localhost",
+    )
+
     def _cors_origin(self) -> str:
         """Origin to echo on /v1/* when RELAY_CORS_ORIGINS allows it (off by default)."""
-        origins = self._cfg().cors_origins
-        if not origins:
-            return ""
         path, _ = _parse_query(self.path or "/")
         if not path.startswith("/v1/"):
             return ""
         origin = (self.headers.get("Origin") or "").strip()
         if not origin:
             return ""
+        if origin in self._TAURI_ORIGINS:
+            return origin
+        origins = self._cfg().cors_origins
         if "*" in origins:
             return "*"
         return origin if origin in origins else ""
