@@ -243,7 +243,7 @@ class TurnHandler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
         req_headers = (self.headers.get("Access-Control-Request-Headers") or "").strip()
         self.send_header(
             "Access-Control-Allow-Headers",

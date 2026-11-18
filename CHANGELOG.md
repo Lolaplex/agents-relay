@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `AGENTS_RELAY_VISION` (`auto`, `on`, `off`). `auto` follows `AGENTS_VISION` when set, otherwise the provider manifest (`vision: true` or `capabilities` containing `vision`) from `AGENTS_PROVIDERS_DIR` or the installed agents-harness provider data. An image with vision off or unsupported is named in the reply. `on` and `off` are passed to the child as `AGENTS_VISION`.
 
 ### Fixed
+- CORS preflight now allows `PUT` and `DELETE`: the allowlist only echoed `GET, POST, OPTIONS`, so same-origin-separate apps (dev server, desktop shell on a dev origin) could list sessions but never delete them.
 - `.relay-inbox/.gitignore` contains `*` so a workdir `git add` does not commit attachment copies.
 - `AGENTS_RELAY_VISION=auto` passes the resolved decision to the child as `AGENTS_VISION=1` or `0`, so the harness does not send an image the relay has already reported as not shown.
 - A missing, oversized, malformed, or failed attachment is reported on the reply instead of being omitted. Telegram downloads and inline base64 uploads use the same 20 MB cap as URL downloads.
