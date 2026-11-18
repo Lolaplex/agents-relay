@@ -448,8 +448,9 @@ def mirror_regular_file(src: Path, workdir: Path) -> Path | None:
     if mirror_root is None:
         return None
     nofollow = getattr(os, "O_NOFOLLOW", 0) or 0
+    binary = getattr(os, "O_BINARY", 0) or 0
     try:
-        src_fd = os.open(src, os.O_RDONLY | nofollow)
+        src_fd = os.open(src, os.O_RDONLY | binary | nofollow)
     except OSError:
         return None
     dst_fd = -1
@@ -463,7 +464,7 @@ def mirror_regular_file(src: Path, workdir: Path) -> Path | None:
             dest.relative_to(mirror_root)
         except ValueError:
             return None
-        dst_fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, 0o644)
+        dst_fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | binary | nofollow, 0o644)
         copied = 0
         while True:
             block = os.read(src_fd, 64 * 1024)
