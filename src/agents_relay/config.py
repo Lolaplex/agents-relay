@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 
+from agents_workspace import resolve_secret
 from agents_workspace.compat import read_alias
 import shlex
 from dataclasses import dataclass
@@ -55,6 +56,15 @@ def _flag(val: str) -> bool:
     return _clean(val).lower() in {"1", "true", "yes", "on"}
 
 
+def _secret(key: str) -> str:
+    """ws/host secrets.json > env. Falls back to env alone when the
+    workspace resolver cannot run (config load must not depend on it)."""
+    try:
+        return resolve_secret(key)
+    except Exception:
+        return os.environ.get(key, "")
+
+
 @dataclass(frozen=True)
 class RelayConfig:
     loop_cmd: tuple[str, ...]
@@ -93,13 +103,13 @@ class RelayConfig:
         return cls(
             loop_cmd=loop_cmd,
             loop_provider=_clean(os.environ.get("LOOP_PROVIDER", "echo")) or "echo",
-            relay_secret=_clean(read_alias(None, "RELAY_SECRET", "GATEWAY_SECRET")),
-            telegram_bot_token=_clean(os.environ.get("TELEGRAM_BOT_TOKEN", "")),
+            relay_secret=_clean(_secret("RELAY_SECRET") or read_alias(None, "RELAY_SECRET", "GATEWAY_SECRET")),
+            telegram_bot_token=_clean(_secret("TELEGRAM_BOT_TOKEN")),
             telegram_allowed_chat_ids=_int_list(os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", "")),
             relay_host=_clean(read_alias(None, "RELAY_HOST", "GATEWAY_HOST")) or "127.0.0.1",
             relay_port=_int(read_alias(None, "RELAY_PORT", "GATEWAY_PORT"), 8787),
             telegram_poll_timeout=max(1, min(50, _int(os.environ.get("TELEGRAM_POLL_TIMEOUT", "50"), 50))),
-            webhook_secret=_clean(os.environ.get("WEBHOOK_SECRET", "")),
+            webhook_secret=_clean(_secret("WEBHOOK_SECRET")),
             board_url=_clean(os.environ.get("BOARD_URL", "")).rstrip("/"),
             board_project=_clean(os.environ.get("BOARD_PROJECT", "")),
             board_key_slug=_clean(os.environ.get("BOARD_KEY_SLUG", "gateway")),
@@ -110,7 +120,7 @@ class RelayConfig:
             approver=_clean(os.environ.get("AGENTS_RELAY_APPROVER", "")),
             attach_dir=_clean(os.environ.get("AGENTS_RELAY_ATTACH_DIR", "")),
             vision=_clean(os.environ.get("AGENTS_RELAY_VISION", "")).lower(),
-            web_token=_clean(os.environ.get("RELAY_WEB_TOKEN", "")),
+            web_token=_clean(_secret("RELAY_WEB_TOKEN")),
             web_user=_clean(os.environ.get("RELAY_WEB_USER", "web")) or "web",
             static_dir=_clean(read_alias(None, "AGENTS_RELAY_WEB_DIR", "RELAY_STATIC_DIR")),
             web_secure=_flag(os.environ.get("RELAY_WEB_SECURE", "1")),
