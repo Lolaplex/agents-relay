@@ -397,6 +397,26 @@ class TurnHandler(BaseHTTPRequestHandler):
             self._write_json({"ok": True, "remote": row}, 200)
             return
 
+        if path == "/v1/presence/publish":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            body = self._read_json()
+            if body is None:
+                return
+            from .presence import publish_offer
+
+            offer, err = publish_offer(
+                str(body.get("key_slug") or "").strip(),
+                str(body.get("label") or "").strip(),
+                body.get("roads") if isinstance(body.get("roads"), list) else [],
+            )
+            if offer is None:
+                self.send_error(400, err)
+                return
+            self._write_json({"ok": True, "offer": offer}, 200)
+            return
+
         if path == "/v1/workspaces":
             if not _check_secret(self, self.relay_secret, query_params):
                 self.send_error(401, "unauthorized")
@@ -1172,6 +1192,14 @@ class TurnHandler(BaseHTTPRequestHandler):
             from .remotes import list_public
 
             self._write_json({"ok": True, "remotes": list_public(self._cfg())}, 200)
+            return
+        if path == "/v1/presence/offers":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            from .presence import list_offers
+
+            self._write_json({"ok": True, "offers": list_offers()}, 200)
             return
         # GET /v1/remote/<id>/<upstream-path> — authenticated remote mount.
         if path.startswith("/v1/remote/"):

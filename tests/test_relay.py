@@ -1139,10 +1139,17 @@ class TestDashboardApi(unittest.TestCase):
                          "https://dash.example.com")
         resp.read()
 
-        # non-/v1 route stays clean even for an allowed origin
+        # /health echoes the allowlist — dashboards poll it cross-origin
         resp = self._req(
             host, port, "GET", "/health", headers=origin, secret=False)
         self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.getheader("Access-Control-Allow-Origin"),
+                         "https://dash.example.com")
+        resp.read()
+
+        # other non-/v1 routes stay clean even for an allowed origin
+        resp = self._req(
+            host, port, "GET", "/", headers=origin, secret=False)
         self.assertIsNone(resp.getheader("Access-Control-Allow-Origin"))
         resp.read()
 
