@@ -32,7 +32,7 @@ class TestServeShutdown(unittest.TestCase):
             "PYTHONPATH": SRC + os.pathsep + os.environ.get("PYTHONPATH", ""),
             "RELAY_HOST": "127.0.0.1",
             "RELAY_PORT": str(port),
-            "AGENTS_HOME": str(Path(home) / ".agents"),
+            "AGENTS_HOST_DIR": str(Path(home) / ".agents"),
             "AGENTS_NO_UPDATE_CHECK": "1",
         }
         proc = subprocess.Popen(

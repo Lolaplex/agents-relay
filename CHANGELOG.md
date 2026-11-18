@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Tests isolate with `AGENTS_HOST_DIR`; the suite dropped the `AGENTS_HOME` alias entirely.
+
 ### Fixed
 - Child process output is decoded as UTF-8 with `errors="replace"` instead of the locale default (`cp1252` on Western-European Windows), and spawned children get `PYTHONUTF8=1`. German umlauts and any non-ASCII text no longer come back mojibake in turn results.
 
