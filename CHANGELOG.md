@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Tauri webview origins (`tauri://localhost`, `http(s)://tauri.localhost`) are always echoed on `/v1/*` CORS so the bundled desktop shell works against any relay without `RELAY_CORS_ORIGINS`. Browsers cannot produce these origins, and `/v1/*` still requires its token, so exposure is unchanged.
 - Accepted turn attachments are copied into `<workdir>/.relay-inbox/` (generated name, regular file only, 20 MB cap, symlinks refused) so workdir-jailed file tools can read them. With no session workdir, the inbox directory is appended to the child `AGENTS_WORKDIR_ALLOW`.
 - `AGENTS_RELAY_VISION` (`auto`, `on`, `off`). `auto` follows `AGENTS_VISION` when set, otherwise the provider manifest (`vision: true` or `capabilities` containing `vision`) from `AGENTS_PROVIDERS_DIR` or the installed agents-harness provider data. An image with vision off or unsupported is named in the reply. `on` and `off` are passed to the child as `AGENTS_VISION`.
 
