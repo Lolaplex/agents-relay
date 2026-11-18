@@ -171,6 +171,17 @@ def _read_json_body(handler: BaseHTTPRequestHandler) -> tuple[dict, bytes]:
     return body, raw
 
 
+def _is_dev_origin(origin: str) -> bool:
+    """Loopback http(s) origins are dev servers/dashboards — echo them so the
+    desktop dev shell and local PWAs reach any relay without RELAY_CORS_ORIGINS.
+    Endpoints still require their secret, so nothing is exposed."""
+    try:
+        host = urllib.parse.urlsplit(origin).hostname or ""
+    except ValueError:
+        return False
+    return host in ("localhost", "127.0.0.1", "::1")
+
+
 def _sse_event(payload: dict) -> bytes:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
 
@@ -224,7 +235,7 @@ class TurnHandler(BaseHTTPRequestHandler):
         origin = (self.headers.get("Origin") or "").strip()
         if not origin:
             return ""
-        if origin in self._TAURI_ORIGINS:
+        if origin in self._TAURI_ORIGINS or _is_dev_origin(origin):
             return origin
         origins = self._cfg().cors_origins
         if "*" in origins:
