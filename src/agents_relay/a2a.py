@@ -36,7 +36,7 @@ def _board_request(
         try:
             nonce = subprocess.check_output(
                 ["python", "-m", "agents_keys", "sign", cfg.board_key_slug, "board"],
-                text=True,
+                encoding="utf-8", errors="replace",
                 stderr=subprocess.DEVNULL,
             ).strip()
             headers["X-Agent-Proof"] = nonce

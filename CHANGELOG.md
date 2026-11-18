@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Child process output is decoded as UTF-8 with  instead of the locale default ( on Western-European Windows), and spawned children get . German umlauts and any non-ASCII text no longer come back mojibake () in turn results.
+
 ### Added
 - Tauri webview origins (`tauri://localhost`, `http(s)://tauri.localhost`) are always echoed on `/v1/*` CORS so the bundled desktop shell works against any relay without `RELAY_CORS_ORIGINS`. Browsers cannot produce these origins, and `/v1/*` still requires its token, so exposure is unchanged.
 - Loopback dev origins (`http(s)://localhost:*`, `127.0.0.1`, `::1`) are echoed on `/v1/*` CORS the same way, so dev servers and local PWAs reach any relay without `RELAY_CORS_ORIGINS`.

@@ -168,9 +168,12 @@ def prepare_loop(params: TurnParams, config: GatewayConfig) -> tuple[TurnParams,
 def _merge_extra_env(
     base: dict[str, str] | None, extra: dict[str, str] | None
 ) -> dict[str, str] | None:
-    if not extra:
-        return base
     env = dict(os.environ if base is None else base)
+    # Child stdout must be UTF-8 regardless of the host locale: on cp1252
+    # Windows the default codec turns umlauts into mojibake downstream.
+    env.setdefault("PYTHONUTF8", "1")
+    if not extra:
+        return env
     for key, value in extra.items():
         if key == "AGENTS_WORKDIR_ALLOW" and env.get(key):
             parts = [part for part in env[key].split(os.pathsep) if part]
@@ -288,7 +291,7 @@ def run_loop_turn(
         proc = subprocess.run(
             argv,
             capture_output=True,
-            text=True,
+            encoding="utf-8", errors="replace",
             timeout=timeout_sec,
             shell=False,
             env=env,
@@ -326,7 +329,7 @@ def iter_loop_stream(
             argv,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            encoding="utf-8", errors="replace",
             bufsize=1,
             env=env,
         )
@@ -469,7 +472,7 @@ def iter_loop_stream_live(
             argv,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            encoding="utf-8", errors="replace",
             bufsize=1,
             env=child_env,
             **popen_kwargs,

@@ -120,7 +120,7 @@ def run_loop_turn(
             proc = subprocess.run(
                 argv,
                 capture_output=True,
-                text=True,
+                encoding="utf-8", errors="replace",
                 timeout=wait,
                 shell=False,
                 env=child_env,
@@ -165,7 +165,7 @@ def run_loop_turn(
             argv,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            encoding="utf-8", errors="replace",
             bufsize=1,
             env=child_env,
             **popen_kwargs,
