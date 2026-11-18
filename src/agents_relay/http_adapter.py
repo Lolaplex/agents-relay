@@ -230,7 +230,9 @@ class TurnHandler(BaseHTTPRequestHandler):
     def _cors_origin(self) -> str:
         """Origin to echo on /v1/* when RELAY_CORS_ORIGINS allows it (off by default)."""
         path, _ = _parse_query(self.path or "/")
-        if not path.startswith("/v1/"):
+        # /health is a public liveness probe — dashboards poll it cross-origin
+        # to mark instances up/down, so it needs the same echo as /v1/*.
+        if not (path.startswith("/v1/") or path == "/health"):
             return ""
         origin = (self.headers.get("Origin") or "").strip()
         if not origin:
