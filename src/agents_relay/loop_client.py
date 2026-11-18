@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .config import RelayConfig
-from .turn import resolve_workspace_id, workspace_env
+from .turn import TurnParams, _container_rewrite, build_loop_argv, prepare_loop
 
 LOOP_TRAILER_MARKER = "---agents-loop-trailer---"
 
@@ -81,59 +81,34 @@ def run_loop_turn(
     workdir: str = "",
 ) -> LoopTurnResult:
     cfg = config or RelayConfig.from_env()
-    argv = list(cfg.loop_cmd)
-    argv.extend(
-        [
-            "--channel",
-            channel,
-            "--user",
-            user,
-            "--message",
-            message,
-            "--complete",
-            "--provider",
-            provider or cfg.loop_provider,
-            "--deliver",
-            "buffered",
-        ]
+    params = TurnParams(
+        channel=channel,
+        user=user,
+        message=message,
+        session=session,
+        user_id=user_id,
+        new_session=new_session,
+        provider=provider,
+        model=model,
+        persona=persona,
+        project=project,
+        workspace=workspace,
+        workdir=workdir,
+        deliver="buffered",
+        attachments=tuple(attachments or ()),
     )
-    if model:
-        argv.extend(["--model", model])
-    if session:
-        argv.extend(["--session", session])
-    if user_id:
-        argv.extend(["--user-id", user_id])
-    if new_session:
-        argv.append("--new-session")
-    if persona:
-        argv.extend(["--persona", persona])
-    if project:
-        argv.extend(["--project", project])
-    for path in attachments or ():
-        if path:
-            argv.extend(["--attach", str(path)])
+    params, notes, extra = prepare_loop(params, cfg)
+    argv = build_loop_argv(params, cfg)
+    argv, child_env, ws = _container_rewrite(argv, params.workspace, params.workdir, extra)
+    container = ws is not None
 
     wait = timeout_sec if timeout_sec and timeout_sec > 0 else None
 
-    ws = None
-    if workspace:
-        try:
-            ws = resolve_workspace_id(workspace)
-        except Exception:
-            ws = None
-    container = False
-    child_env = workspace_env(workspace, workdir)
-    if ws is not None:
-        try:
-            from agents_workspace.runtime import (
-                isolation_of, to_container_argv, to_container_env,
-            )
-            if isolation_of(ws) == "container":
-                child_env = to_container_env(ws, child_env)
-                argv = to_container_argv(ws, argv)
-                container = True
-        except ImportError:
-            pass
+    from .attachments import apply_notes
+
+    def _finish(result: LoopTurnResult) -> LoopTurnResult:
+        result.reply = apply_notes(result.reply, notes)
+        return result
 
     def _run_blocking() -> LoopTurnResult:
         if container:
@@ -151,14 +126,14 @@ def run_loop_turn(
                 env=child_env,
             )
         parsed = parse_loop_stdout(proc.stdout or "")
-        return LoopTurnResult(
+        return _finish(LoopTurnResult(
             reply=parsed["reply"],
             session=parsed["session"],
             user_id=parsed["user_id"],
             alias=parsed["alias"],
             returncode=int(proc.returncode),
             stderr=proc.stderr or "",
-        )
+        ))
 
     if on_status is None and on_pid is None:
         try:
@@ -167,12 +142,12 @@ def run_loop_turn(
             err = exc.stderr or ""
             if isinstance(err, bytes):
                 err = err.decode("utf-8", errors="replace")
-            return _stopped(err)
+            return _finish(_stopped(err))
         except RuntimeError as exc:
-            return LoopTurnResult(
+            return _finish(LoopTurnResult(
                 reply=f"Turn failed: {exc}", session="", user_id="",
                 alias="", returncode=1, stderr=str(exc),
-            )
+            ))
     import threading
 
     popen_kwargs: dict[str, Any] = {}
@@ -236,7 +211,7 @@ def run_loop_turn(
             proc.wait()
         t.join(timeout=1)
         out_t.join(timeout=1)
-        return _stopped("".join(stderr_lines))
+        return _finish(_stopped("".join(stderr_lines)))
     finally:
         t.join(timeout=2)
         out_t.join(timeout=2)
@@ -250,11 +225,11 @@ def run_loop_turn(
     stdout = "".join(stdout_lines)
 
     parsed = parse_loop_stdout(stdout or "")
-    return LoopTurnResult(
+    return _finish(LoopTurnResult(
         reply=parsed["reply"],
         session=parsed["session"],
         user_id=parsed["user_id"],
         alias=parsed["alias"],
         returncode=int(proc.returncode),
         stderr="".join(stderr_lines),
-    )
+    ))

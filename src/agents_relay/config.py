@@ -75,6 +75,7 @@ class RelayConfig:
     max_jobs_per_chat: int = 3
     approver: str = ""
     attach_dir: str = ""
+    vision: str = ""
     web_token: str = ""
     web_user: str = "web"
     static_dir: str = ""
@@ -108,6 +109,7 @@ class RelayConfig:
             max_jobs_per_chat=max(1, _int(os.environ.get("AGENTS_RELAY_MAX_JOBS_PER_CHAT", "3"), 3)),
             approver=_clean(os.environ.get("AGENTS_RELAY_APPROVER", "")),
             attach_dir=_clean(os.environ.get("AGENTS_RELAY_ATTACH_DIR", "")),
+            vision=_clean(os.environ.get("AGENTS_RELAY_VISION", "")).lower(),
             web_token=_clean(os.environ.get("RELAY_WEB_TOKEN", "")),
             web_user=_clean(os.environ.get("RELAY_WEB_USER", "web")) or "web",
             static_dir=_clean(read_alias(None, "AGENTS_RELAY_WEB_DIR", "RELAY_STATIC_DIR")),

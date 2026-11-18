@@ -575,23 +575,26 @@ class TurnHandler(BaseHTTPRequestHandler):
             val = str(body.get(key) or "").strip()
             if val:
                 turn_kwargs[key] = val
+        attachment_notes: list[str] = []
         if raw_attachments:
-            from .attachments import AttachmentRejected, allowed_attach_root, materialize_attachments
-            from .state import inbox_dir
+            from .attachments import AttachmentRejected, materialize_for_turn
 
-            dest = (ws.relay_state / "inbox") if ws is not None else inbox_dir(self._cfg())
-            allowed_root = (
-                ws.relay_state if ws is not None
-                else allowed_attach_root(self._cfg())
-            )
             try:
-                turn_kwargs["attachments"] = materialize_attachments(
+                turn_kwargs["attachments"] = materialize_for_turn(
                     raw_attachments,
-                    dest,
-                    allowed_root=allowed_root,
+                    config=self._cfg(),
+                    workspace_id=ws.id if ws is not None else "",
+                    notes=attachment_notes,
                 )
             except AttachmentRejected:
                 self.send_error(400, "attachment path outside allowed directory")
+                return
+            if attachment_notes:
+                from .attachments import apply_notes
+
+                turn_kwargs["message"] = apply_notes(text, attachment_notes)
+            if not turn_kwargs["attachments"] and not text.strip():
+                self.send_error(400, "; ".join(attachment_notes) or "attachment rejected")
                 return
         try:
             result = self._run_turn(turn_kwargs)
@@ -614,8 +617,10 @@ class TurnHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 log.warning("failed to broadcast notification to telegram: %s", exc)
 
+        from .attachments import apply_notes
+
         payload = {
-            "reply": result.reply,
+            "reply": apply_notes(result.reply, attachment_notes),
             "session": result.session,
             "user_id": result.user_id,
             "alias": result.alias,
@@ -982,6 +987,30 @@ class TurnHandler(BaseHTTPRequestHandler):
         if params.persona and not valid_id(params.persona):
             self.send_error(400, f"invalid persona id: {params.persona!r}")
             return
+        raw_attachments = body.get("attachments") or []
+        attachment_notes: list[str] = []
+        if raw_attachments:
+            from .attachments import AttachmentRejected, apply_notes, materialize_for_turn
+
+            try:
+                paths = materialize_for_turn(
+                    raw_attachments,
+                    config=self._cfg(),
+                    workspace_id=params.workspace,
+                    notes=attachment_notes,
+                )
+            except AttachmentRejected:
+                self.send_error(400, "attachment path outside allowed directory")
+                return
+            original = params.message
+            params = replace(
+                params,
+                attachments=tuple(paths),
+                message=apply_notes(original, attachment_notes),
+            )
+            if not paths and not original.strip():
+                self.send_error(400, "; ".join(attachment_notes) or "attachment rejected")
+                return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -989,6 +1018,12 @@ class TurnHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         try:
+            if attachment_notes:
+                self.wfile.write(_sse_event({
+                    "type": "delta",
+                    "text": "\n\n".join(attachment_notes) + "\n\n",
+                }))
+                self.wfile.flush()
             for event in iter_loop_stream(params, config=self._cfg()):
                 payload = {"type": event.type}
                 if event.type == "delta":
