@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RELAY_SECRET`, `TELEGRAM_BOT_TOKEN`, `WEBHOOK_SECRET`, and `RELAY_WEB_TOKEN` resolve via `agents_workspace.resolve_secret()`: `<ws>/secrets.json` > `<host>/secrets.json` > env. The `GATEWAY_SECRET` alias still works as the env fallback; a broken workspace resolver degrades to env-only.
 
 ### Fixed
+- `/health` gets the same CORS origin echo as `/v1/*`: cross-origin dashboards poll it for up/down status, and without the echo every remote showed as "down" so the workspace tree never loaded.
 - `mirror_regular_file` opens source and destination with `O_BINARY` on Windows: bytes `\x1a` (Ctrl+Z, DOS EOF) no longer truncate mirrored attachments.
 - Child process output is decoded as UTF-8 with `errors="replace"` instead of the locale default (`cp1252` on Western-European Windows), and spawned children get `PYTHONUTF8=1`. German umlauts and any non-ASCII text no longer come back mojibake in turn results.
 
