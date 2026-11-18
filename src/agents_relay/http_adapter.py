@@ -379,6 +379,22 @@ class TurnHandler(BaseHTTPRequestHandler):
             handle_logout(self)
             return
 
+        if path == "/v1/remotes":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            body = self._read_json()
+            if body is None:
+                return
+            from .remotes import upsert_remote
+
+            row, err = upsert_remote(self._cfg(), body)
+            if row is None:
+                self.send_error(400, err)
+                return
+            self._write_json({"ok": True, "remote": row}, 200)
+            return
+
         if path == "/v1/workspaces":
             if not _check_secret(self, self.relay_secret, query_params):
                 self.send_error(401, "unauthorized")
@@ -495,6 +511,21 @@ class TurnHandler(BaseHTTPRequestHandler):
             if body is None:
                 return
             handle_chat_stop(self, body)
+            return
+
+        # POST /v1/remote/<id>/<upstream-path> — authenticated remote mount.
+        if path.startswith("/v1/remote/"):
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            rparts = path.split("/", 4)
+            rid = rparts[3] if len(rparts) > 3 else ""
+            if not valid_id(rid):
+                self.send_error(400, f"invalid remote id: {rid!r}")
+                return
+            from .remotes import handle_proxy
+
+            handle_proxy(self, rid, "/" + rparts[4] if len(rparts) > 4 else "/")
             return
 
         if path == "/v1/inject":
@@ -1132,6 +1163,28 @@ class TurnHandler(BaseHTTPRequestHandler):
                 return
             self._write_json({"ok": True, "providers": rows}, 200)
             return
+        if path == "/v1/remotes":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            from .remotes import list_public
+
+            self._write_json({"ok": True, "remotes": list_public(self._cfg())}, 200)
+            return
+        # GET /v1/remote/<id>/<upstream-path> — authenticated remote mount.
+        if path.startswith("/v1/remote/"):
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            parts = path.split("/", 4)
+            rid = parts[3] if len(parts) > 3 else ""
+            if not valid_id(rid):
+                self.send_error(400, f"invalid remote id: {rid!r}")
+                return
+            from .remotes import handle_proxy
+
+            handle_proxy(self, rid, "/" + parts[4] if len(parts) > 4 else "/")
+            return
         parts = path.split("/")
         # GET /v1/workspaces/<ws>/personas/<p>/inbox
         if (len(parts) == 7 and parts[1] == "v1"
@@ -1171,6 +1224,33 @@ class TurnHandler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:
         path, query_params = _parse_query(self.path)
         parts = path.split("/")
+        # DELETE /v1/remotes/<id> — drop a remote mount (never its secret elsewhere).
+        if (len(parts) == 4 and parts[1] == "v1"
+                and parts[2] == "remotes" and parts[3]):
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            from .remotes import delete_remote
+
+            if not delete_remote(self._cfg(), parts[3]):
+                self.send_error(404, "unknown remote")
+                return
+            self._write_json({"ok": True, "remote": parts[3]}, 200)
+            return
+        # DELETE /v1/remote/<id>/<upstream-path> — proxied mount.
+        if path.startswith("/v1/remote/"):
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            rparts = path.split("/", 4)
+            rid = rparts[3] if len(rparts) > 3 else ""
+            if not valid_id(rid):
+                self.send_error(400, f"invalid remote id: {rid!r}")
+                return
+            from .remotes import handle_proxy
+
+            handle_proxy(self, rid, "/" + rparts[4] if len(rparts) > 4 else "/")
+            return
         # DELETE /v1/workspaces/<id>[?hard=1]
         if (len(parts) == 4 and parts[1] == "v1"
                 and parts[2] == "workspaces" and parts[3]):
