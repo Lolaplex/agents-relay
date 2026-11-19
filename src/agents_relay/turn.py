@@ -454,7 +454,14 @@ def iter_loop_stream_live(
     tools run. Here both pipes feed one queue: stderr lines become ``status``
     events, stdout characters become ``delta`` events. ``cancel`` kills the whole
     process tree, which is what a browser stop button needs.
+
+    The wall-clock cap is the whole turn (spawn to trailer), not one tool call.
+    ``AGENTS_RELAY_TURN_TIMEOUT`` overrides the 900s default.
     """
+    try:
+        timeout_sec = int(os.environ.get("AGENTS_RELAY_TURN_TIMEOUT", "") or timeout_sec)
+    except ValueError:
+        pass
     cfg = config or GatewayConfig.from_env()
     params, notes, extra = prepare_loop(params, cfg)
     argv = build_loop_argv(replace(params, deliver="stream"), cfg)
