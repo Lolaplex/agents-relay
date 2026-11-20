@@ -608,6 +608,83 @@ class TestConcurrency(unittest.TestCase):
             texts = [call.args[2] for call in sent.call_args_list]
             self.assertTrue(any("No running jobs" in text for text in texts))
 
+    def test_new_message_interrupts_single_running_turn(self):
+        from agents_relay.telegram_adapter import dispatch_update
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(Path(tmp), allowed=(5,))
+            registry = reset_registry(cfg)
+            release = threading.Event()
+            running = threading.Event()
+            started: list[str] = []
+
+            def turn(**kwargs):
+                on_pid = kwargs.get("on_pid")
+                if on_pid:
+                    on_pid(31337)
+                started.append(kwargs["message"])
+                if kwargs["message"] == "old":
+                    running.set()
+                    release.wait(3)
+                return _result(kwargs["message"])
+
+            with patch("agents_relay.telegram_adapter.send_message", return_value={"result": {"message_id": 1}}):
+                with patch("agents_relay.telegram_adapter.edit_message", return_value={"ok": True}):
+                    with patch("agents_relay.jobs.kill_process_tree") as killer:
+                        dispatch_update(_message(5, "old"), config=cfg, on_turn=turn, registry=registry)
+                        self.assertTrue(running.wait(2))
+                        dispatch_update(_message(5, "redirect"), config=cfg, on_turn=turn, registry=registry)
+                        killer.assert_called_with(31337)
+                        release.set()
+                        deadline = time.time() + 3
+                        while time.time() < deadline and "redirect" not in started:
+                            time.sleep(0.02)
+            self.assertEqual(started, ["old", "redirect"])
+
+    def test_stop_touches_interrupt_file_before_kill(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(Path(tmp), allowed=(5,))
+            registry = reset_registry(cfg)
+            release = threading.Event()
+            running = threading.Event()
+
+            def fn(job):
+                job.bind_pid(31337)
+                running.set()
+                release.wait(3)
+
+            registry.submit(5, "work", fn)
+            self.assertTrue(running.wait(2))
+            job = registry.list_chat(5)[0]
+            self.assertTrue(job.interrupt_path)
+            with patch("agents_relay.jobs.kill_process_tree"):
+                registry.stop(5)
+            self.assertTrue(Path(job.interrupt_path).exists())
+            release.set()
+
+    def test_run_loop_turn_passes_interrupt_env(self):
+        from agents_relay.loop_client import run_loop_turn
+
+        trailer = json.dumps({"session": "s", "user_id": "u", "alias": "a"})
+        env_seen: dict[str, str] = {}
+
+        class _Proc:
+            stdout = f"answer\n---agents-loop-trailer---\n{trailer}\n"
+            stderr = ""
+            returncode = 0
+
+        def fake_run(argv, **kwargs):
+            env_seen.update(kwargs.get("env") or {})
+            return _Proc()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(Path(tmp))
+            with patch("agents_relay.loop_client.subprocess.run", side_effect=fake_run):
+                with patch("agents_relay.loop_client._container_rewrite", side_effect=lambda a, w, wd, e=None: (a, e or os.environ.copy(), None)):
+                    result = run_loop_turn(channel="telegram", user="u", message="hi", config=cfg, interrupt_file=str(Path(tmp) / "i"))
+            self.assertEqual(result.reply, "answer")
+            self.assertEqual(env_seen.get("AGENTS_INTERRUPT_FILE"), str(Path(tmp) / "i"))
+
     def test_callback_not_blocked_by_running_turn(self):
         from agents_relay.telegram_adapter import dispatch_update
 

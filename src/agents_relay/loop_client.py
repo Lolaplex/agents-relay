@@ -79,6 +79,7 @@ def run_loop_turn(
     project: str = "",
     workspace: str = "",
     workdir: str = "",
+    interrupt_file: str = "",
 ) -> LoopTurnResult:
     cfg = config or RelayConfig.from_env()
     params = TurnParams(
@@ -98,6 +99,9 @@ def run_loop_turn(
         attachments=tuple(attachments or ()),
     )
     params, notes, extra = prepare_loop(params, cfg)
+    if interrupt_file:
+        extra = dict(extra or {})
+        extra["AGENTS_INTERRUPT_FILE"] = interrupt_file
     argv = build_loop_argv(params, cfg)
     argv, child_env, ws = _container_rewrite(argv, params.workspace, params.workdir, extra)
     container = ws is not None

@@ -14,6 +14,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from pathlib import Path
 from typing import Callable
 
 log = logging.getLogger("agents_relay.jobs")
@@ -80,6 +81,7 @@ class Job:
         self.created = time.time()
         self.cancel = threading.Event()
         self.done = threading.Event()
+        self.interrupt_path = ""
 
     def bind_pid(self, pid: int) -> None:
         self.pid = int(pid)
@@ -88,7 +90,7 @@ class Job:
 
 
 class JobRegistry:
-    def __init__(self, max_per_chat: int = 3, max_global: int = 8, max_queue: int = 20) -> None:
+    def __init__(self, max_per_chat: int = 3, max_global: int = 8, max_queue: int = 20, interrupt_dir: str = "") -> None:
         self.max_per_chat = max(1, int(max_per_chat))
         self.max_global = max(1, int(max_global))
         self.max_queue = max(1, int(max_queue))
@@ -98,6 +100,14 @@ class JobRegistry:
         self._running = 0
         self._rr = 0
         self._closed = False
+        self._interrupt_dir = Path(interrupt_dir) if interrupt_dir else None
+        if self._interrupt_dir is not None:
+            try:
+                self._interrupt_dir.mkdir(parents=True, exist_ok=True)
+                for stale in self._interrupt_dir.glob("*.interrupt"):
+                    stale.unlink(missing_ok=True)
+            except OSError:
+                self._interrupt_dir = None
 
     @property
     def closed(self) -> bool:
@@ -115,6 +125,8 @@ class JobRegistry:
             if self._closed:
                 return None
             job = Job(self._new_id_locked(), chat_id, (preview or "")[:80])
+            if self._interrupt_dir is not None:
+                job.interrupt_path = str(self._interrupt_dir / f"{job.id}.interrupt")
             self._jobs[job.id] = job
             if self._can_start_locked(chat_id):
                 self._mark_running_locked(job)
@@ -133,6 +145,7 @@ class JobRegistry:
     def stop(self, chat_id: int, job_id: str | None = None) -> list[str]:
         """Cancel one job or every job for `chat_id`. Kills live process trees."""
         to_kill: list[int] = []
+        to_interrupt: list[str] = []
         stopped: list[str] = []
         with self._lock:
             queue = self._queues.get(chat_id)
@@ -159,8 +172,19 @@ class JobRegistry:
                     continue
                 job.cancel.set()
                 stopped.append(job.id)
+                if job.interrupt_path:
+                    to_interrupt.append(job.interrupt_path)
                 if job.pid:
                     to_kill.append(job.pid)
+        # Graceful first: the marker file lets the loop exit between rounds and
+        # flush its trailer; the tree kill is the hard backstop behind it.
+        for path in to_interrupt:
+            try:
+                Path(path).touch()
+            except OSError:
+                pass
+        if to_interrupt and to_kill:
+            time.sleep(0.6)
         for pid in to_kill:
             kill_process_tree(pid)
         return stopped
@@ -244,6 +268,7 @@ def get_registry(config) -> JobRegistry:
             _REGISTRY = JobRegistry(
                 max_per_chat=getattr(config, "max_jobs_per_chat", 3),
                 max_global=getattr(config, "max_jobs", 8),
+                interrupt_dir=str(Path(getattr(config, "state_dir", "") or ".") / "interrupts"),
             )
         return _REGISTRY
 
@@ -256,7 +281,8 @@ def reset_registry(config=None) -> JobRegistry:
             _REGISTRY._closed = True
         per = getattr(config, "max_jobs_per_chat", 3) if config is not None else 3
         glob = getattr(config, "max_jobs", 8) if config is not None else 8
-        _REGISTRY = JobRegistry(max_per_chat=per, max_global=glob)
+        idir = str(Path(config.state_dir) / "interrupts") if config is not None else ""
+        _REGISTRY = JobRegistry(max_per_chat=per, max_global=glob, interrupt_dir=idir)
         return _REGISTRY
 
 

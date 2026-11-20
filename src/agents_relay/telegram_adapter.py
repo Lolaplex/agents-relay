@@ -470,6 +470,7 @@ def handle_inbound_text(
     cancelled: Callable[[], bool] | None = None,
     attachment_notes: list[str] | None = None,
     voice_reply: bool = False,
+    interrupt_file: str = "",
 ) -> LoopTurnResult:
     """Same Telegram lifecycle as a poll text update: thinking edit, then final."""
     token = config.telegram_bot_token
@@ -528,6 +529,8 @@ def handle_inbound_text(
             "attachments": list(attachments or ()),
             "on_pid": on_pid,
         }
+        if interrupt_file:
+            runner_kwargs["interrupt_file"] = interrupt_file
         if persona:
             runner_kwargs["persona"] = persona
         if ws_pref:
@@ -536,7 +539,7 @@ def handle_inbound_text(
             result = runner(**runner_kwargs)
         except TypeError:
             slim = {key: value for key, value in runner_kwargs.items()
-                    if key not in ("attachments", "on_pid", "persona", "workspace")}
+                    if key not in ("attachments", "on_pid", "persona", "workspace", "interrupt_file")}
             try:
                 result = runner(**slim)
             except TypeError:
@@ -675,6 +678,7 @@ def process_update(
         attachments=attachments,
         on_pid=job.bind_pid if job is not None else None,
         cancelled=job.cancel.is_set if job is not None else None,
+        interrupt_file=job.interrupt_path if job is not None else "",
         attachment_notes=attachment_notes,
         voice_reply=was_voice and config.tts,
     )
@@ -941,6 +945,13 @@ def dispatch_update(
 
     def _run(job: Job) -> None:
         process_update(update, config=config, on_turn=on_turn, job=job)
+
+    # Interrupt-and-redirect: a new message while exactly one turn is running
+    # cancels it and this message becomes the turn. A chat that already queued
+    # extra messages keeps burst-queue semantics — /stop is the hard cancel.
+    chat_jobs = reg.list_chat(chat_id)
+    if len(chat_jobs) == 1 and chat_jobs[0].running:
+        reg.stop(chat_id)
 
     job = reg.submit(chat_id, preview, _run)
     if job is None and not reg.closed:

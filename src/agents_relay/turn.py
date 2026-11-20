@@ -296,6 +296,7 @@ def run_loop_turn(
     workspace: str = "",
     workdir: str = "",
     timeout_sec: int = 600,
+    interrupt_file: str = "",
 ) -> LoopTurnResult:
     params = TurnParams(
         channel=channel,
@@ -314,6 +315,9 @@ def run_loop_turn(
     )
     cfg = config or GatewayConfig.from_env()
     params, notes, extra = prepare_loop(params, cfg)
+    if interrupt_file:
+        extra = dict(extra or {})
+        extra["AGENTS_INTERRUPT_FILE"] = interrupt_file
     argv = build_loop_argv(params, cfg)
     argv, env, ws = _container_rewrite(argv, params.workspace, params.workdir, extra)
     if ws is not None:
