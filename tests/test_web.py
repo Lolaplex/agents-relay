@@ -418,10 +418,23 @@ class TestPush(unittest.TestCase):
             )
             self.assertEqual(resp.status, 200)
             self.assertEqual(json.loads(resp.read().decode())["subscriptions"], 1)
-        stored = (
-            Path(self._tmp.name) / "relay-state" / "push" / "subscriptions.jsonl"
-        ).read_text().splitlines()
+        stored = json.loads(
+            (Path(self._tmp.name) / "relay-state" / "push.json").read_text()
+        )
         self.assertEqual(len(stored), 1)
+
+    def test_push_send_501_without_pywebpush(self):
+        resp = self.srv.request(
+            "POST",
+            "/v1/push/send",
+            {"payload": {"type": "test"}},
+            headers={"X-Relay-Secret": "expected"},
+        )
+        try:
+            import pywebpush  # noqa: F401
+        except ImportError:
+            self.assertEqual(resp.status, 501)
+        resp.read()
 
     def test_subscribe_rejects_bad_endpoint(self):
         resp = self.srv.request(

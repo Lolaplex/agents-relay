@@ -31,7 +31,7 @@ from .web import (
     verify_cookie,
     web_enabled,
 )
-from .push import handle_push_subscribe, handle_vapid_key
+from .push import handle_push_send, handle_push_subscribe, handle_vapid_key
 from .webhooks import handle_webhook
 
 log = logging.getLogger("agents_relay.http")
@@ -618,6 +618,16 @@ class TurnHandler(BaseHTTPRequestHandler):
             if body is None:
                 return
             handle_push_subscribe(self, self._cfg(), body, query_params)
+            return
+
+        if path == "/v1/push/send":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            body = self._read_json()
+            if body is None:
+                return
+            handle_push_send(self, self._cfg(), body, query_params)
             return
 
         # POST /v1/remote/<id>/<upstream-path> — authenticated remote mount.

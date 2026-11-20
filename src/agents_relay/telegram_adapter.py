@@ -228,11 +228,26 @@ def deliver_html(
 
 
 def chat_allowed(chat_id: int, config: RelayConfig) -> bool:
-    """Allowlist membership. Empty allowlist denies unless AGENTS_RELAY_ALLOW_ANYONE=1."""
+    """Member-registry first, then env allowlist fallback.
+
+    ``<ws>/members.json`` (agents-workspace D-members) is the authored
+    authz list: a chat_id with any member role is allowed. When no
+    workspace/members file resolves, TELEGRAM_ALLOWED_CHAT_IDS (or
+    AGENTS_RELAY_ALLOW_ANYONE on an empty list) decides as before.
+    """
     try:
         numeric = int(chat_id)
     except (TypeError, ValueError):
         return False
+    try:
+        from agents_workspace import Workspace
+        from agents_workspace.members import member_role
+
+        ws = Workspace.from_env()
+        if member_role(ws, str(numeric)):
+            return True
+    except Exception:
+        pass
     if numeric in config.telegram_allowed_chat_ids:
         return True
     if not config.telegram_allowed_chat_ids and config.allow_anyone:

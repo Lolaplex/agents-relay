@@ -1,15 +1,20 @@
-"""VAPID (Web Push, RFC 8292) key generation and subscription storage.
+"""VAPID (Web Push, RFC 8292) key generation, subscription storage, send.
 
 P-256 key generation is done in pure stdlib Python: a scalar multiply on
 secp256r1 runs once per host, so the ~60-line EC implementation beats pulling
 in a crypto dependency the relay does not otherwise need. The private key is
-stored hex-encoded under ``<host>/keys/vapid.json`` (mode 0600); the public
-key served to browsers is the base64url uncompressed point (65 bytes).
+stored hex-encoded under ``<ws>/relay/vapid.json`` (mode 0600) — i.e. the
+configured relay state dir; the public key served to browsers is the
+base64url uncompressed point (65 bytes).
 
 Subscriptions (PushSubscription JSON from the web app) live in
-``<ws>/relay/push/subscriptions.jsonl`` — one JSON object per line, deduped
-by ``endpoint`` so a re-subscribe replaces, never appends. Without a
-``?workspace=`` the serve state dir is used instead.
+``<ws>/relay/push.json`` — a JSON array deduped by ``endpoint`` so a
+re-subscribe replaces, never appends. Without a ``?workspace=`` the serve
+state dir is used instead.
+
+Sending needs ``pywebpush`` (lazy import): it signs the VAPID JWT and does
+the aes128gcm payload encryption. Absent → :class:`PushUnavailable`; the
+key/subscription endpoints keep working regardless.
 """
 
 from __future__ import annotations
@@ -72,15 +77,13 @@ def _public_key_b64(priv: int) -> str:
 
 # --- host key file ------------------------------------------------------------
 
-def _host_keys_dir() -> Path:
-    from agents_workspace import Host
-
-    return Host.from_env().keys
+def _state_dir(config) -> Path:
+    return Path(config.state_dir)
 
 
-def vapid_keypair() -> dict[str, str]:
-    """Load or mint the host VAPID keypair. Public key is base64url, 65 bytes."""
-    path = _host_keys_dir() / "vapid.json"
+def vapid_keypair(config) -> dict[str, str]:
+    """Load or mint the relay VAPID keypair. Public key is base64url, 65 bytes."""
+    path = _state_dir(config) / "vapid.json"
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(data, dict) and data.get("public") and data.get("private"):
@@ -106,7 +109,7 @@ def vapid_keypair() -> dict[str, str]:
 def handle_vapid_key(handler, config) -> None:
     """``GET /v1/push/vapid-key`` → the relay's VAPID public key."""
     try:
-        pair = vapid_keypair()
+        pair = vapid_keypair(config)
     except Exception as exc:
         handler._write_json({"ok": False, "error": f"vapid unavailable: {exc}"}, 503)  # type: ignore[attr-defined]
         return
@@ -119,33 +122,34 @@ def _push_dir(config, ws_ref: str) -> Path:
     if ws_ref:
         from .turn import resolve_workspace_id
 
-        return resolve_workspace_id(ws_ref).relay_state / "push"
-    return Path(config.state_dir) / "push"
+        return resolve_workspace_id(ws_ref).relay_state
+    return _state_dir(config)
 
 
 def _store_file(root: Path) -> Path:
-    return root / "subscriptions.jsonl"
+    return root / "push.json"
 
 
 def load_subscriptions(root: Path) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
     path = _store_file(root)
-    if not path.is_file():
-        return rows
     try:
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(row, dict) and row.get("endpoint"):
-                rows.append(row)
+        rows = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(rows, list):
+        return []
+    return [r for r in rows if isinstance(r, dict) and r.get("endpoint")]
+
+
+def _write_subscriptions(root: Path, rows: list[dict[str, Any]]) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    tmp = _store_file(root).with_suffix(".tmp")
+    tmp.write_text(json.dumps(rows, indent=1), encoding="utf-8")
+    try:
+        tmp.chmod(stat.S_IRUSR | stat.S_IWUSR)
     except OSError:
         pass
-    return rows
+    tmp.replace(_store_file(root))
 
 
 def handle_push_subscribe(handler, config, body: dict, query: dict[str, Any]) -> None:
@@ -173,15 +177,76 @@ def handle_push_subscribe(handler, config, body: dict, query: dict[str, Any]) ->
     }
     rows = [r for r in load_subscriptions(root) if r.get("endpoint") != endpoint]
     rows.append(row)
-    root.mkdir(parents=True, exist_ok=True)
-    tmp = _store_file(root).with_suffix(".tmp")
-    tmp.write_text(
-        "".join(json.dumps(r, separators=(",", ":")) + "\n" for r in rows),
-        encoding="utf-8",
-    )
-    try:
-        tmp.chmod(stat.S_IRUSR | stat.S_IWUSR)
-    except OSError:
-        pass
-    tmp.replace(_store_file(root))
+    _write_subscriptions(root, rows)
     handler._write_json({"ok": True, "subscriptions": len(rows)}, 200)  # type: ignore[attr-defined]
+
+
+# --- send (pywebpush, lazy) ----------------------------------------------------
+
+class PushUnavailable(RuntimeError):
+    """``pywebpush`` is not installed — storage endpoints stay live anyway."""
+
+
+def send_push_all(config, payload: dict[str, Any], ws_ref: str = "") -> int:
+    """Push ``payload`` to every stored subscription. Returns delivered count."""
+    try:
+        from pywebpush import webpush  # type: ignore
+    except ImportError:
+        try:
+            from webpush import webpush  # type: ignore
+        except ImportError:
+            raise PushUnavailable("pywebpush not installed") from None
+    pair = vapid_keypair(config)
+    root = _push_dir(config, ws_ref)
+    sent = 0
+    dead: list[str] = []
+    for sub in load_subscriptions(root):
+        try:
+            webpush(
+                subscription_info={
+                    "endpoint": sub["endpoint"],
+                    "keys": sub.get("keys") or {},
+                },
+                data=json.dumps(payload),
+                vapid_private_key=pair["private"],
+                vapid_claims={"sub": "mailto:relay@localhost"},
+            )
+            sent += 1
+        except Exception as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", 0)
+            if status in (404, 410):
+                dead.append(str(sub.get("endpoint")))
+    if dead:
+        rows = [r for r in load_subscriptions(root) if r.get("endpoint") not in dead]
+        _write_subscriptions(root, rows)
+    return sent
+
+
+def notify_approval_pending(config, request: dict[str, Any], ws_ref: str = "") -> None:
+    """Best-effort push when an approval goes pending. Never raises."""
+    try:
+        send_push_all(
+            config,
+            {
+                "type": "approval",
+                "id": str(request.get("id") or request.get("ident") or ""),
+                "summary": str(request.get("summary") or request.get("command") or "")[:160],
+            },
+            ws_ref=ws_ref,
+        )
+    except Exception:
+        pass
+
+
+def handle_push_send(handler, config, body: dict, query: dict[str, Any]) -> None:
+    """``POST /v1/push/send`` — test/admin send to stored subscriptions."""
+    try:
+        sent = send_push_all(
+            config,
+            body.get("payload") if isinstance(body.get("payload"), dict) else body,
+            ws_ref=str(query.get("workspace") or body.get("workspace") or "").strip(),
+        )
+    except PushUnavailable as exc:
+        handler._write_json({"ok": False, "error": str(exc)}, 501)  # type: ignore[attr-defined]
+        return
+    handler._write_json({"ok": True, "sent": sent}, 200)  # type: ignore[attr-defined]

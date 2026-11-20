@@ -1237,6 +1237,41 @@ class TestDashboardApi(unittest.TestCase):
         with patch.dict("os.environ", {"RELAY_CORS_ORIGINS": ""}, clear=False):
             self.assertEqual(RelayConfig.from_env().cors_origins, ())
 
+class TestMemberRoleAuthz(unittest.TestCase):
+    """ws members.json grants chat access before the env allowlist."""
+
+    def setUp(self):
+        from pathlib import Path as _P
+
+        self._tmp = tempfile.TemporaryDirectory()
+        root = _P(self._tmp.name)
+        os.environ["AGENTS_HOST_DIR"] = str(root / "host")
+        os.environ["AGENTS_WORKSPACE"] = "demo"
+        from agents_workspace import Host
+
+        self.ws = Host(dir=root / "host").create("demo")
+
+    def tearDown(self):
+        os.environ.pop("AGENTS_HOST_DIR", None)
+        os.environ.pop("AGENTS_WORKSPACE", None)
+        self._tmp.cleanup()
+
+    def _cfg(self, allowed=()):
+        return _test_config(telegram_allowed_chat_ids=allowed)
+
+    def test_member_chat_allowed(self):
+        from agents_workspace.members import write_members
+        from agents_relay.telegram_adapter import chat_allowed
+
+        write_members(self.ws, [{"id": "999", "role": "member"}])
+        self.assertTrue(chat_allowed(999, self._cfg(allowed=())))
+
+    def test_nonmember_falls_back_to_env_list(self):
+        from agents_relay.telegram_adapter import chat_allowed
+
+        self.assertFalse(chat_allowed(999, self._cfg(allowed=())))
+        self.assertTrue(chat_allowed(999, self._cfg(allowed=(999,))))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -111,6 +111,10 @@ def create_pending(config: RelayConfig, chat_id: int, request: dict) -> dict:
         }
 
     updated = _mutate(config, ident, _apply)
+    if updated and updated.get("status") == _PENDING:
+        from .push import notify_approval_pending
+
+        notify_approval_pending(config, {**request, "id": ident})
     return updated or {}
 
 
