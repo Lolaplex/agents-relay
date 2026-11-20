@@ -274,6 +274,33 @@ def send_to_user(
     return last
 
 
+def send_audio(token: str, chat_id: int, blob: bytes, *, filename: str = "reply.mp3", caption: str = "") -> dict:
+    """Telegram sendAudio with an in-memory file (multipart upload)."""
+    boundary = f"----relay{uuid.uuid4().hex}"
+
+    def _field(name: str, value: str) -> bytes:
+        return (
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+        ).encode("utf-8")
+
+    body = _field("chat_id", str(chat_id))
+    if caption:
+        body += _field("caption", caption[:200])
+    body += (
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"audio\"; "
+        f"filename=\"{filename}\"\r\nContent-Type: audio/mpeg\r\n\r\n"
+    ).encode("utf-8")
+    body += blob + f"\r\n--{boundary}--\r\n".encode("utf-8")
+    req = urllib.request.Request(
+        _api_url(token, "sendAudio"),
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
 def _download_telegram_file(
     token: str,
     file_id: str,
@@ -402,6 +429,7 @@ def handle_inbound_text(
     on_pid: Callable[[int], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
     attachment_notes: list[str] | None = None,
+    voice_reply: bool = False,
 ) -> LoopTurnResult:
     """Same Telegram lifecycle as a poll text update: thinking edit, then final."""
     token = config.telegram_bot_token
@@ -516,6 +544,21 @@ def handle_inbound_text(
 
     anim_done.set()
     deliver_html(token, chat_id, reply_html, thinking_id=thinking_id if isinstance(thinking_id, int) else None)
+    if voice_reply and config.tts and config.groq_api_key:
+        try:
+            from .voice import TTS_MODEL, TTS_VOICE, synthesize_speech
+
+            plain = visible_reply(result.reply or "", extract_traces(result.stderr or "")[1])
+            blob = synthesize_speech(
+                plain,
+                config.groq_api_key,
+                model=config.tts_model or TTS_MODEL,
+                voice=config.tts_voice or TTS_VOICE,
+            )
+            if blob:
+                send_audio(token, chat_id, blob, filename="reply.mp3")
+        except Exception:
+            log.warning("tts reply failed")
     return result
 
 
@@ -593,6 +636,7 @@ def process_update(
         on_pid=job.bind_pid if job is not None else None,
         cancelled=job.cancel.is_set if job is not None else None,
         attachment_notes=attachment_notes,
+        voice_reply=was_voice and config.tts,
     )
 
 

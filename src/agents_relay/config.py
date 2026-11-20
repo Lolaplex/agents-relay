@@ -92,6 +92,9 @@ class RelayConfig:
     web_secure: bool = True
     cors_origins: tuple[str, ...] = ()
     groq_api_key: str = ""
+    tts: bool = False
+    tts_voice: str = ""
+    tts_model: str = ""
 
     @classmethod
     def from_env(cls) -> "RelayConfig":
@@ -134,6 +137,9 @@ class RelayConfig:
                 if origin
             ),
             groq_api_key=_clean(_secret("GROQ_API_KEY")),
+            tts=_flag(os.environ.get("AGENTS_RELAY_TTS", "")),
+            tts_voice=_clean(os.environ.get("AGENTS_RELAY_TTS_VOICE", "")),
+            tts_model=_clean(os.environ.get("AGENTS_RELAY_TTS_MODEL", "")),
         )
 
 

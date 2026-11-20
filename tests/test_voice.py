@@ -23,6 +23,7 @@ def _config(tmp: str, **over) -> RelayConfig:
         telegram_poll_timeout=1,
         state_dir=str(Path(tmp) / "relay"),
         groq_api_key="",
+        tts=False,
     )
     base.update(over)
     return RelayConfig(**base)
@@ -75,6 +76,47 @@ class VoiceInTests(unittest.TestCase):
                 ta.process_update(_voice_update(), config=cfg, on_turn=fake_turn)
         self.assertEqual(seen.get("message"), "hello world")
 
+    def test_voice_reply_sends_audio_when_tts_on(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _config(tmp, groq_api_key="gk", tts=True)
+            saved = Path(tmp) / "v.oga"
+            saved.write_bytes(b"oga")
+            audio_calls: list[bytes] = []
+
+            def fake_turn(**kw):
+                return ta.LoopTurnResult(reply="spoken answer", session="s", user_id="u", alias="a", returncode=0, stderr="")
+
+            with (
+                patch.object(ta, "_download_telegram_file", return_value=saved),
+                patch.object(ta, "send_message", return_value={"result": {"message_id": 9}}),
+                patch.object(ta, "edit_message"),
+                patch.object(ta, "deliver_html"),
+                patch.object(ta, "send_audio", side_effect=lambda t, c, b, **kw: audio_calls.append(b)),
+                patch("agents_relay.voice.transcribe_audio", return_value="question"),
+                patch("agents_relay.voice.synthesize_speech", return_value=b"MP3DATA"),
+            ):
+                ta.process_update(_voice_update(), config=cfg, on_turn=fake_turn)
+        self.assertEqual(audio_calls, [b"MP3DATA"])
+
+    def test_tts_off_means_no_audio(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _config(tmp, groq_api_key="gk", tts=False)
+            saved = Path(tmp) / "v.oga"
+            saved.write_bytes(b"oga")
+
+            def fake_turn(**kw):
+                return ta.LoopTurnResult(reply="ok", session="s", user_id="u", alias="a", returncode=0, stderr="")
+
+            with (
+                patch.object(ta, "_download_telegram_file", return_value=saved),
+                patch.object(ta, "send_message", return_value={"result": {"message_id": 9}}),
+                patch.object(ta, "edit_message"),
+                patch.object(ta, "deliver_html"),
+                patch.object(ta, "send_audio") as mock_audio,
+                patch("agents_relay.voice.transcribe_audio", return_value="question"),
+            ):
+                ta.process_update(_voice_update(), config=cfg, on_turn=fake_turn)
+        mock_audio.assert_not_called()
 
 
 class VoiceApiTests(unittest.TestCase):
@@ -108,6 +150,30 @@ class VoiceApiTests(unittest.TestCase):
         self.assertIn(b"OGABYTES", captured["body"])
         self.assertIn(b"whisper-large-v3-turbo", captured["body"])
 
+    def test_synthesize_posts_json(self):
+        captured: dict = {}
+
+        class FakeResp:
+            def read(self):
+                return b"AUDIO"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_open(req, timeout=0):
+            captured["url"] = req.full_url
+            captured["body"] = json.loads(req.data.decode())
+            return FakeResp()
+
+        with patch("urllib.request.urlopen", side_effect=fake_open):
+            blob = voice.synthesize_speech("hello", "gk")
+        self.assertEqual(blob, b"AUDIO")
+        self.assertIn("audio/speech", captured["url"])
+        self.assertEqual(captured["body"]["model"], "playai-tts")
+        self.assertEqual(captured["body"]["input"], "hello")
 
 
 if __name__ == "__main__":

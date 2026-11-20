@@ -1,7 +1,9 @@
 """Voice in/out via the Groq API (stdlib urllib only).
 
 Opt-in: ``GROQ_API_KEY`` enables speech-to-text for incoming Telegram voice
-and audio messages.
+and audio messages. ``AGENTS_RELAY_TTS=1`` makes a voice note get an audio
+answer back (text reply is still sent). ``AGENTS_RELAY_TTS_VOICE`` /
+``AGENTS_RELAY_TTS_MODEL`` override the defaults.
 """
 
 from __future__ import annotations
@@ -17,6 +19,10 @@ log = logging.getLogger("agents_relay.voice")
 
 GROQ_BASE = "https://api.groq.com/openai/v1"
 STT_MODEL = "whisper-large-v3-turbo"
+TTS_MODEL = "playai-tts"
+TTS_VOICE = "Fritz-PlayAI"
+TTS_FORMAT = "mp3"
+_MAX_INPUT = 4000
 
 
 def _multipart(fields: dict[str, str], file_field: str, file_path: Path) -> tuple[bytes, str]:
@@ -59,3 +65,38 @@ def transcribe_audio(path: Path, api_key: str, *, model: str = STT_MODEL) -> str
         log.warning("groq transcription failed for %s", path.name)
         return ""
     return str(data.get("text") or "").strip()
+
+
+def synthesize_speech(
+    text: str,
+    api_key: str,
+    *,
+    model: str = TTS_MODEL,
+    voice: str = TTS_VOICE,
+) -> bytes | None:
+    """Groq TTS audio bytes (mp3). None on failure."""
+    clean = (text or "").strip()
+    if not api_key or not clean:
+        return None
+    payload = {
+        "model": model,
+        "voice": voice,
+        "input": clean[:_MAX_INPUT],
+        "response_format": TTS_FORMAT,
+    }
+    req = urllib.request.Request(
+        f"{GROQ_BASE}/audio/speech",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            blob = resp.read()
+    except Exception:
+        log.warning("groq speech synthesis failed")
+        return None
+    return blob or None
