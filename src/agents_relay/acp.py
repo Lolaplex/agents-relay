@@ -491,15 +491,8 @@ def run_acp_turn(
             },
         )
         auth_methods = (init.get("result") or {}).get("authMethods") or []
-        if auth_methods:
-            api_key = os.environ.get("AGENTS_ACP_API_KEY", "").strip()
-            if not api_key:
-                sys.stderr.write(
-                    "acp agent requires auth "
-                    f"({', '.join(str(m.get('id')) for m in auth_methods)}) — "
-                    "set AGENTS_ACP_API_KEY.\n"
-                )
-                return 1
+        api_key = os.environ.get("AGENTS_ACP_API_KEY", "").strip()
+        if auth_methods and api_key:
             res = conn.request(
                 "authenticate",
                 {"methodId": str(auth_methods[0].get("id")), "meta": {"api_key": api_key}},
@@ -507,6 +500,10 @@ def run_acp_turn(
             if "error" in res:
                 sys.stderr.write(f"acp authenticate failed: {res['error']}\n")
                 return 1
+        # No key: proceed anyway — the agent may already be authenticated
+        # out-of-band (`devin auth login` creds, SSH, etc.). If not, the
+        # session request below fails loudly instead of a speculative
+        # refusal here.
         acp_sid = str(stored.get("acpSessionId") or "")
         loaded = False
         if acp_sid:
