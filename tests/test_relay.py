@@ -267,6 +267,31 @@ class TestHttpTurn(unittest.TestCase):
 
 
 class TestTelegramFormat(unittest.TestCase):
+    def test_digest_refs_never_reach_telegram(self):
+        from agents_relay.telegram_format import (
+            format_telegram_html,
+            split_telegram_html,
+            visible_reply,
+        )
+
+        reply = visible_reply('analysis…\n<ref digest="deadbeef0123" chars="9000"/>')
+        self.assertNotIn("digest", reply)
+        self.assertIn("analysis", reply)
+        reply = visible_reply(
+            'only <stdio evicted="1" truncated="1" digest="cafe" chars="5000"/> here'
+        )
+        self.assertNotIn("digest", reply)
+        long_html = format_telegram_html(
+            "para one.\n\n" + "x" * 9000 + '\n<ref digest="d1" chars="8000"/>'
+        )
+        parts = split_telegram_html(long_html)
+        self.assertGreater(len(parts), 1)
+        for part in parts:
+            from agents_relay.telegram_format import utf16_len
+
+            self.assertLessEqual(utf16_len(part), 4096)
+            self.assertNotIn("digest", part)
+
     def test_format_with_traces_and_links(self):
         from agents_relay.telegram_format import format_telegram_html
 

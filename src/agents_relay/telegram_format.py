@@ -22,6 +22,8 @@ _TOOL_TAG_RE = re.compile(
     re.IGNORECASE,
 )
 _BARE_TAGS_RE = re.compile(r"</?(?:ts|clock|timestamp)\b[^>]*>", re.IGNORECASE)
+# agents-traces frozen addresses: never surface digest refs to the user.
+_REF_MARKER_RE = re.compile(r"<(?:ref|stdio)\b[^>]*?/>", re.IGNORECASE)
 _BLOB_KEYS = (
     "tool_call",
     "tool_calls",
@@ -249,7 +251,8 @@ def extract_traces(text: str) -> tuple[str, tuple[str, ...]]:
 def strip_model_dumps(text: str) -> str:
     if not text:
         return ""
-    out = _FENCE_RE.sub(lambda m: "" if _looks_like_blob(m.group(0)) else m.group(0), text)
+    out = _REF_MARKER_RE.sub("", text)
+    out = _FENCE_RE.sub(lambda m: "" if _looks_like_blob(m.group(0)) else m.group(0), out)
     out = _TOOL_TAG_RE.sub("", out)
     out = _BARE_TAGS_RE.sub("", out)
     stripped = out.strip()
