@@ -11,14 +11,24 @@ a ``reply_to`` field) are handed back to the origin persona.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import secrets
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable
 
 log = logging.getLogger("agents_relay.wake")
 
 _RECENT_LIMIT = 20
+
+# Persistent wake queue (<ws>/relay/handoffs/<task>.json, #93): written
+# before a wake turns `running`, removed only after the result write
+# lands, and replayed on boot so a crash never strands a handoff.
+_QUEUE_DIR = "handoffs"
+_TERMINAL = ("done", "failed", "replied")
 
 # Live wake threads; lets shutdown/tests join instead of leaking daemons
 # that lose their result write (or race a removed state dir) mid-flight.
@@ -70,6 +80,51 @@ def _write_status(
     _write_task(_task_path(persona_inbox(ws, owner), task_id), task)
     task["owner"] = owner
     return task
+
+
+def _queue_dir(ws) -> Path:
+    d = Path(ws.relay_state) / _QUEUE_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _enqueue(ws, task: dict[str, Any]) -> None:
+    """Crash-marker for an in-flight wake; atomic like inbox writes."""
+    payload = {
+        "task_id": str(task.get("id") or ""),
+        "owner": str(task.get("owner") or task.get("to_persona") or ""),
+        "enqueued_at": _ts(),
+    }
+    dst = _queue_dir(ws) / (payload["task_id"] + ".json")
+    tmp = dst.with_suffix(f".{secrets.token_hex(6)}.tmp")
+    try:
+        tmp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, dst)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _dequeue(ws, task_id: str) -> None:
+    (_queue_dir(ws) / f"{task_id}.json").unlink(missing_ok=True)
+
+
+def _refusal(ws, task: dict[str, Any]) -> str:
+    """Why the target persona must not be woken, or "" (#93).
+
+    The handoff itself enforces this at move time; wake re-checks so a
+    queued or replayed task honors a policy that changed after the move.
+    """
+    from agents_workspace.inbox import persona_meta
+
+    owner = str(task.get("owner") or task.get("to_persona") or "")
+    meta = persona_meta(ws, owner)
+    if meta.get("accepts_messages") is False:
+        return f"persona {owner} does not accept messages"
+    src = str(task.get("from_persona") or "")
+    peers = meta.get("allow_peers")
+    if src and isinstance(peers, list) and src not in [str(p) for p in peers]:
+        return f"persona {owner} does not accept {src}"
+    return ""
 
 
 def _prompt(task: dict[str, Any]) -> str:
@@ -124,6 +179,13 @@ def wake_task(
     """
     task_id = str(task.get("id") or "")
     owner = str(task.get("owner") or task.get("to_persona") or "")
+    refusal = _refusal(ws, task)
+    if refusal:
+        _write_status(ws, task_id, "failed", note=f"wake refused: {refusal}")
+        _dequeue(ws, task_id)
+        log.warning("handoff wake %s refused: %s", task_id, refusal)
+        return
+    _enqueue(ws, task)
     _write_status(ws, task_id, "running", note="wake spawned")
 
     def _run() -> None:
@@ -155,6 +217,8 @@ def wake_task(
             _finish(ws, task_id, status, result, summary)
         except Exception:  # noqa: BLE001 - same rule: log, never propagate
             log.exception("handoff wake %s result write failed", task_id)
+        else:
+            _dequeue(ws, task_id)
         finally:
             _THREADS.discard(threading.current_thread())
 
@@ -197,3 +261,54 @@ def team_inbox(ws, *, limit: int = _RECENT_LIMIT) -> dict[str, Any]:
                         })
     recent.sort(key=lambda row: row["at"], reverse=True)
     return {"personas": personas, "recent": recent[: max(1, int(limit))]}
+
+
+def replay(ws, *, run_turn: Callable[..., Any], timeout_sec: int = 900) -> int:
+    """Re-wake unfinished queued handoffs in ``ws`` after a restart (#93).
+
+    Queue files whose task vanished or reached a terminal status are
+    dropped; everything else goes through ``wake_task`` again, which
+    re-checks the current persona peer policy before spawning.
+    """
+    from agents_workspace.inbox import find_task
+
+    qdir = Path(ws.relay_state) / _QUEUE_DIR
+    if not qdir.is_dir():
+        return 0
+    n = 0
+    for path in sorted(qdir.glob("*.json")):
+        tid = path.stem
+        try:
+            rec = json.loads(path.read_text(encoding="utf-8"))
+            tid = str(rec.get("task_id") or tid)
+        except (OSError, ValueError):
+            pass
+        hit = find_task(ws, tid)
+        if hit is None or str(hit[1].get("status") or "") in _TERMINAL:
+            path.unlink(missing_ok=True)
+            continue
+        _owner, task = hit
+        wake_task(ws, task, run_turn=run_turn, timeout_sec=timeout_sec)
+        n += 1
+    return n
+
+
+def replay_all(*, run_turn: Callable[..., Any], timeout_sec: int = 900) -> dict[str, int]:
+    """Boot-time replay across every workspace; ``{ws_id: wakes}``."""
+    from .workspaces import list_workspaces
+
+    out: dict[str, int] = {}
+    try:
+        workspaces = list_workspaces()
+    except Exception:
+        log.exception("handoff replay: workspace list failed")
+        return out
+    for ws in workspaces:
+        try:
+            n = replay(ws, run_turn=run_turn, timeout_sec=timeout_sec)
+        except Exception:  # noqa: BLE001 - one bad ws must not stop boot
+            log.exception("handoff replay failed for %s", getattr(ws, "id", ws))
+            continue
+        if n:
+            out[str(ws.id)] = n
+    return out

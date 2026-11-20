@@ -1432,11 +1432,13 @@ class TurnHandler(BaseHTTPRequestHandler):
                     return
                 if serve_static(self, "index.html"):
                     return
-            body: dict[str, Any] = {"ok": True, "version": __version__}
-            klanker_version = getattr(self, "klanker_version", "") or getattr(
-                self._cfg(), "klanker_version", "")
-            if klanker_version:
-                body["klanker_version"] = klanker_version
+            body: dict[str, Any] = {"ok": True}
+            if path == "/health":
+                body["version"] = __version__
+                klanker_version = getattr(self, "klanker_version", "") or getattr(
+                    self._cfg(), "klanker_version", "")
+                if klanker_version:
+                    body["klanker_version"] = klanker_version
             self._write_json(body, 200)
             return
         if web_enabled(cfg) and serve_static(self, path):
@@ -1583,5 +1585,17 @@ def serve_http(config: RelayConfig, *, on_turn: Callable[..., LoopTurnResult] | 
         pass
     handler = type("ConfiguredRelayHandler", (TurnHandler,), attrs)
     server = ThreadingHTTPServer((config.relay_host, config.relay_port), handler)
+    try:
+        from .wake import replay_all
+
+        if on_turn is not None:
+            run_turn = attrs["turn_hook"]
+        else:
+            run_turn = lambda **kw: run_loop_turn(config=config, **kw)  # noqa: E731
+        replayed = replay_all(run_turn=run_turn)
+        if replayed:
+            log.info("replayed %d unfinished handoff wake(s)", sum(replayed.values()))
+    except Exception:  # noqa: BLE001 - replay never blocks boot
+        log.exception("handoff wake replay failed")
     log.info("HTTP listening on %s:%s", config.relay_host, config.relay_port)
     return server

@@ -525,6 +525,110 @@ class TestHandoffWake(unittest.TestCase):
         self.assertEqual(owner, "cos")
         self.assertIn("exit 1", task["result"])
 
+    def _handoff_no_wake(self, tid: str, target: str = "cos") -> None:
+        resp = self.srv.request(
+            "POST",
+            f"/v1/workspaces/demo/personas/default/inbox/{tid}/handoff",
+            {"to": target})
+        self.assertEqual(resp.status, 200)
+        resp.read()
+
+    def _stranded(self, tid: str):
+        """Crash state: queue entry + task stuck at running (#93)."""
+        from agents_relay import wake
+        from agents_workspace import Host
+        from agents_workspace.inbox import find_task
+
+        ws = Host.from_env().workspace("demo")
+        _owner, task = find_task(ws, tid)
+        wake._enqueue(ws, task)
+        wake._write_status(ws, tid, "running", note="crash")
+        return ws
+
+    def _restart(self, calls: list) -> None:
+        from agents_relay.turn import LoopTurnResult
+
+        def hook(**kwargs):
+            calls.append(kwargs)
+            return LoopTurnResult(
+                reply="replayed", session=str(kwargs.get("session") or ""),
+                user_id="", alias="", returncode=0, stderr="")
+
+        self.srv.close()
+        self.srv = _Server(_cfg(), on_turn=hook)
+
+    def test_wake_queue_cleared_on_finish(self):
+        create_workspace("demo")
+        self.srv.request(
+            "POST", "/v1/workspaces/demo/personas", {"id": "cos"})
+        tid = self._mk_task()
+        resp = self.srv.request(
+            "POST",
+            f"/v1/workspaces/demo/personas/default/inbox/{tid}/handoff?wake=1",
+            {"to": "cos"})
+        self.assertEqual(resp.status, 202)
+        resp.read()
+        self._wait_task("cos", tid)
+        from agents_workspace import Host
+
+        qdir = Host.from_env().workspace("demo").relay_state / "handoffs"
+        self.assertEqual(list(qdir.glob("*.json")), [])
+
+    def test_boot_replays_stranded_handoff(self):
+        create_workspace("demo")
+        self.srv.request(
+            "POST", "/v1/workspaces/demo/personas", {"id": "cos"})
+        tid = self._mk_task()
+        self._handoff_no_wake(tid)
+        ws = self._stranded(tid)
+        calls: list[dict] = []
+        self._restart(calls)
+        owner, task = self._wait_task("cos", tid)
+        self.assertEqual(task["result"], "replayed")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["session"], f"routine:handoff:{tid}")
+        self.assertEqual(calls[0]["persona"], "cos")
+        self.assertEqual(
+            list((ws.relay_state / "handoffs").glob("*.json")), [])
+
+    def test_replay_honors_post_move_policy(self):
+        create_workspace("demo")
+        self.srv.request(
+            "POST", "/v1/workspaces/demo/personas", {"id": "cos"})
+        tid = self._mk_task()
+        self._handoff_no_wake(tid)
+        ws = self._stranded(tid)
+        # Policy tightened after the move: replay must refuse, not run.
+        manifest = ws.personas / "cos" / "persona.json"
+        meta = json.loads(manifest.read_text(encoding="utf-8"))
+        meta["accepts_messages"] = False
+        manifest.write_text(json.dumps(meta), encoding="utf-8")
+        calls: list[dict] = []
+        self._restart(calls)
+        _owner, task = self._wait_task("cos", tid, status="failed")
+        self.assertIn("does not accept", str(task.get("events")[-1].get("note")))
+        self.assertEqual(calls, [])
+        self.assertEqual(
+            list((ws.relay_state / "handoffs").glob("*.json")), [])
+
+    def test_replay_drops_terminal_and_missing_tasks(self):
+        create_workspace("demo")
+        self.srv.request(
+            "POST", "/v1/workspaces/demo/personas", {"id": "cos"})
+        tid = self._mk_task()
+        ws = self._stranded(tid)
+        # terminal: finished before the crash window closed -> drop, no wake
+        from agents_relay import wake
+
+        wake._write_status(ws, tid, "done", result="x")
+        # missing: dangling entry for a task that no longer exists
+        wake._enqueue(ws, {"id": "ghost1", "owner": "cos"})
+        calls: list[dict] = []
+        self._restart(calls)
+        self.assertEqual(calls, [])
+        self.assertEqual(
+            list((ws.relay_state / "handoffs").glob("*.json")), [])
+
     def test_handler_error_returns_500_not_disconnect(self):
         """A crashing handler must answer 500 JSON, not drop the socket."""
         create_workspace("demo")
