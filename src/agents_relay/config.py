@@ -91,6 +91,7 @@ class RelayConfig:
     static_dir: str = ""
     web_secure: bool = True
     cors_origins: tuple[str, ...] = ()
+    groq_api_key: str = ""
 
     @classmethod
     def from_env(cls) -> "RelayConfig":
@@ -132,6 +133,7 @@ class RelayConfig:
                 )
                 if origin
             ),
+            groq_api_key=_clean(_secret("GROQ_API_KEY")),
         )
 
 

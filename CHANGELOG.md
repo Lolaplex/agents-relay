@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Speech-to-text for Telegram voice/audio messages: the file downloads into the relay inbox and is transcribed via Groq Whisper (`whisper-large-v3-turbo`) into the turn text. Opt-in via `GROQ_API_KEY` (resolved through workspace/host secrets first); without a key the user gets a notice instead of a silent drop.
 - `GET /v1/presence/offers` + `POST /v1/presence/publish`: signed `road-declaration/1` offers in `AGENTS_PRESENCE_DIR` (default `~/.agents/presence`). Signing/verification shells out to `agents_keys` — the relay never touches key material. Forged/expired/broken offers list as invalid rows with their refusal reason; publish self-verifies before writing.
 
 ### Changed

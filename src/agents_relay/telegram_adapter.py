@@ -336,6 +336,40 @@ def _collect_attachments(
     return paths, notes
 
 
+def _collect_voice(
+    message: dict, token: str, config: RelayConfig
+) -> tuple[str, list[str], bool]:
+    """Download and transcribe a voice/audio message via Groq Whisper.
+
+    Returns (transcript, notes, is_voice). ``is_voice`` stays true when the
+    message was a voice note even if transcription is unavailable, so the
+    caller can still answer with audio. Voice keeps its file out of the
+    attachment list — the model gets the transcript, not the .oga.
+    """
+    item = message.get("voice") if isinstance(message.get("voice"), dict) else None
+    if item is None:
+        audio = message.get("audio")
+        if isinstance(audio, dict):
+            item = audio
+    if not item or not item.get("file_id"):
+        return "", [], False
+    name = str(item.get("file_name") or ("voice.oga" if "voice" in message else "audio"))
+    saved = _download_telegram_file(token, str(item["file_id"]), inbox_dir(config), dest_name=name)
+    if saved is None:
+        return "", ["Voice message dropped: could not save the Telegram file."], True
+    if not config.groq_api_key:
+        return "", [
+            "Voice message received but speech-to-text is off (GROQ_API_KEY not set)."
+        ], True
+    from .voice import transcribe_audio
+
+    transcript = transcribe_audio(saved, config.groq_api_key)
+    if not transcript:
+        return "", ["Voice message could not be transcribed."], True
+    log.info("voice note transcribed (%d chars)", len(transcript))
+    return transcript, [], True
+
+
 def inbound_payload(result: LoopTurnResult) -> dict:
     """Caller JSON: visible answer + humanized traces. No tokens, no raw CLI dump."""
     _, err_traces = extract_traces(result.stderr or "")
@@ -530,6 +564,10 @@ def process_update(
     if not token:
         return
     attachments, attachment_notes = _collect_attachments(message, token, config)
+    transcript, voice_notes, was_voice = _collect_voice(message, token, config)
+    if transcript:
+        text = f"{text}\n{transcript}".strip() if text else transcript
+    attachment_notes.extend(voice_notes)
     if not text and not attachments and not attachment_notes:
         return
     if not text and not attachments:
@@ -813,7 +851,9 @@ def dispatch_update(
     if command is not None and not message.get("photo") and not message.get("document"):
         _handle_control(command, chat_id, config, reg)
         return
-    preview = text or str(message.get("caption") or "").strip() or "(attachment)"
+    preview = text or str(message.get("caption") or "").strip() or (
+        "(voice)" if message.get("voice") or message.get("audio") else "(attachment)"
+    )
 
     def _run(job: Job) -> None:
         process_update(update, config=config, on_turn=on_turn, job=job)
