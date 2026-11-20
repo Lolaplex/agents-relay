@@ -31,6 +31,7 @@ from .web import (
     verify_cookie,
     web_enabled,
 )
+from .push import handle_push_subscribe, handle_vapid_key
 from .webhooks import handle_webhook
 
 log = logging.getLogger("agents_relay.http")
@@ -607,6 +608,16 @@ class TurnHandler(BaseHTTPRequestHandler):
             if body is None:
                 return
             handle_chat_stop(self, body)
+            return
+
+        if path == "/v1/push/subscribe":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            body = self._read_json()
+            if body is None:
+                return
+            handle_push_subscribe(self, self._cfg(), body, query_params)
             return
 
         # POST /v1/remote/<id>/<upstream-path> — authenticated remote mount.
@@ -1265,6 +1276,12 @@ class TurnHandler(BaseHTTPRequestHandler):
                 self.send_error(401, "unauthorized")
                 return
             handle_runs_attach(self, query_params)
+            return
+        if path == "/v1/push/vapid-key":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            handle_vapid_key(self, self._cfg())
             return
         if path == "/v1/approvals":
             if not _check_secret(self, self.relay_secret, query_params):

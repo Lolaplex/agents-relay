@@ -375,6 +375,64 @@ class TestChatStream(unittest.TestCase):
         worker.join(timeout=5)
         self.assertIn('"run": "r-find"', body)
 
+class TestPush(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        os.environ["AGENTS_KEYS_DIR"] = str(Path(self._tmp.name) / "keys")
+        os.environ["AGENTS_HOST_DIR"] = str(Path(self._tmp.name) / "host")
+        self.srv = _Server(_cfg(state_dir=str(Path(self._tmp.name) / "relay-state")))
+
+    def tearDown(self):
+        self.srv.close()
+        os.environ.pop("AGENTS_KEYS_DIR", None)
+        os.environ.pop("AGENTS_HOST_DIR", None)
+
+    def test_vapid_key_mints_and_stays_stable(self):
+        resp = self.srv.request(
+            "GET", "/v1/push/vapid-key", headers={"X-Relay-Secret": "expected"}
+        )
+        self.assertEqual(resp.status, 200)
+        key = json.loads(resp.read().decode())["key"]
+        import base64
+
+        raw = base64.urlsafe_b64decode(key + "=" * (-len(key) % 4))
+        self.assertEqual(len(raw), 65)
+        self.assertEqual(raw[0], 4)
+        # same key on second call (persisted under <host>/keys/vapid.json)
+        resp2 = self.srv.request(
+            "GET", "/v1/push/vapid-key", headers={"X-Relay-Secret": "expected"}
+        )
+        self.assertEqual(json.loads(resp2.read().decode())["key"], key)
+
+    def test_subscribe_upserts_by_endpoint(self):
+        sub = {
+            "endpoint": "https://push.example/x1",
+            "keys": {"p256dh": "a", "auth": "b"},
+        }
+        for _ in range(2):
+            resp = self.srv.request(
+                "POST",
+                "/v1/push/subscribe",
+                {"subscription": sub, "workspace": "", "persona": "p1"},
+                headers={"X-Relay-Secret": "expected"},
+            )
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(json.loads(resp.read().decode())["subscriptions"], 1)
+        stored = (
+            Path(self._tmp.name) / "relay-state" / "push" / "subscriptions.jsonl"
+        ).read_text().splitlines()
+        self.assertEqual(len(stored), 1)
+
+    def test_subscribe_rejects_bad_endpoint(self):
+        resp = self.srv.request(
+            "POST",
+            "/v1/push/subscribe",
+            {"subscription": {"endpoint": "http://nope"}},
+            headers={"X-Relay-Secret": "expected"},
+        )
+        self.assertEqual(resp.status, 400)
+        resp.read()
+
 
 if __name__ == "__main__":
     unittest.main()
