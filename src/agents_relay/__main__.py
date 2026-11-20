@@ -142,6 +142,13 @@ def _help_json() -> dict:
                 "description": "Block until a tool call is approved or denied (JSON on stdin). --local waits on the approval file. --decide writes one decision.",
                 "flags": ["--user", "--chat-id", "--timeout", "--local", "--decide", "--allow", "--deny"],
             },
+            "acp-serve": {
+                "description": "Run as an ACP agent over stdio (Zed/ACP clients spawn this; prompts drive runner.loop)",
+            },
+            "acp-run": {
+                "description": "Drive a foreign ACP agent (AGENTS_ACP_CMD) with a runner.loop-shaped CLI; usable as LOOP_CMD",
+                "flags": ["--message", "--session", "--workdir", "--deliver", "--new-session"],
+            },
             "client": {
                 "description": "Smoke-test relay turn/stream/health",
                 "subcommands": ["turn", "health"],
@@ -178,6 +185,27 @@ def build_parser() -> argparse.ArgumentParser:
     approve_p.add_argument("--decide", default="", help="Resolve this pending id and exit")
     approve_p.add_argument("--allow", action="store_true", help="With --decide, allow the tool")
     approve_p.add_argument("--deny", action="store_true", help="With --decide, deny the tool")
+    sub.add_parser(
+        "acp-serve",
+        help="Run as an ACP agent over stdio (Zed/ACP clients spawn this)",
+    )
+    acp_run_p = sub.add_parser(
+        "acp-run",
+        help="Drive a foreign ACP agent via AGENTS_ACP_CMD; runner.loop-shaped argv",
+    )
+    # Mirrors the flags build_loop_argv emits so `LOOP_CMD="agents-relay acp-run"`
+    # works as a drop-in; most are accepted and ignored (ACP has no analog).
+    acp_run_p.add_argument("--message", default="")
+    acp_run_p.add_argument("--session", default="")
+    acp_run_p.add_argument("--workdir", default="")
+    acp_run_p.add_argument("--deliver", default="stream", choices=["stream", "buffered"])
+    acp_run_p.add_argument("--new-session", action="store_true")
+    for ignored in (
+        "--user", "--user-id", "--channel", "--complete", "--provider",
+        "--model", "--project", "--persona",
+    ):
+        acp_run_p.add_argument(ignored, nargs="?", const="", default="")
+    acp_run_p.add_argument("--attach", action="append", default=[])
     client_p = sub.add_parser("client", help="Relay client smoke tests")
     client_sub = client_p.add_subparsers(dest="client_cmd")
     turn_p = client_sub.add_parser("turn", help="POST /v1/turn")
@@ -219,7 +247,9 @@ def _client_main(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     args = build_parser().parse_args(argv)
-    if not getattr(args, "help_json", False):
+    # stdout must stay clean on the stdio ACP surface — skip the update probe.
+    acp_cmd = getattr(args, "command", "") in ("acp-serve", "acp-run")
+    if not getattr(args, "help_json", False) and not acp_cmd:
         try:
             from .updates import check_for_updates
             check_for_updates("agents-relay", __version__)
@@ -228,6 +258,14 @@ def main(argv: list[str] | None = None) -> int:
     if getattr(args, "help_json", False):
         print(json.dumps(_help_json(), indent=2))
         return 0
+    if args.command == "acp-serve":
+        from .acp import serve_acp
+
+        return serve_acp(RelayConfig.from_env())
+    if args.command == "acp-run":
+        from .acp import acp_loop_main
+
+        return acp_loop_main(args, RelayConfig.from_env())
     if args.command == "client":
         return _client_main(args)
     if args.command == "send":
