@@ -429,6 +429,9 @@ class TestHandoffWake(unittest.TestCase):
         self.srv = _Server(_cfg(), on_turn=hook)
 
     def tearDown(self):
+        from agents_relay import wake
+
+        wake.drain()
         self.srv.close()
         self.env.stop()
         self.dir.cleanup()
@@ -521,6 +524,22 @@ class TestHandoffWake(unittest.TestCase):
         owner, task = self._wait_task("cos", tid, status="failed")
         self.assertEqual(owner, "cos")
         self.assertIn("exit 1", task["result"])
+
+    def test_handler_error_returns_500_not_disconnect(self):
+        """A crashing handler must answer 500 JSON, not drop the socket."""
+        create_workspace("demo")
+        self.srv.request(
+            "POST", "/v1/workspaces/demo/personas", {"id": "cos"})
+        tid = self._mk_task()
+        with patch("agents_relay.wake.wake_task",
+                   side_effect=RuntimeError("boom")):
+            resp = self.srv.request(
+                "POST",
+                f"/v1/workspaces/demo/personas/default/inbox/{tid}/handoff?wake=1",
+                {"to": "cos"})
+        self.assertEqual(resp.status, 500)
+        data = json.loads(resp.read().decode())
+        self.assertFalse(data["ok"])
 
     def test_team_inbox_feed(self):
         create_workspace("demo")

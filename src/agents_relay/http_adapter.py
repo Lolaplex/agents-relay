@@ -202,6 +202,19 @@ class TurnHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args) -> None:
         log.info("%s - %s", self.address_string(), fmt % args)
 
+    def handle_one_request(self) -> None:
+        """Last error boundary: an unhandled exception must not drop the
+        connection silently (client sees a bare RemoteDisconnected)."""
+        try:
+            super().handle_one_request()
+        except Exception:
+            self.close_connection = True
+            log.exception("unhandled handler error on %s", getattr(self, "path", ""))
+            try:
+                self._write_json({"ok": False, "error": "internal handler error"}, 500)
+            except Exception:  # response already half-written or peer gone
+                pass
+
     def _read_json(self) -> dict | None:
         length = int(self.headers.get("Content-Length") or "0")
         raw = self.rfile.read(length).decode("utf-8", errors="replace")

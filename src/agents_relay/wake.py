@@ -20,6 +20,19 @@ log = logging.getLogger("agents_relay.wake")
 
 _RECENT_LIMIT = 20
 
+# Live wake threads; lets shutdown/tests join instead of leaking daemons
+# that lose their result write (or race a removed state dir) mid-flight.
+_THREADS: set[threading.Thread] = set()
+
+
+def drain(timeout: float = 5.0) -> int:
+    """Join live wake threads; returns how many are still running."""
+    deadline = time.monotonic() + timeout
+    for t in [t for t in _THREADS if t.is_alive()]:
+        t.join(max(0.0, deadline - time.monotonic()))
+    _THREADS.difference_update(t for t in _THREADS if not t.is_alive())
+    return sum(1 for t in _THREADS if t.is_alive())
+
 
 def _ts() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -138,9 +151,16 @@ def wake_task(
         except Exception as exc:  # noqa: BLE001 - wake must not kill the relay
             log.exception("handoff wake %s failed", task_id)
             result = str(exc)
-        _finish(ws, task_id, status, result, summary)
+        try:
+            _finish(ws, task_id, status, result, summary)
+        except Exception:  # noqa: BLE001 - same rule: log, never propagate
+            log.exception("handoff wake %s result write failed", task_id)
+        finally:
+            _THREADS.discard(threading.current_thread())
 
-    threading.Thread(target=_run, daemon=True, name=f"wake-{task_id}").start()
+    t = threading.Thread(target=_run, daemon=True, name=f"wake-{task_id}")
+    _THREADS.add(t)
+    t.start()
 
 
 def team_inbox(ws, *, limit: int = _RECENT_LIMIT) -> dict[str, Any]:
