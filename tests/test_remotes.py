@@ -142,6 +142,45 @@ class TestRemotes(unittest.TestCase):
         r = self.relay.request("DELETE", "/v1/remote/vps/v1/workspaces/A")
         self.assertEqual(json.loads(r.read())["path"], "/v1/workspaces/A")
 
+    def test_health_reports_version(self):
+        import agents_relay
+
+        r = self.relay.request("GET", "/health")
+        body = json.loads(r.read())
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["version"], agents_relay.__version__)
+        # klanker_version only appears when a klanker-grafted serve reports it
+        self.assertNotIn("klanker_version", body)
+
+    def test_health_reports_klanker_version_when_grafted(self):
+        from agents_relay import http_adapter
+
+        class KlankerGraft(http_adapter.TurnHandler):
+            klanker_version = "9.9.9-test"
+
+        saved = http_adapter.TurnHandler
+        http_adapter.TurnHandler = KlankerGraft
+        try:
+            server = http_adapter.serve_http(_cfg(state_dir=self.tmp.name))
+        finally:
+            http_adapter.TurnHandler = saved
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            conn = HTTPConnection(*server.server_address[:2], timeout=10)
+            conn.request("GET", "/health")
+            body = json.loads(conn.getresponse().read())
+            self.assertEqual(body["klanker_version"], "9.9.9-test")
+        finally:
+            server.shutdown()
+
+    def test_proxy_health_passthrough(self):
+        self.relay.request("POST", "/v1/remotes", {
+            "id": "vps", "base_url": self.base, "secret": "s",
+        })
+        r = self.relay.request("GET", "/v1/remote/vps/health")
+        self.assertEqual(r.status, 200)
+        self.assertEqual(json.loads(r.read())["path"], "/health")
+
     def test_unknown_remote_404(self):
         r = self.relay.request("GET", "/v1/remote/ghost/v1/workspaces")
         self.assertEqual(r.status, 404)

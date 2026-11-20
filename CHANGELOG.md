@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `GET /health` reports the stack version: flat, additive `version` (agents-relay `__version__` via importlib.metadata) plus `klanker_version` when a klanker-grafted serve reports one — readable unchanged through the `/v1/remote/<id>` mount proxy.
 - `chat_allowed` checks `<ws>/members.json` via `agents_workspace.members.member_role` before the env allowlist (workspace#15): a member chat_id passes even when `TELEGRAM_ALLOWED_CHAT_IDS` is empty; the env list / `AGENTS_RELAY_ALLOW_ANYONE` remain the fallback when no workspace member row matches.
 - `POST /v1/push/send` — VAPID delivery via lazy `pywebpush` import; `501` when the package is absent while the key/subscribe endpoints stay live. `approvals.create_pending` fires a best-effort `notify_approval_pending` push to stored subscriptions (gone endpoints 404/410 are pruned). Storage layout per klanker#37: keypair `<ws>/relay/vapid.json`, subscriptions `<ws>/relay/push.json`.
 - Web Push plumbing (klanker#37): `GET /v1/push/vapid-key` serves the host's VAPID public key — minted on demand as pure-stdlib secp256r1 scalar multiply (no crypto dep), private scalar persisted hex in `<host>/keys/vapid.json` (0600). `POST /v1/push/subscribe` upserts browser PushSubscriptions by endpoint into `<ws>/relay/push/subscriptions.jsonl` (serve state dir when no `?workspace=`). The actual send path (JWT + aes128gcm payload encryption) is still open — it needs a crypto dependency decision.

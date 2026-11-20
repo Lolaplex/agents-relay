@@ -11,9 +11,10 @@ from collections import deque
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 from urllib.parse import urlparse
 
+from . import __version__
 from .a2a import handle_a2a_mail, list_peers
 from .config import RelayConfig
 from .loop_client import LoopTurnResult, run_loop_turn
@@ -1431,7 +1432,12 @@ class TurnHandler(BaseHTTPRequestHandler):
                     return
                 if serve_static(self, "index.html"):
                     return
-            self._write_json({"ok": True}, 200)
+            body: dict[str, Any] = {"ok": True, "version": __version__}
+            klanker_version = getattr(self, "klanker_version", "") or getattr(
+                self._cfg(), "klanker_version", "")
+            if klanker_version:
+                body["klanker_version"] = klanker_version
+            self._write_json(body, 200)
             return
         if web_enabled(cfg) and serve_static(self, path):
             return
