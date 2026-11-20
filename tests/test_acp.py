@@ -24,7 +24,7 @@ sys.stdout.write("\\n---agents-loop-trailer---\\n" + json.dumps({"session": "ses
 """
 
 FAKE_AGENT = """\
-import json, sys
+import json, os, sys
 for line in sys.stdin:
     line = line.strip()
     if not line:
@@ -36,6 +36,12 @@ for line in sys.stdin:
     elif method == "session/new":
         print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "acp_stub_1"}}), flush=True)
     elif method == "session/load":
+        print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {}}), flush=True)
+    elif method == "session/set_config_option":
+        log = os.environ.get("AGENT_LOG")
+        if log:
+            with open(log, "a") as fh:
+                fh.write(json.dumps(m.get("params") or {}) + "\\n")
         print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {}}), flush=True)
     elif method == "session/prompt":
         sid = (m.get("params") or {}).get("sessionId")
@@ -67,7 +73,9 @@ class TestAcpServe(unittest.TestCase):
     def test_initialize_and_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             loop = _write(Path(tmp) / "fake_loop.py", FAKE_LOOP)
-            env = _env(tmp, LOOP_CMD=f"{sys.executable} {loop}")
+            env = _env(
+                tmp, LOOP_CMD=f"{sys.executable} {loop}", LOOP_PROVIDER="echo"
+            )
             proc = subprocess.Popen(
                 [sys.executable, "-m", "agents_relay", "acp-serve"],
                 stdin=subprocess.PIPE,
@@ -153,6 +161,152 @@ class TestAcpRun(unittest.TestCase):
             # session id persisted for load on the next turn
             stored = json.loads((Path(tmp) / "acp_sessions" / "ses_t1.json").read_text())
             self.assertEqual(stored["acpSessionId"], "acp_stub_1")
+
+    def test_model_goes_to_set_config_option(self) -> None:
+        from agents_relay.acp import run_acp_turn
+        from agents_relay.config import RelayConfig
+
+        with tempfile.TemporaryDirectory() as tmp:
+            agent = _write(Path(tmp) / "fake_agent.py", FAKE_AGENT)
+            log = str(Path(tmp) / "agent.log")
+            import io, contextlib
+
+            env_save = {k: os.environ.get(k) for k in (
+                "AGENTS_RELAY_STATE", "AGENT_LOG")}
+            os.environ["AGENTS_RELAY_STATE"] = tmp
+            os.environ["AGENT_LOG"] = log
+            config = RelayConfig.from_env()
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = run_acp_turn(
+                        agent_argv=[sys.executable, str(agent)],
+                        message="ping", session="ses_m1", workdir=tmp,
+                        config=config, model="swe-2-high",
+                    )
+            finally:
+                for k, v in env_save.items():
+                    os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+            self.assertEqual(rc, 0)
+            calls = [json.loads(x) for x in Path(log).read_text().splitlines()]
+            self.assertEqual(calls, [{
+                "sessionId": "acp_stub_1", "configId": "model",
+                "value": "swe-2-high"}])
+
+
+class TestAcpProviderWiring(unittest.TestCase):
+    """acp.* providers → acp-run argv, env cmd map, manifest, probe rows."""
+
+    def _env_save(self, *keys):
+        saved = {k: os.environ.get(k) for k in keys}
+        self.addCleanup(
+            lambda: [
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+                for k, v in saved.items()])
+        return saved
+
+    def test_agent_cmd_suffix_and_fallback(self):
+        from agents_relay.acp import acp_agent_cmd
+
+        self._env_save("AGENTS_ACP_CMD", "AGENTS_ACP_CMD_DEVIN")
+        os.environ["AGENTS_ACP_CMD"] = "devin acp"
+        os.environ["AGENTS_ACP_CMD_DEVIN"] = "devin acp --model x"
+        self.assertEqual(acp_agent_cmd("acp.devin"), "devin acp --model x")
+        self.assertEqual(acp_agent_cmd("acp.other"), "devin acp")
+        self.assertEqual(acp_agent_cmd(), "devin acp")
+        os.environ.pop("AGENTS_ACP_CMD_DEVIN")
+        os.environ.pop("AGENTS_ACP_CMD")
+        self.assertEqual(acp_agent_cmd("acp.devin"), "")
+
+    def test_provider_name_env_and_basename(self):
+        from agents_relay.acp import acp_provider_name
+
+        self._env_save("AGENTS_ACP_CMD", "AGENTS_ACP_NAME")
+        os.environ["AGENTS_ACP_CMD"] = "devin acp"
+        self.assertEqual(acp_provider_name(), "acp.devin")
+        os.environ["AGENTS_ACP_NAME"] = "zedfriend"
+        self.assertEqual(acp_provider_name(), "acp.zedfriend")
+
+    def test_ensure_manifest_registers_provider(self):
+        from agents_relay.acp import ensure_acp_manifest
+
+        self._env_save("AGENTS_ACP_CMD", "AGENTS_HOST_DIR")
+        os.environ["AGENTS_ACP_CMD"] = "devin acp"
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["AGENTS_HOST_DIR"] = tmp
+            ensure_acp_manifest()
+            path = Path(tmp) / "providers" / "acp.devin.json"
+            self.assertTrue(path.is_file())
+            from runner.providers import find_provider
+            row = find_provider("acp.devin")
+            self.assertIsNotNone(row)
+            self.assertEqual(row["kind"], "acp-agent")
+            # runner.model.use accepts the pick — no special casing needed
+            from agents_workspace import Host
+            from runner.model import use
+            ws_dir = Path(tmp) / "workspaces" / "demo"
+            ws_dir.mkdir(parents=True)
+            (ws_dir / "workspace.json").write_text("{}")
+            ws = Host.from_env().workspace("demo")
+            out = use("acp.devin", "swe-2-high", workspace=ws)
+            self.assertEqual(out["provider"], "acp.devin")
+
+    def test_build_loop_argv_acp_spawn(self):
+        from agents_relay.config import RelayConfig
+        from agents_relay.turn import TurnParams, build_loop_argv
+
+        cfg = RelayConfig.from_env()
+        params = TurnParams(provider="acp.devin", model="swe-2-high")
+        argv = build_loop_argv(params, cfg)
+        self.assertEqual(argv[:4], [sys.executable, "-m", "agents_relay", "acp-run"])
+        self.assertIn("--provider", argv)
+        self.assertEqual(argv[argv.index("--provider") + 1], "acp.devin")
+        self.assertEqual(argv[argv.index("--model") + 1], "swe-2-high")
+
+    def test_workspace_pick_injects_acp(self):
+        from agents_relay.config import RelayConfig
+        from agents_relay.turn import TurnParams, build_loop_argv
+
+        self._env_save("AGENTS_HOST_DIR")
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["AGENTS_HOST_DIR"] = tmp
+            ws_dir = Path(tmp) / "workspaces" / "demo"
+            ws_dir.mkdir(parents=True)
+            (ws_dir / "workspace.json").write_text("{}")
+            (ws_dir / "config.json").write_text(json.dumps(
+                {"model": {"provider": "acp.devin", "model": "swe-2-high"}}))
+            cfg = RelayConfig.from_env()
+            params = TurnParams(workspace="demo")
+            argv = build_loop_argv(params, cfg)
+            self.assertEqual(argv[:4],
+                             [sys.executable, "-m", "agents_relay", "acp-run"])
+            self.assertEqual(argv[argv.index("--provider") + 1], "acp.devin")
+            self.assertEqual(argv[argv.index("--model") + 1], "swe-2-high")
+            # explicit flag beats the pick
+            params2 = TurnParams(workspace="demo", provider="echo", model="m2")
+            argv2 = build_loop_argv(params2, cfg)
+            self.assertEqual(argv2[:3], ["python", "-m", "runner.loop"])
+            self.assertEqual(argv2[argv2.index("--model") + 1], "m2")
+
+    def test_provider_rows_enriched(self):
+        from unittest.mock import patch
+        from agents_relay import acp
+        from agents_relay.config import RelayConfig
+
+        self._env_save("AGENTS_ACP_CMD", "AGENTS_HOST_DIR")
+        os.environ["AGENTS_ACP_CMD"] = "devin acp"
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["AGENTS_HOST_DIR"] = tmp
+            acp.ensure_acp_manifest()
+            fake = {"model": "swe-2-high", "models": ["a", "b"],
+                    "mode": "accept-edits", "modes": []}
+            os.environ["AGENTS_RELAY_DIR"] = tmp
+            self._env_save("AGENTS_RELAY_DIR")
+            with patch.object(acp, "acp_agent_info", return_value=fake):
+                rows = acp.acp_provider_rows(RelayConfig.from_env())
+            self.assertEqual(len(rows), 1)
+            row = rows[0]
+            self.assertEqual(row["name"], "acp.devin")
+            self.assertEqual(row["models"], ["a", "b"])
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ import os
 import queue
 import re
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -128,8 +129,23 @@ def turn_params_from_body(body: dict[str, Any]) -> TurnParams:
 
 
 def build_loop_argv(params: TurnParams, config: GatewayConfig) -> list[str]:
-    provider = (params.provider or config.loop_provider).strip() or config.loop_provider
+    provider = params.provider.strip()
+    model = params.model.strip()
+    if params.workspace and (not provider or not model):
+        # Workspace pick fills unset slots (flag > pick > env default).
+        try:
+            from runner.model import selected
+
+            pick = selected(resolve_workspace_id(params.workspace))
+            provider = provider or str(pick.get("provider") or "")
+            model = model or str(pick.get("model") or "")
+        except Exception:
+            pass
+    provider = provider or config.loop_provider
     argv = list(config.loop_cmd)
+    if provider.startswith("acp."):
+        # Foreign ACP agent drives the turn; model maps to a config option.
+        argv = [sys.executable, "-m", "agents_relay", "acp-run"]
     argv.extend(
         [
             "--channel",
@@ -145,8 +161,8 @@ def build_loop_argv(params: TurnParams, config: GatewayConfig) -> list[str]:
             params.deliver,
         ]
     )
-    if params.model:
-        argv.extend(["--model", params.model])
+    if model:
+        argv.extend(["--model", model])
     if params.session:
         argv.extend(["--session", params.session])
     if params.user_id:

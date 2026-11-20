@@ -196,6 +196,37 @@ def _bridge_pending_approvals(
         stop.wait(0.4)
 
 
+def _provider_problem() -> str:
+    """Empty when the selected provider can resolve url+model+key.
+
+    Mirrors OpenAICompatProvider's resolution so a misconfigured turn fails
+    loudly here instead of inside the spawned loop process.
+    """
+    name = os.environ.get("LOOP_PROVIDER", "").strip() or "openai.default"
+    try:
+        from agents_workspace import resolve_secret
+        from runner.providers import find_provider
+    except ImportError:
+        return ""
+    manifest = find_provider(name)
+    if manifest is None:
+        return f"unknown provider {name!r}"
+    if manifest.get("kind", "openai_compat") != "openai_compat":
+        return ""
+    missing = [
+        env
+        for env, field in (
+            (manifest.get("url_env") or "LLM_BASE_URL", "url"),
+            (manifest.get("model_env") or "LLM_MODEL", "model"),
+        )
+        if not (os.environ.get(env) or manifest.get(field))
+    ]
+    key_env = manifest.get("key_env") or "LLM_API_KEY"
+    if not (resolve_secret(key_env) or manifest.get("api_key")):
+        missing.append(key_env)
+    return ", ".join(missing)
+
+
 def _run_prompt(
     config: RelayConfig,
     writer: _Writer,
@@ -299,13 +330,40 @@ def serve_acp(config: RelayConfig) -> int:
                         "title": "Klanker (agents-harness)",
                         "version": "0.1.0",
                     },
-                    "authMethods": [],
+                    "authMethods": [
+                        {
+                            "id": "llm_api_key",
+                            "name": "LLM API Key",
+                            "description": "Stored as LLM_API_KEY in the host secrets.json.",
+                        }
+                    ],
                 },
             )
             continue
 
         if method == "authenticate":
-            writer.respond(req_id, {})
+            params = msg.get("params") or {}
+            meta = params.get("meta") or {}
+            key = str(
+                params.get("apiKey") or meta.get("api_key") or params.get("key") or ""
+            ).strip()
+            if not key:
+                writer.respond_error(
+                    req_id, ERR_INVALID_PARAMS, "no api key in authenticate params"
+                )
+                continue
+            try:
+                from agents_workspace import Host
+
+                secrets_path = Host.from_env().secrets
+                data = read_json(secrets_path) or {}
+                data["LLM_API_KEY"] = key
+                write_json_atomic(secrets_path, data)
+                writer.respond(req_id, {})
+            except Exception as exc:
+                writer.respond_error(
+                    req_id, ERR_INTERNAL, f"store key failed: {exc}"
+                )
             continue
 
         if method in ("session/new", "session/load"):
@@ -337,6 +395,17 @@ def serve_acp(config: RelayConfig) -> int:
                 )
                 continue
             message = _prompt_text(params.get("prompt"))
+            problem = _provider_problem()
+            if problem:
+                _chunk(
+                    writer,
+                    sid,
+                    f"provider not configured: {problem}\n"
+                    "Use the client's Authenticate button or set host "
+                    "secrets.json / env vars, then retry.",
+                )
+                writer.respond(req_id, {"stopReason": "end_turn"})
+                continue
             session.busy = True
             session.cancel.clear()
             _start_bridge(session)
@@ -461,6 +530,155 @@ def _acp_sessions_dir(config: RelayConfig) -> Path:
     return path
 
 
+def acp_agent_cmd(provider: str = "") -> str:
+    """Agent command for provider ``acp.<name>``.
+
+    ``AGENTS_ACP_CMD_<NAME>`` wins over the shared ``AGENTS_ACP_CMD`` so a
+    host can register several agents (``acp.devin`` -> ``AGENTS_ACP_CMD_DEVIN``).
+    """
+    suffix = provider.split(".", 1)[1] if provider.startswith("acp.") else ""
+    if suffix:
+        val = os.environ.get(f"AGENTS_ACP_CMD_{suffix.upper()}", "").strip()
+        if val:
+            return val
+    return os.environ.get("AGENTS_ACP_CMD", "").strip()
+
+
+def acp_provider_name() -> str:
+    """``acp.<name>`` — explicit AGENTS_ACP_NAME, else first argv basename."""
+    name = os.environ.get("AGENTS_ACP_NAME", "").strip()
+    if not name:
+        import shlex
+
+        cmd = acp_agent_cmd()
+        argv = shlex.split(cmd, posix=(os.name != "nt")) if cmd else []
+        name = Path(argv[0]).stem if argv else "agent"
+    return f"acp.{name}"
+
+
+def probe_acp_agent(agent_argv: list[str], timeout: float = 20) -> dict[str, Any]:
+    """Spawn the agent briefly; collect its model/mode config options."""
+    out: dict[str, Any] = {"model": "", "models": [], "mode": "", "modes": []}
+    conn = _AgentConn(agent_argv)
+    try:
+        conn.request(
+            "initialize",
+            {
+                "protocolVersion": PROTOCOL_VERSION,
+                "clientCapabilities": {},
+                "clientInfo": {"name": "agents-relay", "version": "0.1.0"},
+            },
+            timeout=timeout,
+        )
+        res = conn.request(
+            "session/new", {"cwd": os.getcwd(), "mcpServers": []}, timeout=timeout
+        )
+        for opt in (res.get("result") or {}).get("configOptions") or []:
+            oid = str(opt.get("id") or "")
+            if oid not in out:
+                continue
+            out[oid] = str(opt.get("currentValue") or "")
+            out[oid + "s"] = [
+                str(v.get("value")) for v in opt.get("options") or [] if v.get("value")
+            ]
+        return out
+    finally:
+        conn.close()
+
+
+_ACP_INFO_TTL = 24 * 3600
+
+
+def acp_agent_info(
+    config: RelayConfig, provider: str = "", refresh: bool = False
+) -> dict[str, Any]:
+    """Cached agent probe (<state>/acp_models/<name>.json, 24h TTL)."""
+    name = provider.split(".", 1)[1] if provider.startswith("acp.") else ""
+    name = name or acp_provider_name().split(".", 1)[1]
+    base = Path(config.state_dir or ".")
+    path = base / "acp_models" / f"{name}.json"
+    cached = read_json(path) or {}
+    if cached.get("models") and not refresh and (
+        time.time() - float(cached.get("ts") or 0) < _ACP_INFO_TTL
+    ):
+        return cached
+    cmd = acp_agent_cmd(provider)
+    if not cmd:
+        return {"error": "AGENTS_ACP_CMD unset", "model": "", "models": []}
+    import shlex
+
+    try:
+        data = probe_acp_agent(shlex.split(cmd, posix=(os.name != "nt")))
+        data["ts"] = time.time()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(path, data)
+        return data
+    except Exception as exc:
+        if cached:
+            cached["error"] = str(exc)
+            return cached
+        return {"error": str(exc), "model": "", "models": []}
+
+
+def acp_provider_rows(config: RelayConfig, refresh: bool = False) -> list[dict[str, Any]]:
+    """``acp-agent`` manifest rows enriched with probed model/mode lists."""
+    if not acp_agent_cmd():
+        return []
+    ensure_acp_manifest()
+    try:
+        from runner.providers import list_providers
+    except ImportError:
+        return []
+    rows: list[dict[str, Any]] = []
+    for raw in list_providers():
+        if raw.get("kind") != "acp-agent":
+            continue
+        name = str(raw.get("name") or "")
+        row: dict[str, Any] = {
+            "name": name, "kind": "acp-agent",
+            "model": raw.get("model"), "when": raw.get("when"),
+        }
+        info = acp_agent_info(config, name, refresh=refresh)
+        for key in ("model", "models", "mode", "modes", "error"):
+            if info.get(key):
+                row[key] = info[key]
+        rows.append(row)
+    return rows
+
+
+def ensure_acp_manifest() -> None:
+    """Drop ``<host>/providers/acp.<name>.json`` when AGENTS_ACP_CMD is set.
+
+    The provider-manifest overlay is the existing extension point: the row
+    shows up in /v1/providers, /v1/model, and runner.model.use validation
+    without touching any of them. ``kind=acp-agent`` (not the harness
+    ``acp`` completer stub) marks turns for the acp-run spawn path.
+    """
+    if not acp_agent_cmd():
+        return
+    try:
+        from agents_workspace import Host
+
+        providers_dir = Host.from_env().dir / "providers"
+    except Exception:
+        return
+    name = acp_provider_name()
+    path = providers_dir / f"{name}.json"
+    if path.exists():
+        return
+    payload = {
+        "name": name,
+        "kind": "acp-agent",
+        "when": "on_request",
+        "cadence": "on_request",
+        "verb": "chat.completions",
+        "rests_on": "Foreign ACP agent loop; agents-relay acp-run spawns it per turn",
+        "expected_exit": 0,
+    }
+    providers_dir.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
 def run_acp_turn(
     *,
     agent_argv: list[str],
@@ -469,6 +687,7 @@ def run_acp_turn(
     workdir: str,
     config: RelayConfig,
     deliver: str = "stream",
+    model: str = "",
 ) -> int:
     """One loop-shaped turn against a foreign ACP agent.
 
@@ -527,6 +746,16 @@ def run_acp_turn(
             stored["acpSessionId"] = acp_sid
             write_json_atomic(state_path, stored)
 
+        if model:
+            res = conn.request(
+                "session/set_config_option",
+                {"sessionId": acp_sid, "configId": "model", "value": model},
+            )
+            if "error" in res:
+                sys.stderr.write(
+                    f"acp set model {model!r} failed: {res['error']} — agent default stays\n"
+                )
+
         buffered: list[str] = []
 
         def _on_update(params: dict[str, Any]) -> None:
@@ -573,7 +802,8 @@ def acp_loop_main(args: Any, config: RelayConfig) -> int:
 
     Unknown runner.loop flags are ignored at the parser layer so this works
     as a LOOP_CMD drop-in without tracking the loop's full CLI."""
-    raw_cmd = os.environ.get("AGENTS_ACP_CMD", "").strip()
+    provider = str(getattr(args, "provider", "") or "").strip()
+    raw_cmd = acp_agent_cmd(provider)
     if not raw_cmd:
         sys.stderr.write(
             "AGENTS_ACP_CMD is unset — the ACP agent command "
@@ -591,4 +821,5 @@ def acp_loop_main(args: Any, config: RelayConfig) -> int:
         workdir=getattr(args, "workdir", "") or "",
         config=config,
         deliver="buffered" if getattr(args, "deliver", "stream") == "buffered" else "stream",
+        model=str(getattr(args, "model", "") or "").strip(),
     )

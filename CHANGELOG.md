@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `acp.<name>` providers are first-class: `serve` drops `<host>/providers/acp.<name>.json` (`kind: acp-agent`) whenever `AGENTS_ACP_CMD` is set, so `/v1/providers`, `/v1/model`, and `runner.model` pick validation treat the foreign agent like any manifest provider. The rows are enriched with the agent's own model/mode config options — probed via a throwaway `initialize`+`session/new`, cached in `<state>/acp_models/<name>.json` for 24 h, re-probed on `GET /v1/model?refresh=1`. Turns with `provider=acp.*` spawn `acp-run` instead of `LOOP_CMD` (precedence: flag > workspace pick > env), and `--model` reaches the agent as `session/set_config_option` `configId=model`. `AGENTS_ACP_CMD_<NAME>` overrides `AGENTS_ACP_CMD` per provider; `AGENTS_ACP_NAME` pins the provider name (otherwise derived from the command basename).
+- `acp-serve` advertises an `llm_api_key` authMethod: the client's `authenticate` call stores the key as `LLM_API_KEY` in the host `secrets.json`. `session/prompt` resolves the selected provider up front and answers with a configuration hint when url/model/key are missing instead of letting the spawned loop fail invisibly.
+
+### Changed
+- `acp-run` no longer refuses agents that advertise `authMethods` when `AGENTS_ACP_API_KEY` is unset — it proceeds and lets the agent decide. Pre-authenticated agents (stored `devin auth login` creds, SSH hops) work out of the box; `authenticate` is only sent when a key is configured. A genuinely unauthenticated agent still fails loudly at `session/new`.
+
+### Added
 - Persistent handoff wake queue + boot replay (klanker#93): `wake_task` writes a crash marker to `<ws>/relay/handoffs/<task>.json` before marking the task `running` and removes it only after the result write lands; `serve_http` replays any unfinished entries across all workspaces on boot. Wake and replay re-check the target persona's `accepts_messages`/`allow_peers` so a policy tightened after the move refuses the run (task marked `failed`, entry dropped) instead of executing.
 - `GET /health` reports the stack version: flat, additive `version` (agents-relay `__version__` via importlib.metadata) plus `klanker_version` when a klanker-grafted serve reports one — readable unchanged through the `/v1/remote/<id>` mount proxy.
 - `chat_allowed` checks `<ws>/members.json` via `agents_workspace.members.member_role` before the env allowlist (workspace#15): a member chat_id passes even when `TELEGRAM_ALLOWED_CHAT_IDS` is empty; the env list / `AGENTS_RELAY_ALLOW_ANYONE` remain the fallback when no workspace member row matches.

@@ -30,11 +30,28 @@ Handoffs: `POST .../inbox/<task>/handoff` moves task ownership (peer policy enfo
   (`AGENTS_APPROVAL_CMD` pending under `AGENTS_RELAY_DIR/approvals`) bridge
   to `session/request_permission`, so the client's allow/deny UI decides
   them (`AGENTS_APPROVAL_CMD="agents-relay approve --local"`).
+  `initialize` advertises `llm_api_key` in `authMethods`; `authenticate`
+  stores the received key as `LLM_API_KEY` in the host `secrets.json`.
+  Before each turn the selected `LOOP_PROVIDER` manifest is resolved —
+  missing url/model/key is reported as an `agent_message_chunk` instead
+  of letting the spawned loop die.
 - `agents-relay acp-run` — klanker as an ACP **client**. Accepts the
   `runner.loop` argv shape so it is a `LOOP_CMD` drop-in; spawns the agent
   named by `AGENTS_ACP_CMD` (e.g. `devin acp`, `ssh box devin acp`), reuses
   persisted `acpSessionId`s via `session/load`, streams reply text to
-  stdout, ends with the loop trailer marker. Agents that advertise
-  `authMethods` need `AGENTS_ACP_API_KEY` (sent as `meta.api_key`).
+  stdout, ends with the loop trailer marker. `authenticate` is only sent
+  when `AGENTS_ACP_API_KEY` is set (`meta.api_key`) — agents with stored
+  creds (e.g. `devin auth login`) run without it and fail loudly at
+  `session/new` if genuinely unauthenticated.
 
-Env: `AGENTS_ACP_CMD` (required for acp-run), `AGENTS_ACP_API_KEY`.
+Foreign agents register as `acp.<name>` providers: `serve` drops
+`<host>/providers/acp.<name>.json` (`kind: acp-agent`) when `AGENTS_ACP_CMD`
+is set, so `/v1/providers`, `/v1/model`, and workspace picks see them like
+manifest providers. Turns with `provider=acp.*` spawn `acp-run` instead of
+`LOOP_CMD` (flag > workspace pick > env); `--model` maps to
+`session/set_config_option`. Agent model/mode lists are probed on demand and
+cached in `<state>/acp_models/<name>.json` (24 h, `?refresh=1` re-probes).
+
+Env: `AGENTS_ACP_CMD` (required for acp-run), `AGENTS_ACP_API_KEY`,
+`AGENTS_ACP_CMD_<NAME>` (per-provider command, `acp.devin` → `AGENTS_ACP_CMD_DEVIN`),
+`AGENTS_ACP_NAME` (provider name pin).

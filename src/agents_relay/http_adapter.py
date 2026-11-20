@@ -1324,6 +1324,9 @@ class TurnHandler(BaseHTTPRequestHandler):
                      "model": r.get("model"), "when": r.get("when")}
                     for r in list_providers()
                 ]
+                from .acp import acp_provider_rows
+                rows = [r for r in rows if r.get("kind") != "acp-agent"]
+                rows.extend(acp_provider_rows(self._cfg()))
             except Exception as exc:
                 self.send_error(500, f"providers unavailable: {exc}")
                 return
@@ -1344,6 +1347,10 @@ class TurnHandler(BaseHTTPRequestHandler):
                      "model": r.get("model"), "when": r.get("when")}
                     for r in list_providers()
                 ]
+                from .acp import acp_provider_rows
+                rows = [r for r in rows if r.get("kind") != "acp-agent"]
+                rows.extend(acp_provider_rows(
+                    self._cfg(), refresh=str(query_params.get("refresh") or "") == "1"))
             except ValueError as exc:
                 self.send_error(400, str(exc))
                 return
@@ -1597,5 +1604,11 @@ def serve_http(config: RelayConfig, *, on_turn: Callable[..., LoopTurnResult] | 
             log.info("replayed %d unfinished handoff wake(s)", sum(replayed.values()))
     except Exception:  # noqa: BLE001 - replay never blocks boot
         log.exception("handoff wake replay failed")
+    try:
+        from .acp import ensure_acp_manifest
+
+        ensure_acp_manifest()
+    except Exception:  # noqa: BLE001 - manifest drop never blocks boot
+        log.exception("acp provider manifest failed")
     log.info("HTTP listening on %s:%s", config.relay_host, config.relay_port)
     return server
