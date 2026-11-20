@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `GET /v1/runs/stream` — SSE attach to a running web turn (klanker#92). Look up by `?run=<id>` or `?workspace=&persona=&session=`; replays the buffered event tail (start/status/delta/trailer, capped at 2000 events) then fans out live, ending after the trailer. Active runs now keep an event buffer + meta under a per-run condition, so other devices watch the same turn instead of polling traces.
 - `GET /?token=<RELAY_WEB_TOKEN>` performs the cookie login directly: issues the HttpOnly cookie and 302-redirects to `/`, so a printed serve URL is paste-ready without touching the login form (pairs with `klanker serve` auto-token).
 - Runtime model switch: `GET /v1/model` returns the workspace pick plus provider registry; `POST /v1/model {provider, model?, workspace?}` persists the pick into the workspace (harness `runner.model`), `{clear: true}` removes it. Telegram `/model [<provider>[:<model>] | clear]` stores a per-chat override that rides into turns as `--provider`/`--model` — chat pref > explicit flag > workspace pick > default.
 - `POST /v1/send` — plain Telegram notification without running a turn (`{chat_id|user, text}`), allowlist-enforced, relay-secret gated. The `agents-relay send` CLI covers the same ground locally; the route exists for `klanker send` and remote callers.

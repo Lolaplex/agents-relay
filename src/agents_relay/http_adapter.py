@@ -24,6 +24,7 @@ from .web import (
     handle_chat_stream,
     handle_login,
     handle_logout,
+    handle_runs_attach,
     handle_status,
     handle_token_query,
     serve_static,
@@ -1258,6 +1259,12 @@ class TurnHandler(BaseHTTPRequestHandler):
                 self.send_error(401, "unauthorized")
                 return
             self._handle_traces(query_params)
+            return
+        if path == "/v1/runs/stream":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            handle_runs_attach(self, query_params)
             return
         if path == "/v1/approvals":
             if not _check_secret(self, self.relay_secret, query_params):

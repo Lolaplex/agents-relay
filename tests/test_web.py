@@ -284,6 +284,97 @@ class TestChatStream(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertIn("stopped", result.get("body", ""))
 
+    def test_attach_replays_buffer_then_live(self):
+        gate = threading.Event()
+
+        def fake_stream(params, config, *, cancel=None, on_pid=None):
+            yield StreamEvent(type="delta", text="part1 ")
+            gate.wait(timeout=5)
+            yield StreamEvent(type="delta", text="part2")
+            yield StreamEvent(type="trailer", session="ses_att", user_id="u", alias="", returncode=0)
+
+        result: dict = {}
+
+        def run_stream():
+            with patch("agents_relay.web.iter_loop_stream_live", fake_stream):
+                resp = self.srv.request(
+                    "POST",
+                    "/v1/chat/stream",
+                    {"text": "hi", "run": "r-att", "session": "ses_att"},
+                    headers={"X-Relay-Secret": "expected"},
+                )
+                result["body"] = resp.read().decode()
+
+        worker = threading.Thread(target=run_stream, daemon=True)
+        worker.start()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and "r-att" not in active_runs():
+            time.sleep(0.02)
+        self.assertIn("r-att", active_runs())
+        time.sleep(0.15)  # let the first delta land in the buffer
+
+        att = self.srv.request(
+            "GET",
+            "/v1/runs/stream?run=r-att",
+            headers={"X-Relay-Secret": "expected"},
+        )
+        self.assertEqual(att.status, 200)
+        gate.set()
+        body = att.read().decode()
+        worker.join(timeout=5)
+
+        frames = [json.loads(line[6:]) for line in body.splitlines() if line.startswith("data: ")]
+        self.assertEqual(frames[0]["type"], "attach")
+        text = "".join(f.get("text", "") for f in frames if f["type"] == "delta")
+        self.assertIn("part1", text)
+        self.assertIn("part2", text)
+        self.assertEqual(frames[-1]["type"], "trailer")
+        self.assertEqual(frames[-1]["session"], "ses_att")
+
+    def test_attach_404_for_unknown_run(self):
+        resp = self.srv.request(
+            "GET",
+            "/v1/runs/stream?run=nope",
+            headers={"X-Relay-Secret": "expected"},
+        )
+        self.assertEqual(resp.status, 404)
+        resp.read()
+
+    def test_attach_finds_run_by_session(self):
+        gate = threading.Event()
+
+        def fake_stream(params, config, *, cancel=None, on_pid=None):
+            gate.wait(timeout=5)
+            yield StreamEvent(type="trailer", session="ses_find", user_id="u", alias="", returncode=0)
+
+        def run_stream():
+            with patch("agents_relay.web.iter_loop_stream_live", fake_stream):
+                resp = self.srv.request(
+                    "POST",
+                    "/v1/chat/stream",
+                    {"text": "hi", "run": "r-find", "session": "ses_find"},
+                    headers={"X-Relay-Secret": "expected"},
+                )
+                resp.read()
+
+        worker = threading.Thread(target=run_stream, daemon=True)
+        worker.start()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and "r-find" not in active_runs():
+            time.sleep(0.02)
+        self.assertIn("r-find", active_runs())
+
+        att = self.srv.request(
+            "GET",
+            "/v1/runs/stream?session=ses_find",
+            headers={"X-Relay-Secret": "expected"},
+        )
+        self.assertEqual(att.status, 200)
+        gate.set()
+        body = att.read().decode()
+        worker.join(timeout=5)
+        self.assertIn('"run": "r-find"', body)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -51,8 +51,97 @@ _MIME = {
 
 _NO_CACHE = frozenset({".html", ".js", ".css", ".webmanifest"})
 
-_ACTIVE: dict[str, threading.Event] = {}
+_ACTIVE: dict[str, dict[str, Any]] = {}
 _ACTIVE_LOCK = threading.Lock()
+
+# Event buffer cap per run: deltas are small but long turns are not bounded;
+# an attach that starts mid-run replays only the tail. Trailer/start/meta are
+# always kept (replayed first, marked replayed).
+_RUN_EVENT_CAP = 2000
+
+
+def _new_run_entry() -> dict[str, Any]:
+    return {
+        "cancel": threading.Event(),
+        "cond": threading.Condition(),
+        "meta": {},
+        "events": [],
+        "done": False,
+    }
+
+
+def _publish(entry: dict[str, Any], payload: dict[str, Any]) -> None:
+    cond = entry["cond"]
+    with cond:
+        events = entry["events"]
+        events.append(payload)
+        if len(events) > _RUN_EVENT_CAP:
+            keep = [e for e in events[:8] if e.get("type") in ("start", "meta")]
+            events[:] = keep + events[-(_RUN_EVENT_CAP - len(keep)) :]
+        cond.notify_all()
+
+
+def _find_run(run: str = "", session: str = "", workspace: str = "", persona: str = "") -> tuple[str, dict[str, Any] | None]:
+    with _ACTIVE_LOCK:
+        if run:
+            return run, _ACTIVE.get(run)
+        for rid, entry in _ACTIVE.items():
+            meta = entry.get("meta") or {}
+            if session and meta.get("session") != session:
+                continue
+            if workspace and meta.get("workspace") != workspace:
+                continue
+            if persona and meta.get("persona") != persona:
+                continue
+            return rid, entry
+    return "", None
+
+
+def handle_runs_attach(handler: BaseHTTPRequestHandler, query: dict[str, Any]) -> None:
+    """SSE attach to a running turn: replay buffered events, then live fan-out."""
+    run_id, entry = _find_run(
+        run=str(query.get("run") or "").strip(),
+        session=str(query.get("session") or "").strip(),
+        workspace=str(query.get("workspace") or "").strip(),
+        persona=str(query.get("persona") or "").strip(),
+    )
+    if entry is None:
+        handler._write_json({"ok": False, "error": "no such running turn"}, 404)  # type: ignore[attr-defined]
+        return
+
+    handler.send_response(200)
+    handler.send_header("Content-Type", "text/event-stream")
+    handler.send_header("Cache-Control", "no-cache, no-transform")
+    handler.send_header("X-Accel-Buffering", "no")
+    handler.end_headers()
+
+    index = 0
+    cond = entry["cond"]
+    try:
+        handler.wfile.write(_sse({"type": "attach", "run": run_id, "meta": entry.get("meta") or {}}))
+        handler.wfile.flush()
+        while True:
+            ping = False
+            with cond:
+                pending = entry["events"][index:]
+                index = len(entry["events"])
+                if not pending and not entry["done"]:
+                    cond.wait(timeout=15.0)
+                    pending = entry["events"][index:]
+                    index = len(entry["events"])
+                    ping = not pending and not entry["done"]
+                finished = entry["done"] and index >= len(entry["events"])
+            if ping:
+                handler.wfile.write(b": ping\n\n")
+                handler.wfile.flush()
+                continue
+            for payload in pending:
+                handler.wfile.write(_sse(payload))
+                handler.wfile.flush()
+            if finished:
+                break
+    except (BrokenPipeError, ConnectionResetError):
+        log.info("attached client disconnected (run %s)", run_id)
 
 
 def web_enabled(config: RelayConfig) -> bool:
@@ -283,9 +372,10 @@ def handle_chat_stream(handler: BaseHTTPRequestHandler, body: dict) -> None:
         return
 
     run = str(body.get("run") or "").strip() or uuid.uuid4().hex
-    cancel = threading.Event()
+    entry = _new_run_entry()
+    cancel = entry["cancel"]
     with _ACTIVE_LOCK:
-        _ACTIVE[run] = cancel
+        _ACTIVE[run] = entry
 
     ws_ref = str(body.get("workspace") or "").strip()
     persona_ref = str(body.get("persona") or "").strip()
@@ -329,6 +419,12 @@ def handle_chat_stream(handler: BaseHTTPRequestHandler, body: dict) -> None:
             )
             return
 
+    entry["meta"] = {
+        "session": str(body.get("session") or "").strip(),
+        "workspace": ws_ref,
+        "persona": persona_ref,
+        "user": config.web_user,
+    }
     params = TurnParams(
         channel="web",
         user=config.web_user,
@@ -352,13 +448,13 @@ def handle_chat_stream(handler: BaseHTTPRequestHandler, body: dict) -> None:
     handler.end_headers()
 
     try:
+        _publish(entry, {"type": "start", "run": run})
         handler.wfile.write(_sse({"type": "start", "run": run}))
         handler.wfile.flush()
         if attachment_notes:
-            handler.wfile.write(_sse({
-                "type": "delta",
-                "text": "\n\n".join(attachment_notes) + "\n\n",
-            }))
+            note_payload = {"type": "delta", "text": "\n\n".join(attachment_notes) + "\n\n"}
+            _publish(entry, note_payload)
+            handler.wfile.write(_sse(note_payload))
             handler.wfile.flush()
         for event in iter_loop_stream_live(params, config, cancel=cancel):
             if event.type == "keepalive":
@@ -373,6 +469,8 @@ def handle_chat_stream(handler: BaseHTTPRequestHandler, body: dict) -> None:
             elif event.type == "delta":
                 payload = {"type": "delta", "text": event.text}
             elif event.type == "trailer":
+                if event.session:
+                    entry["meta"]["session"] = event.session
                 payload = {
                     "type": "trailer",
                     "session": event.session,
@@ -382,6 +480,7 @@ def handle_chat_stream(handler: BaseHTTPRequestHandler, body: dict) -> None:
                 }
             else:
                 payload = {"type": "error", "text": event.text or "turn failed"}
+            _publish(entry, payload)
             handler.wfile.write(_sse(payload))
             handler.wfile.flush()
     except (BrokenPipeError, ConnectionResetError):
@@ -395,6 +494,9 @@ def handle_chat_stream(handler: BaseHTTPRequestHandler, body: dict) -> None:
         except Exception:
             pass
     finally:
+        with entry["cond"]:
+            entry["done"] = True
+            entry["cond"].notify_all()
         with _ACTIVE_LOCK:
             _ACTIVE.pop(run, None)
 
@@ -403,10 +505,10 @@ def handle_chat_stop(handler: BaseHTTPRequestHandler, body: dict) -> None:
     run = str(body.get("run") or "").strip()
     stopped: list[str] = []
     with _ACTIVE_LOCK:
-        for key, event in list(_ACTIVE.items()):
+        for key, entry in list(_ACTIVE.items()):
             if run and key != run:
                 continue
-            event.set()
+            entry["cancel"].set()
             stopped.append(key)
     handler._write_json({"ok": True, "stopped": stopped}, 200)  # type: ignore[attr-defined]
 
