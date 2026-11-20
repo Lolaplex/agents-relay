@@ -167,6 +167,29 @@ def handle_login(handler: BaseHTTPRequestHandler, body: dict) -> None:
     handler.wfile.write(payload)
 
 
+def handle_token_query(handler: BaseHTTPRequestHandler, token: str) -> bool:
+    """``/?token=<web_token>`` — mint the cookie and redirect to ``/``.
+
+    ``klanker serve`` prints this URL when it auto-generates the token, so a
+    pasted link has to be the whole login flow: one GET, one Set-Cookie, one
+    redirect that strips the token from the address bar.
+    """
+    config = handler._cfg()  # type: ignore[attr-defined]
+    if not web_enabled(config) or not token:
+        return False
+    if not hmac.compare_digest(token, config.web_token):
+        return False
+    value = issue_cookie(config)
+    handler.send_response(302)
+    handler.send_header("Location", "/")
+    handler.send_header(
+        "Set-Cookie",
+        _cookie_header(config, value, secure=_secure_for(handler, config)),
+    )
+    handler.end_headers()
+    return True
+
+
 def handle_logout(handler: BaseHTTPRequestHandler) -> None:
     payload = json.dumps({"ok": True}).encode("utf-8")
     handler.send_response(200)

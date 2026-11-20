@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `GET /?token=<RELAY_WEB_TOKEN>` performs the cookie login directly: issues the HttpOnly cookie and 302-redirects to `/`, so a printed serve URL is paste-ready without touching the login form (pairs with `klanker serve` auto-token).
 - Runtime model switch: `GET /v1/model` returns the workspace pick plus provider registry; `POST /v1/model {provider, model?, workspace?}` persists the pick into the workspace (harness `runner.model`), `{clear: true}` removes it. Telegram `/model [<provider>[:<model>] | clear]` stores a per-chat override that rides into turns as `--provider`/`--model` — chat pref > explicit flag > workspace pick > default.
 - `POST /v1/send` — plain Telegram notification without running a turn (`{chat_id|user, text}`), allowlist-enforced, relay-secret gated. The `agents-relay send` CLI covers the same ground locally; the route exists for `klanker send` and remote callers.
 - Cron/routine delivery matrix: `/v1/turn` and `/v1/alert` accept `deliver` (or `deliver_to`) with comma-separated `channel:user` targets — `telegram:<chat>`, `telegram:*`/`all`, `none` — so routine output reaches an arbitrary allowlisted chat instead of always the first entry. The response reports `delivered` chat ids and `skipped` targets.
@@ -100,6 +101,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - `_check_secret` accepts the `relay_web` cookie. With `RELAY_WEB_TOKEN` set and `RELAY_SECRET` empty, the cookie is the only gate on every endpoint instead of "no auth".
 - `GET /` serves `index.html` from `RELAY_STATIC_DIR` when it exists and keeps `{"ok": true}` otherwise. `_parse_query` keeps `/` instead of collapsing it to an empty path.
+
+### Added
+- Active handoff wake (#18): `POST /v1/workspaces/<ws>/personas/<p>/inbox/<task>/handoff?wake=1` moves the task (peer policy `accepts_messages`/`allow_peers` and the hop window enforced by `agents_workspace.inbox`), then runs it as a detached background turn under `routine:handoff:<task_id>` so interactive chat stays clean. The child env carries `AGENTS_PERSONA`, `AGENTS_PERSONA_HOP`, and `AGENTS_THREAD_ID` (new `extra_env` on `loop_client.run_loop_turn`). The task transitions `open -> running -> done|failed` with `result`/`reply_summary`; tasks with `mode=ask` or a `reply_to` field are handed back to the origin persona as the result notification. Answers 202 `{ok, task, wake: true}`.
+- Team inbox feed: `GET /v1/workspaces/<ws>/inbox` returns per-persona counts (`open`/`running`/`done`/`failed`, `unread`, `total`) plus the newest 20 `handoff`/`reply` events across personas for the Web UI badge and activity feed.
 
 ## [0.1.1] - 2026-11-08
 

@@ -115,6 +115,21 @@ class TestAuthEndpoints(unittest.TestCase):
         resp = self.srv.request("POST", "/v1/auth/logout")
         self.assertIn("Max-Age=0", resp.getheader("Set-Cookie") or "")
 
+    def test_token_query_issues_cookie_and_redirects(self):
+        resp = self.srv.request("GET", "/?token=tok")
+        self.assertEqual(resp.status, 302)
+        self.assertEqual(resp.getheader("Location"), "/")
+        raw = resp.getheader("Set-Cookie") or ""
+        self.assertIn(f"{COOKIE_NAME}=", raw)
+        value = raw.split(f"{COOKIE_NAME}=", 1)[1].split(";", 1)[0]
+        status = self.srv.request("GET", "/v1/auth/status", headers={"Cookie": f"{COOKIE_NAME}={value}"})
+        self.assertTrue(json.loads(status.read().decode())["authenticated"])
+
+    def test_token_query_wrong_token_falls_through(self):
+        resp = self.srv.request("GET", "/?token=wrong")
+        self.assertNotEqual(resp.status, 302)
+        resp.read()
+
 
 class TestStatic(unittest.TestCase):
     def setUp(self):

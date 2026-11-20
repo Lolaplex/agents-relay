@@ -25,6 +25,7 @@ from .web import (
     handle_login,
     handle_logout,
     handle_status,
+    handle_token_query,
     serve_static,
     verify_cookie,
     web_enabled,
@@ -188,7 +189,7 @@ def _sse_event(payload: dict) -> bytes:
 
 # Kwargs accepted by loop_client.run_loop_turn beyond the core turn fields.
 # turn_hook callables (e.g. telegram inbound) may not accept them.
-_OPTIONAL_TURN_KWARGS = ("attachments", "provider", "model", "persona", "project", "workdir")
+_OPTIONAL_TURN_KWARGS = ("attachments", "provider", "model", "persona", "project", "workdir", "extra_env")
 
 
 class TurnHandler(BaseHTTPRequestHandler):
@@ -863,6 +864,16 @@ class TurnHandler(BaseHTTPRequestHandler):
                 msg = str(exc)
                 self.send_error(404 if "unknown task" in msg else 400, msg)
                 return
+            wake = (
+                str(query_params.get("wake") or body.get("wake") or "")
+                .strip().lower() in ("1", "true", "yes")
+            ) or bool(task.get("wake"))
+            if wake:
+                from .wake import wake_task
+
+                wake_task(ws, task, run_turn=lambda **kw: self._run_turn(kw))
+                self._write_json({"ok": True, "task": task, "wake": True}, 202)
+                return
             self._write_json({"ok": True, "task": task}, 200)
             return
         self.send_error(404)
@@ -1325,6 +1336,28 @@ class TurnHandler(BaseHTTPRequestHandler):
             handle_proxy(self, rid, "/" + parts[4] if len(parts) > 4 else "/")
             return
         parts = path.split("/")
+        # GET /v1/workspaces/<ws>/inbox — team feed: counts + recent handoffs
+        if (len(parts) == 5 and parts[1] == "v1"
+                and parts[2] == "workspaces" and parts[4] == "inbox"):
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            ws_ref = parts[3]
+            if not valid_id(ws_ref):
+                self.send_error(400, f"invalid workspace id: {ws_ref!r}")
+                return
+            from .workspaces import get_workspace
+
+            try:
+                ws = get_workspace(ws_ref)
+            except KeyError:
+                self.send_error(404, "unknown workspace")
+                return
+            from .wake import team_inbox
+
+            self._write_json(
+                {"ok": True, "workspace": ws.id, **team_inbox(ws)}, 200)
+            return
         # GET /v1/workspaces/<ws>/personas/<p>/inbox
         if (len(parts) == 7 and parts[1] == "v1"
                 and parts[2] == "workspaces" and parts[4] == "personas"
@@ -1344,8 +1377,13 @@ class TurnHandler(BaseHTTPRequestHandler):
             self._handle_session_get(parts, query_params)
             return
         if path in ("/health", "/"):
-            if path == "/" and web_enabled(cfg) and serve_static(self, "index.html"):
-                return
+            if path == "/" and web_enabled(cfg):
+                if str(query_params.get("token") or "").strip() and handle_token_query(
+                    self, str(query_params["token"])
+                ):
+                    return
+                if serve_static(self, "index.html"):
+                    return
             self._write_json({"ok": True}, 200)
             return
         if web_enabled(cfg) and serve_static(self, path):
