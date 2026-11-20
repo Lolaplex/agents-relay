@@ -1,4 +1,4 @@
-"""A2A routes: proxy lolaplex-board mailbox and peers."""
+"""A2A routes: proxy agents-board mailbox and peers."""
 
 from __future__ import annotations
 

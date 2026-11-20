@@ -215,7 +215,7 @@ Or via CLI: `python -m agents_relay client turn "hello" --url http://127.0.0.1:8
 | Variable | Default | Notes |
 |----------|---------|-------|
 | `WEBHOOK_SECRET` | | `X-Webhook-Secret` for `/v1/webhook/*` |
-| `BOARD_URL` | | lolaplex-board base for A2A routes |
+| `BOARD_URL` | | agents-board base for A2A routes |
 | `BOARD_PROJECT` | | Default project slug |
 | `BOARD_KEY_SLUG` | `gateway` | agents-keys slug for board auth |
 
