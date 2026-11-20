@@ -515,6 +515,45 @@ class TurnHandler(BaseHTTPRequestHandler):
             self._handle_approval_post(parts[3], query_params)
             return
 
+        if path == "/v1/send":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            body = self._read_json()
+            if body is None:
+                return
+            cfg = self._cfg()
+            try:
+                chat_id = int(str(body.get("chat_id") or body.get("user") or "").strip())
+            except ValueError:
+                self.send_error(400, "chat_id is required and must be numeric")
+                return
+            text = str(body.get("text") or body.get("message") or "").strip()
+            if not text:
+                self.send_error(400, "text is required")
+                return
+            from .telegram_adapter import send_to_user
+
+            try:
+                send_to_user(
+                    token=cfg.telegram_bot_token,
+                    chat_id=chat_id,
+                    text=text,
+                    allowed=cfg.telegram_allowed_chat_ids,
+                    allow_anyone=cfg.allow_anyone,
+                )
+            except PermissionError as exc:
+                self.send_error(403, str(exc))
+                return
+            except ValueError as exc:
+                self.send_error(400, str(exc))
+                return
+            except Exception as exc:
+                self.send_error(502, f"send failed: {exc}")
+                return
+            self._write_json({"ok": True, "chat_id": chat_id}, 200)
+            return
+
         if path == "/v1/chat/stream":
             if not _check_secret(self, self.relay_secret, query_params):
                 self.send_error(401, "unauthorized")

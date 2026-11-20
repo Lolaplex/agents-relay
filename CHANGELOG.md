@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `POST /v1/send` — plain Telegram notification without running a turn (`{chat_id|user, text}`), allowlist-enforced, relay-secret gated. The `agents-relay send` CLI covers the same ground locally; the route exists for `klanker send` and remote callers.
 - Cron/routine delivery matrix: `/v1/turn` and `/v1/alert` accept `deliver` (or `deliver_to`) with comma-separated `channel:user` targets — `telegram:<chat>`, `telegram:*`/`all`, `none` — so routine output reaches an arbitrary allowlisted chat instead of always the first entry. The response reports `delivered` chat ids and `skipped` targets.
 - Text-to-speech replies for Telegram voice notes: with `AGENTS_RELAY_TTS=1` (and `GROQ_API_KEY` set), a voice-in message gets a `sendAudio` mp3 back synthesized by Groq `playai-tts` — the text reply still lands first. `AGENTS_RELAY_TTS_VOICE` / `AGENTS_RELAY_TTS_MODEL` override the voice and model.
 - Speech-to-text for Telegram voice/audio messages: the file downloads into the relay inbox and is transcribed via Groq Whisper (`whisper-large-v3-turbo`) into the turn text. Opt-in via `GROQ_API_KEY` (resolved through workspace/host secrets first); without a key the user gets a notice instead of a silent drop.

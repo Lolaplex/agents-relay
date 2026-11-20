@@ -127,5 +127,55 @@ class NotifyMatrixTests(unittest.TestCase):
         mock_del.assert_not_called()
 
 
+class SendRouteTests(unittest.TestCase):
+    def _post(self, server, path: str, body: dict, secret: str = "expected") -> tuple[int, dict]:
+        host, port = server.server_address  # type: ignore[misc]
+        conn = HTTPConnection(host, port, timeout=5)
+        conn.request(
+            "POST",
+            path,
+            body=json.dumps(body),
+            headers={"Content-Type": "application/json", "X-Relay-Secret": secret},
+        )
+        resp = conn.getresponse()
+        raw = resp.read().decode()
+        try:
+            return resp.status, json.loads(raw)
+        except json.JSONDecodeError:
+            return resp.status, {}
+
+    def test_send_delivers_without_turn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            import threading
+
+            server = serve_http(_config(tmp), on_turn=_turn)
+            t = threading.Thread(target=server.serve_forever, daemon=True)
+            t.start()
+            try:
+                with patch("agents_relay.telegram_adapter.send_to_user") as mock_send:
+                    status, data = self._post(
+                        server, "/v1/send", {"chat_id": 9, "text": "heads up"}
+                    )
+                    self.assertEqual(status, 200)
+                    self.assertTrue(data["ok"])
+                    self.assertEqual(mock_send.call_args.kwargs["chat_id"], 9)
+                    mock_send.side_effect = PermissionError("chat_id not in TELEGRAM_ALLOWED_CHAT_IDS")
+                    status, _ = self._post(
+                        server, "/v1/send", {"chat_id": 42, "text": "nope"}
+                    )
+                    self.assertEqual(status, 403)
+                    status, _ = self._post(
+                        server, "/v1/send", {"chat_id": 9}
+                    )
+                    self.assertEqual(status, 400)
+                    status, _ = self._post(
+                        server, "/v1/send", {"chat_id": 9, "text": "x"}, secret="bad"
+                    )
+                    self.assertEqual(status, 401)
+            finally:
+                server.shutdown()
+                t.join(timeout=2)
+
+
 if __name__ == "__main__":
     unittest.main()
