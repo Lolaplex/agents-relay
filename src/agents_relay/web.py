@@ -323,7 +323,7 @@ def handle_chat_stream(handler: BaseHTTPRequestHandler, body: dict) -> None:
 
     handler.send_response(200)
     handler.send_header("Content-Type", "text/event-stream")
-    handler.send_header("Cache-Control", "no-cache")
+    handler.send_header("Cache-Control", "no-cache, no-transform")
     handler.send_header("X-Accel-Buffering", "no")
     handler.send_header("Connection", "close")
     handler.end_headers()
@@ -338,6 +338,10 @@ def handle_chat_stream(handler: BaseHTTPRequestHandler, body: dict) -> None:
             }))
             handler.wfile.flush()
         for event in iter_loop_stream_live(params, config, cancel=cancel):
+            if event.type == "keepalive":
+                handler.wfile.write(b": ping\n\n")
+                handler.wfile.flush()
+                continue
             if event.type == "status":
                 line = _status_text(event.text)
                 if not line:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import json
 import os
 import queue
@@ -15,6 +16,38 @@ from typing import Any, Callable, Iterator
 from .config import GatewayConfig
 
 LOOP_TRAILER_MARKER = "---agents-loop-trailer---"
+_STREAM_READ = 4096
+_BATCH_MAX = 256
+_BATCH_WAIT = 0.03
+_KEEPALIVE_SEC = 12.0
+
+
+def _pipe_reader(stream):
+    """Return a callable reading one OS-pipe chunk (<=_STREAM_READ bytes).
+
+    ``read1`` on the buffered reader returns whatever the kernel has ready;
+    raw FileIO falls back to ``os.read`` on the fd. Never blocks for a full
+    buffer, so tokens flush as soon as the child writes them.
+    """
+    raw = getattr(stream, "buffer", None) or stream
+    read1 = getattr(raw, "read1", None)
+    if callable(read1):
+        return lambda: read1(_STREAM_READ)
+    fileno = getattr(raw, "fileno", None)
+    if callable(fileno):
+        return lambda: os.read(raw.fileno(), _STREAM_READ)
+    read = getattr(stream, "read", None)
+    if callable(read):
+        return lambda: read(_STREAM_READ)
+    raise TypeError("stream is not readable")
+
+
+def _decode(dec, data) -> str:
+    return data if isinstance(data, str) else dec.decode(data)
+
+
+def _utf8_decoder():
+    return codecs.getincrementaldecoder("utf-8")(errors="replace")
 
 
 @dataclass
@@ -309,6 +342,59 @@ def run_loop_turn(
     )
 
 
+def _spawn_stream(argv: list[str], env: dict[str, str] | None, workspace: str, workdir: str, extra: dict[str, str]):
+    """Shared spawn for both stream iterators: binary pipes for chunk reads."""
+    argv2, env2, ws = _container_rewrite(list(argv), workspace, workdir, extra)
+    if ws is not None:
+        from agents_workspace.runtime import spawn as ws_spawn
+
+        return ws_spawn(ws, argv2, env2, pipes=True), ws
+    popen_kwargs: dict[str, Any] = {}
+    if os.name != "nt":
+        # Own process group so cancel kills the loop and its tool children.
+        popen_kwargs["start_new_session"] = True
+    return subprocess.Popen(
+        argv2,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+        env=env2,
+        **popen_kwargs,
+    ), ws
+
+
+def _finish_stream(
+    pending: str,
+    emitted: int,
+    notes: list[str],
+    meta: dict[str, Any] | None,
+    returncode: int,
+) -> Iterator[StreamEvent]:
+    """Tail delta + attachment notes + trailer — shared by both iterators."""
+    marker = LOOP_TRAILER_MARKER
+    body = pending.partition(marker)[0] if marker in pending else pending
+    tail = body[emitted:]
+    if tail:
+        yield StreamEvent(type="delta", text=tail)
+    if meta is None:
+        meta = _parse_trailer(pending.partition(marker)[2]) if marker in pending else None
+    if meta is None:
+        parsed = parse_loop_stdout(pending)
+        meta = {
+            "session": parsed["session"],
+            "user_id": parsed["user_id"],
+            "alias": parsed["alias"],
+        }
+    yield from _note_deltas(notes, body)
+    yield StreamEvent(
+        type="trailer",
+        session=str(meta.get("session") or ""),
+        user_id=str(meta.get("user_id") or ""),
+        alias=str(meta.get("alias") or ""),
+        returncode=returncode,
+    )
+
+
 def iter_loop_stream(
     params: TurnParams,
     config: GatewayConfig | None = None,
@@ -319,99 +405,40 @@ def iter_loop_stream(
     params, notes, extra = prepare_loop(params, cfg)
     stream_params = replace(params, deliver="stream")
     argv = build_loop_argv(stream_params, cfg)
-    argv, env, ws = _container_rewrite(argv, params.workspace, params.workdir, extra)
-    if ws is not None:
-        from agents_workspace.runtime import spawn as ws_spawn
-
-        proc = ws_spawn(ws, argv, env, pipes=True)
-    else:
-        proc = subprocess.Popen(
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            encoding="utf-8", errors="replace",
-            bufsize=1,
-            env=env,
-        )
+    proc, _ws = _spawn_stream(argv, env=None, workspace=params.workspace, workdir=params.workdir, extra=extra)
     assert proc.stdout is not None
+    read = _pipe_reader(proc.stdout)
+    dec = _utf8_decoder()
     marker = LOOP_TRAILER_MARKER
     pending = ""
     emitted = 0
     try:
         while True:
-            chunk = proc.stdout.read(1)
-            if chunk:
-                pending += chunk
-                if marker in pending:
-                    body, _, trailer_part = pending.partition(marker)
-                    lines = [ln for ln in trailer_part.strip().splitlines() if ln.strip()]
-                    meta: dict[str, Any] | None = None
-                    if lines:
-                        try:
-                            meta = json.loads(lines[0])
-                        except json.JSONDecodeError:
-                            meta = None
-                    if meta is None and proc.poll() is None:
-                        continue
-                    new_text = body[emitted:]
-                    if new_text:
-                        yield StreamEvent(type="delta", text=new_text)
-                    emitted = len(body)
-                    meta = meta or {}
-                    rc = int(proc.wait(timeout=timeout_sec))
-                    yield from _note_deltas(notes, body)
-                    yield StreamEvent(
-                        type="trailer",
-                        session=str(meta.get("session") or ""),
-                        user_id=str(meta.get("user_id") or ""),
-                        alias=str(meta.get("alias") or ""),
-                        returncode=rc,
-                    )
-                    return
-                safe = len(pending) - len(marker)
-                if safe > emitted:
-                    piece = pending[emitted:safe]
-                    emitted = safe
-                    yield StreamEvent(type="delta", text=piece)
-            elif proc.poll() is not None:
+            block = read()
+            if block:
+                pending += _decode(dec, block)
+            else:
+                pending += dec.decode(b"", final=True)
                 break
-        if marker in pending:
-            body, _, trailer_part = pending.partition(marker)
-            lines = [ln for ln in trailer_part.strip().splitlines() if ln.strip()]
-            meta: dict[str, Any] | None = None
-            if lines:
-                try:
-                    meta = json.loads(lines[0])
-                except json.JSONDecodeError:
-                    meta = None
-            new_text = body[emitted:]
-            if new_text:
-                yield StreamEvent(type="delta", text=new_text)
-            meta = meta or {}
-            rc = int(proc.wait(timeout=timeout_sec))
-            yield from _note_deltas(notes, body)
-            yield StreamEvent(
-                type="trailer",
-                session=str(meta.get("session") or ""),
-                user_id=str(meta.get("user_id") or ""),
-                alias=str(meta.get("alias") or ""),
-                returncode=rc,
-            )
-            return
+            if marker in pending:
+                body, _, trailer_part = pending.partition(marker)
+                meta = _parse_trailer(trailer_part) or None
+                if meta is None and proc.poll() is None:
+                    continue
+                tail = body[emitted:]
+                if tail:
+                    yield StreamEvent(type="delta", text=tail)
+                emitted = len(body)
+                rc = int(proc.wait(timeout=timeout_sec))
+                yield from _finish_stream(pending, emitted, notes, meta, rc)
+                return
+            safe = len(pending) - len(marker)
+            if safe > emitted:
+                piece = pending[emitted:safe]
+                emitted = safe
+                yield StreamEvent(type="delta", text=piece)
         rc = int(proc.wait(timeout=timeout_sec))
-        if pending and marker not in pending:
-            tail = pending[emitted:]
-            if tail:
-                yield StreamEvent(type="delta", text=tail)
-            parsed = parse_loop_stdout(pending)
-            yield from _note_deltas(notes, pending)
-            yield StreamEvent(
-                type="trailer",
-                session=parsed["session"],
-                user_id=parsed["user_id"],
-                alias=parsed["alias"],
-                returncode=rc,
-            )
+        yield from _finish_stream(pending, emitted, notes, None, rc)
     finally:
         if proc.poll() is None:
             proc.kill()
@@ -465,25 +492,7 @@ def iter_loop_stream_live(
     cfg = config or GatewayConfig.from_env()
     params, notes, extra = prepare_loop(params, cfg)
     argv = build_loop_argv(replace(params, deliver="stream"), cfg)
-    argv, child_env, ws = _container_rewrite(argv, params.workspace, params.workdir, extra)
-    if ws is not None:
-        from agents_workspace.runtime import spawn as ws_spawn
-
-        proc = ws_spawn(ws, argv, child_env, pipes=True)
-    else:
-        popen_kwargs: dict[str, Any] = {}
-        if os.name != "nt":
-            # Own process group so cancel kills the loop and its tool children.
-            popen_kwargs["start_new_session"] = True
-        proc = subprocess.Popen(
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            encoding="utf-8", errors="replace",
-            bufsize=1,
-            env=child_env,
-            **popen_kwargs,
-        )
+    proc, _ws = _spawn_stream(argv, env=None, workspace=params.workspace, workdir=params.workdir, extra=extra)
     if on_pid is not None and proc.pid:
         try:
             on_pid(int(proc.pid))
@@ -492,26 +501,43 @@ def iter_loop_stream_live(
 
     events: "queue.Queue[tuple[str, str]]" = queue.Queue()
 
-    def _pump(stream, tag: str, *, by_line: bool) -> None:
+    def _pump(stream, tag: str) -> None:
+        """OS-chunk pipe reads + incremental UTF-8 decode.
+
+        stdout events are chunk deltas (the consumer batches them); stderr
+        events are complete lines, so a partial last line stays buffered.
+        """
         try:
             if stream is None:
                 return
-            if by_line:
-                for line in stream:
-                    events.put((tag, line))
-            else:
-                while True:
-                    piece = stream.read(1)
-                    if not piece:
-                        break
-                    events.put((tag, piece))
+            read = _pipe_reader(stream)
+            dec = _utf8_decoder()
+            buf = ""
+            while True:
+                try:
+                    block = read()
+                except OSError:
+                    break
+                if not block:
+                    break
+                text = _decode(dec, block)
+                if tag == "err":
+                    buf += text
+                    while "\n" in buf:
+                        line, buf = buf.split("\n", 1)
+                        events.put((tag, line + "\n"))
+                else:
+                    events.put((tag, text))
+            buf += dec.decode(b"", final=True)
+            if buf:
+                events.put((tag, buf))
         except Exception:
             pass
         finally:
             events.put((tag + "-eof", ""))
 
-    threading.Thread(target=_pump, args=(proc.stdout, "out"), kwargs={"by_line": False}, daemon=True).start()
-    threading.Thread(target=_pump, args=(proc.stderr, "err"), kwargs={"by_line": True}, daemon=True).start()
+    threading.Thread(target=_pump, args=(proc.stdout, "out"), daemon=True).start()
+    threading.Thread(target=_pump, args=(proc.stderr, "err"), daemon=True).start()
 
     marker = LOOP_TRAILER_MARKER
     pending = ""
@@ -519,6 +545,8 @@ def iter_loop_stream_live(
     out_eof = False
     err_eof = False
     deadline = time.monotonic() + max(1, int(timeout_sec))
+    outbuf = ""
+    last_emit = time.monotonic()
 
     def _kill() -> None:
         from .jobs import kill_process_tree
@@ -538,15 +566,28 @@ def iter_loop_stream_live(
                 yield StreamEvent(type="error", text=apply_notes("Turn timed out.", notes))
                 return
             try:
-                tag, data = events.get(timeout=0.25)
+                tag, data = events.get(timeout=_BATCH_WAIT)
             except queue.Empty:
+                # >=30ms since the last event: flush the delta batch, keep the
+                # connection alive during silent tool phases, or end on EOF.
+                if outbuf:
+                    piece, outbuf = outbuf, ""
+                    last_emit = time.monotonic()
+                    yield StreamEvent(type="delta", text=piece)
+                elif time.monotonic() - last_emit > _KEEPALIVE_SEC and not (out_eof and err_eof):
+                    last_emit = time.monotonic()
+                    yield StreamEvent(type="keepalive")
                 if out_eof and err_eof:
                     break
                 continue
 
             if tag == "err":
+                if outbuf:
+                    piece, outbuf = outbuf, ""
+                    yield StreamEvent(type="delta", text=piece)
                 line = data.strip()
                 if line:
+                    last_emit = time.monotonic()
                     yield StreamEvent(type="status", text=line)
                 continue
             if tag == "err-eof":
@@ -554,6 +595,9 @@ def iter_loop_stream_live(
                 continue
             if tag == "out-eof":
                 out_eof = True
+                if outbuf:
+                    piece, outbuf = outbuf, ""
+                    yield StreamEvent(type="delta", text=piece)
                 continue
 
             pending += data
@@ -561,55 +605,28 @@ def iter_loop_stream_live(
                 if not out_eof and proc.poll() is None:
                     continue
                 body, _, trailer_part = pending.partition(marker)
-                tail = body[emitted:]
+                # emitted already counts the safe region parked in outbuf —
+                # the tail is the batch plus whatever came after it.
+                tail = outbuf + body[emitted:]
+                outbuf = ""
                 if tail:
                     yield StreamEvent(type="delta", text=tail)
                 emitted = len(body)
                 meta = _parse_trailer(trailer_part)
                 rc = proc.wait(timeout=5) if proc.poll() is None else int(proc.returncode or 0)
-                yield from _note_deltas(notes, body)
-                yield StreamEvent(
-                    type="trailer",
-                    session=str(meta.get("session") or ""),
-                    user_id=str(meta.get("user_id") or ""),
-                    alias=str(meta.get("alias") or ""),
-                    returncode=rc,
-                )
+                yield from _finish_stream(pending, emitted, notes, meta, rc)
                 return
             safe = len(pending) - len(marker)
             if safe > emitted:
-                piece = pending[emitted:safe]
+                outbuf += pending[emitted:safe]
                 emitted = safe
+            if outbuf and (len(outbuf) >= _BATCH_MAX or outbuf.endswith("\n")):
+                piece, outbuf = outbuf, ""
+                last_emit = time.monotonic()
                 yield StreamEvent(type="delta", text=piece)
 
         rc = proc.wait(timeout=5) if proc.poll() is None else int(proc.returncode or 0)
-        # The marker may have arrived in the same chunk that ended the stream, so
-        # the loop above skipped it while waiting for EOF. Strip it here.
-        if marker in pending:
-            body, _, trailer_part = pending.partition(marker)
-            tail = body[emitted:]
-            if tail:
-                yield StreamEvent(type="delta", text=tail)
-            meta = _parse_trailer(trailer_part)
-        else:
-            tail = pending[emitted:]
-            if tail:
-                yield StreamEvent(type="delta", text=tail)
-            parsed = parse_loop_stdout(pending)
-            meta = {
-                "session": parsed["session"],
-                "user_id": parsed["user_id"],
-                "alias": parsed["alias"],
-            }
-        shown = body if marker in pending else pending
-        yield from _note_deltas(notes, shown)
-        yield StreamEvent(
-            type="trailer",
-            session=str(meta.get("session") or ""),
-            user_id=str(meta.get("user_id") or ""),
-            alias=str(meta.get("alias") or ""),
-            returncode=rc,
-        )
+        yield from _finish_stream(pending, emitted, notes, None, rc)
     finally:
         if proc.poll() is None:
             _kill()

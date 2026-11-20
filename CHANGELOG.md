@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `GET /v1/presence/offers` + `POST /v1/presence/publish`: signed `road-declaration/1` offers in `AGENTS_PRESENCE_DIR` (default `~/.agents/presence`). Signing/verification shells out to `agents_keys` — the relay never touches key material. Forged/expired/broken offers list as invalid rows with their refusal reason; publish self-verifies before writing.
 
 ### Changed
+- Streamed turns read child pipes in OS chunks (`read1`/`os.read` up to 4096 bytes) instead of `stream.read(1)`, decode UTF-8 incrementally so split multibyte characters survive, and batch stdout deltas on a ~30 ms window (flushed early on newline, 4 KB batch cap, status, trailer, or EOF). `iter_loop_stream` and `iter_loop_stream_live` share the same pump/marker framing, and the web SSE emits `: ping` keepalives during quiet stretches with `Cache-Control: no-cache, no-transform` so proxies do not buffer the stream.
 - The web stream turn cap (`iter_loop_stream_live`, spawn-to-trailer wall clock) honors `AGENTS_RELAY_TURN_TIMEOUT` seconds; default stays 900.
 - Tests isolate with `AGENTS_HOST_DIR`; the suite dropped the `AGENTS_HOME` alias entirely.
 - `RELAY_SECRET`, `TELEGRAM_BOT_TOKEN`, `WEBHOOK_SECRET`, and `RELAY_WEB_TOKEN` resolve via `agents_workspace.resolve_secret()`: `<ws>/secrets.json` > `<host>/secrets.json` > env. The `GATEWAY_SECRET` alias still works as the env fallback; a broken workspace resolver degrades to env-only.
