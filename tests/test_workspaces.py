@@ -34,8 +34,8 @@ def _cfg(**overrides) -> RelayConfig:
 
 
 class _Server:
-    def __init__(self, cfg: RelayConfig) -> None:
-        self.server = serve_http(cfg)
+    def __init__(self, cfg: RelayConfig, on_turn=None) -> None:
+        self.server = serve_http(cfg, on_turn=on_turn)
         self.host, self.port = self.server.server_address  # type: ignore[misc]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -402,6 +402,147 @@ class TestWorkspaceRoutes(unittest.TestCase):
         resp = self.srv.request(
             "POST", "/v1/workspaces/demo/personas/default/inbox", {})
         self.assertEqual(resp.status, 400)
+
+
+class TestHandoffWake(unittest.TestCase):
+    """POST .../handoff?wake=1 runs the task as a detached turn (#18)."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.env = patch.dict(
+            os.environ,
+            {"AGENTS_WORKSPACES_DIR": self.dir.name},
+            clear=False,
+        )
+        self.env.start()
+        self.calls: list[dict] = []
+
+        def hook(**kwargs):
+            from agents_relay.turn import LoopTurnResult
+
+            self.calls.append(kwargs)
+            return LoopTurnResult(
+                reply="wake reply", session=str(kwargs.get("session") or ""),
+                user_id="", alias="", returncode=0, stderr="",
+            )
+
+        self.srv = _Server(_cfg(), on_turn=hook)
+
+    def tearDown(self):
+        self.srv.close()
+        self.env.stop()
+        self.dir.cleanup()
+
+    def _mk_task(self, persona: str = "default") -> str:
+        resp = self.srv.request(
+            "POST", f"/v1/workspaces/demo/personas/{persona}/inbox",
+            {"title": "summarize logs", "note": "do it", "user": "me"})
+        self.assertEqual(resp.status, 201)
+        return json.loads(resp.read().decode())["task"]["id"]
+
+    def _wait_task(self, persona: str, tid: str, status: str = "done"):
+        import time as _time
+
+        from agents_workspace.inbox import find_task
+        from agents_workspace import Host
+
+        deadline = _time.monotonic() + 5
+        ws = Host.from_env().workspace("demo")
+        while _time.monotonic() < deadline:
+            hit = find_task(ws, tid)
+            if hit and hit[1].get("status") == status:
+                return hit[0], hit[1]
+            _time.sleep(0.05)
+        self.fail(f"task {tid} never reached {status}")
+
+    def test_wake_runs_detached_turn(self):
+        create_workspace("demo")
+        self.srv.request(
+            "POST", "/v1/workspaces/demo/personas", {"id": "cos"})
+        tid = self._mk_task()
+        resp = self.srv.request(
+            "POST",
+            f"/v1/workspaces/demo/personas/default/inbox/{tid}/handoff?wake=1",
+            {"to": "cos"})
+        self.assertEqual(resp.status, 202)
+        data = json.loads(resp.read().decode())
+        self.assertTrue(data["wake"])
+        self.assertEqual(data["task"]["owner"], "cos")
+        owner, task = self._wait_task("cos", tid)
+        self.assertEqual(owner, "cos")
+        self.assertEqual(task["result"], "wake reply")
+        self.assertEqual(task["reply_summary"], "wake reply")
+        self.assertEqual(len(self.calls), 1)
+        call = self.calls[0]
+        self.assertEqual(call["persona"], "cos")
+        self.assertEqual(call["workspace"], "demo")
+        self.assertEqual(call["session"], f"routine:handoff:{tid}")
+        self.assertEqual(call["channel"], "handoff")
+        env = call["extra_env"]
+        self.assertEqual(env["AGENTS_PERSONA"], "cos")
+        self.assertEqual(env["AGENTS_PERSONA_HOP"], "1")
+
+    def test_wake_honors_target_peer_policy(self):
+        create_workspace("demo")
+        self.srv.request(
+            "POST", "/v1/workspaces/demo/personas",
+            {"id": "cos", "accepts_messages": False})
+        tid = self._mk_task()
+        resp = self.srv.request(
+            "POST",
+            f"/v1/workspaces/demo/personas/default/inbox/{tid}/handoff?wake=1",
+            {"to": "cos"})
+        self.assertEqual(resp.status, 400)
+        resp.read()
+        self.assertEqual(self.calls, [])
+
+    def test_wake_marks_failed_on_turn_error(self):
+        create_workspace("demo")
+        self.srv.request(
+            "POST", "/v1/workspaces/demo/personas", {"id": "cos"})
+        self.srv.close()
+
+        def bad(**kwargs):
+            from agents_relay.turn import LoopTurnResult
+
+            return LoopTurnResult(
+                reply="", session="", user_id="", alias="",
+                returncode=1, stderr="boom",
+            )
+
+        self.srv = _Server(_cfg(), on_turn=bad)
+        tid = self._mk_task()
+        resp = self.srv.request(
+            "POST",
+            f"/v1/workspaces/demo/personas/default/inbox/{tid}/handoff?wake=1",
+            {"to": "cos"})
+        self.assertEqual(resp.status, 202)
+        resp.read()
+        owner, task = self._wait_task("cos", tid, status="failed")
+        self.assertEqual(owner, "cos")
+        self.assertIn("exit 1", task["result"])
+
+    def test_team_inbox_feed(self):
+        create_workspace("demo")
+        self.srv.request(
+            "POST", "/v1/workspaces/demo/personas", {"id": "cos"})
+        tid = self._mk_task()
+        resp = self.srv.request(
+            "POST",
+            f"/v1/workspaces/demo/personas/default/inbox/{tid}/handoff",
+            {"to": "cos"})
+        self.assertEqual(resp.status, 200)
+        resp.read()
+        resp = self.srv.request("GET", "/v1/workspaces/demo/inbox")
+        self.assertEqual(resp.status, 200)
+        data = json.loads(resp.read().decode())
+        self.assertEqual(data["workspace"], "demo")
+        self.assertEqual(data["personas"]["cos"]["open"], 1)
+        self.assertEqual(data["personas"]["cos"]["unread"], 1)
+        self.assertEqual(data["personas"]["default"]["total"], 0)
+        hand = [r for r in data["recent"] if r["task"] == tid]
+        self.assertEqual(len(hand), 1)
+        self.assertEqual((hand[0]["from"], hand[0]["to"]), ("default", "cos"))
 
 
 if __name__ == "__main__":
