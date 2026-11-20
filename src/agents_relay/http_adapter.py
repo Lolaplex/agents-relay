@@ -554,6 +554,39 @@ class TurnHandler(BaseHTTPRequestHandler):
             self._write_json({"ok": True, "chat_id": chat_id}, 200)
             return
 
+        if path == "/v1/model":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            body = self._read_json()
+            if body is None:
+                return
+            try:
+                ws_ref = str(body.get("workspace") or "").strip()
+                ws = resolve_workspace_id(ws_ref) if ws_ref else None
+            except ValueError as exc:
+                self.send_error(400, str(exc))
+                return
+            from runner.model import ModelError, clear, use
+
+            try:
+                if body.get("clear"):
+                    out = clear(workspace=ws)
+                else:
+                    provider = str(body.get("provider") or "").strip()
+                    if not provider:
+                        self.send_error(400, "provider is required")
+                        return
+                    out = use(provider, str(body.get("model") or "").strip(), workspace=ws)
+            except ModelError as exc:
+                self.send_error(400, str(exc))
+                return
+            except Exception as exc:
+                self.send_error(500, f"model switch failed: {exc}")
+                return
+            self._write_json({"ok": True, **out}, 200)
+            return
+
         if path == "/v1/chat/stream":
             if not _check_secret(self, self.relay_secret, query_params):
                 self.send_error(401, "unauthorized")
@@ -1236,6 +1269,30 @@ class TurnHandler(BaseHTTPRequestHandler):
                 self.send_error(500, f"providers unavailable: {exc}")
                 return
             self._write_json({"ok": True, "providers": rows}, 200)
+            return
+        if path == "/v1/model":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            try:
+                ws_ref = str(query_params.get("workspace") or "").strip()
+                ws = resolve_workspace_id(ws_ref) if ws_ref else None
+                from runner.model import selected
+                from runner.providers import list_providers
+                pick = selected(ws)
+                rows = [
+                    {"name": r.get("name"), "kind": r.get("kind"),
+                     "model": r.get("model"), "when": r.get("when")}
+                    for r in list_providers()
+                ]
+            except ValueError as exc:
+                self.send_error(400, str(exc))
+                return
+            except Exception as exc:
+                self.send_error(500, f"model unavailable: {exc}")
+                return
+            self._write_json({"ok": True, "provider": pick.get("provider") or "",
+                              "model": pick.get("model") or "", "providers": rows}, 200)
             return
         if path == "/v1/remotes":
             if not _check_secret(self, self.relay_secret, query_params):

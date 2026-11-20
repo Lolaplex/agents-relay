@@ -43,7 +43,7 @@ from .telegram_format import (
 log = logging.getLogger("agents_relay.telegram")
 
 API_BASE = "https://api.telegram.org"
-_CONTROL_COMMANDS = {"jobs", "stop", "persona", "workspace"}
+_CONTROL_COMMANDS = {"jobs", "stop", "persona", "workspace", "model"}
 
 
 def _prefs_path(config: RelayConfig) -> Path:
@@ -93,6 +93,13 @@ def _chat_persona(chat_id: int, config: RelayConfig) -> str:
 def _chat_ws(chat_id: int, config: RelayConfig) -> str:
     """Per-chat workspace id. Empty = serve-selected workspace."""
     return str(_chat_prefs(chat_id, config).get("ws") or "")
+
+
+def _chat_model(chat_id: int, config: RelayConfig) -> tuple[str, str]:
+    """Per-chat model pref stored as "provider" or "provider:model". Empty = inherit."""
+    raw = str(_chat_prefs(chat_id, config).get("model") or "")
+    provider, _, model = raw.partition(":")
+    return provider.strip(), model.strip()
 
 
 def _resolve_ws(chat_id: int, config: RelayConfig):
@@ -531,6 +538,11 @@ def handle_inbound_text(
         }
         if interrupt_file:
             runner_kwargs["interrupt_file"] = interrupt_file
+        prov_pref, model_pref = _chat_model(chat_id, config)
+        if prov_pref:
+            runner_kwargs["provider"] = prov_pref
+        if model_pref:
+            runner_kwargs["model"] = model_pref
         if persona:
             runner_kwargs["persona"] = persona
         if ws_pref:
@@ -539,7 +551,7 @@ def handle_inbound_text(
             result = runner(**runner_kwargs)
         except TypeError:
             slim = {key: value for key, value in runner_kwargs.items()
-                    if key not in ("attachments", "on_pid", "persona", "workspace", "interrupt_file")}
+                    if key not in ("attachments", "on_pid", "persona", "workspace", "interrupt_file", "provider", "model")}
             try:
                 result = runner(**slim)
             except TypeError:
@@ -735,6 +747,40 @@ def _persona_text(chat_id: int, arg: str, config: RelayConfig) -> str:
     return f"persona: {arg}"
 
 
+def _model_text(chat_id: int, arg: str, config: RelayConfig) -> str:
+    """/model [<provider>[:<model>] | clear] — show or switch this chat's model."""
+    try:
+        from runner.providers import find_provider, list_providers
+    except Exception:
+        return "provider registry unavailable."
+    names = sorted(str(p.get("name") or "") for p in list_providers() if p.get("name"))
+    prov_pref, model_pref = _chat_model(chat_id, config)
+    current = prov_pref + ((":" + model_pref) if model_pref else "") if prov_pref else ""
+    if not arg:
+        ws_pick = ""
+        try:
+            from runner.model import selected
+
+            pick = selected()
+            ws_pick = pick.get("provider", "") + ((":" + pick["model"]) if pick.get("model") else "")
+        except Exception:
+            pass
+        listing = ", ".join(names) if names else "none"
+        shown = current or ws_pick or "default"
+        return f"model: {shown}\navailable: {listing}"
+    if arg in ("clear", "default"):
+        _set_chat_pref(chat_id, "model", "", config)
+        return "model: default"
+    prov, _, mdl = arg.partition(":")
+    prov = prov.strip()
+    mdl = mdl.strip()
+    if find_provider(prov) is None:
+        listing = ", ".join(names) if names else "none"
+        return f"unknown provider: {prov}\navailable: {listing}"
+    _set_chat_pref(chat_id, "model", f"{prov}:{mdl}" if mdl else prov, config)
+    return f"model: {prov}:{mdl}" if mdl else f"model: {prov}"
+
+
 def _workspace_text(chat_id: int, arg: str, config: RelayConfig) -> str:
     """/workspace [<id>|new <id> [label]] — show, switch, or create+switch ws."""
     from .workspaces import create_workspace, get_workspace, list_workspaces
@@ -806,6 +852,10 @@ def _handle_control(
         return
     if name == "persona":
         body = _persona_text(chat_id, rest, config)
+        deliver_html(token, chat_id, format_telegram_html(body))
+        return
+    if name == "model":
+        body = _model_text(chat_id, rest, config)
         deliver_html(token, chat_id, format_telegram_html(body))
         return
     if name == "jobs":
