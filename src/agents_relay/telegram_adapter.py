@@ -233,6 +233,46 @@ def chat_allowed(chat_id: int, config: RelayConfig) -> bool:
     return False
 
 
+def resolve_delivery(spec: str, config: RelayConfig) -> tuple[list[int], list[str]]:
+    """Parse a delivery spec into Telegram chat ids.
+
+    ``"telegram:<chat>"``, comma-separated targets, ``telegram:*``/``all`` for
+    every allowlisted chat, and ``none``/``off`` to suppress delivery. A bare
+    numeric value is treated as ``telegram:<id>``. Unknown channels and chats
+    outside the allowlist come back in ``skipped``.
+    """
+    chats: list[int] = []
+    skipped: list[str] = []
+    for part in (spec or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        channel, sep, user = part.partition(":")
+        channel = channel.strip().lower()
+        user = user.strip()
+        if channel in ("none", "off") and not sep:
+            return [], skipped
+        if not sep:
+            user = "all" if channel == "telegram" else channel
+            channel = "telegram"
+        if channel != "telegram":
+            skipped.append(part)
+            continue
+        if user in ("*", "all"):
+            chats.extend(int(c) for c in config.telegram_allowed_chat_ids)
+            continue
+        try:
+            chat = int(user)
+        except ValueError:
+            skipped.append(part)
+            continue
+        if chat_allowed(chat, config):
+            chats.append(chat)
+        else:
+            skipped.append(part)
+    return list(dict.fromkeys(chats)), skipped
+
+
 def send_to_user(
     *,
     token: str,

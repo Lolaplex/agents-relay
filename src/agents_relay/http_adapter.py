@@ -668,18 +668,28 @@ class TurnHandler(BaseHTTPRequestHandler):
             return
 
         notified = False
+        delivered: list[int] = []
+        skipped: list[str] = []
         cfg = self._cfg()
         if notify and cfg.telegram_bot_token and cfg.telegram_allowed_chat_ids:
-            from .telegram_adapter import deliver_html
+            from .telegram_adapter import deliver_html, resolve_delivery
             from .telegram_format import extract_traces, format_telegram_html
-            try:
-                primary_chat = cfg.telegram_allowed_chat_ids[0]
+
+            spec = str(body.get("deliver") or body.get("deliver_to") or "").strip()
+            if spec:
+                targets, skipped = resolve_delivery(spec, cfg)
+            else:
+                targets = [int(cfg.telegram_allowed_chat_ids[0])]
+            if targets:
                 _, err_traces = extract_traces(result.stderr or "")
                 html = format_telegram_html(result.reply, err_traces)
-                deliver_html(cfg.telegram_bot_token, primary_chat, html)
-                notified = True
-            except Exception as exc:
-                log.warning("failed to broadcast notification to telegram: %s", exc)
+            for chat in targets:
+                try:
+                    deliver_html(cfg.telegram_bot_token, chat, html)
+                    delivered.append(chat)
+                except Exception as exc:
+                    log.warning("failed to broadcast notification to telegram %s: %s", chat, exc)
+            notified = bool(delivered)
 
         from .attachments import apply_notes
 
@@ -691,6 +701,9 @@ class TurnHandler(BaseHTTPRequestHandler):
             "returncode": result.returncode,
             "notified": notified,
         }
+        if delivered or skipped:
+            payload["delivered"] = delivered
+            payload["skipped"] = skipped
         self._write_json(payload, 200 if result.returncode == 0 else 502)
 
     def _ws_and_persona(self, parts: list[str]):
