@@ -403,6 +403,80 @@ class TestWorkspaceRoutes(unittest.TestCase):
             "POST", "/v1/workspaces/demo/personas/default/inbox", {})
         self.assertEqual(resp.status, 400)
 
+    def test_create_persona_enforces_field_allowlist(self):
+        from agents_relay.workspaces import create_persona, get_persona
+
+        ws = create_workspace("demo")
+        row = create_persona(
+            ws,
+            "analyst",
+            {
+                "id": "hijack",
+                "name": "Analyst",
+                "role": "research",
+                "notes": "read only",
+                "accepts_messages": True,
+                "allow_peers": ["cos"],
+                "allowed_kinds": ["admin"],
+                "caps_ref": "root",
+                "arbitrary": "drop-me",
+            },
+        )
+        self.assertEqual(row["id"], "analyst")
+        self.assertEqual(row["name"], "Analyst")
+        self.assertNotIn("allowed_kinds", row)
+        self.assertNotIn("caps_ref", row)
+        self.assertNotIn("arbitrary", row)
+
+        on_disk = json.loads(
+            (ws.personas / "analyst" / "persona.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(on_disk["id"], "analyst")
+        self.assertEqual(on_disk["role"], "research")
+        self.assertNotIn("allowed_kinds", on_disk)
+        self.assertNotIn("caps_ref", on_disk)
+        self.assertNotIn("arbitrary", on_disk)
+        self.assertEqual(get_persona(ws, "analyst")["name"], "Analyst")
+
+        resp = self.srv.request(
+            "POST",
+            "/v1/workspaces/demo/personas",
+            {"id": "ops", "name": "Ops", "allowed_kinds": ["*"]},
+        )
+        self.assertEqual(resp.status, 201)
+        body = json.loads(resp.read().decode())
+        self.assertNotIn("allowed_kinds", body["persona"])
+        ops_disk = json.loads(
+            (ws.personas / "ops" / "persona.json").read_text(encoding="utf-8")
+        )
+        self.assertNotIn("allowed_kinds", ops_disk)
+
+    def test_get_persona_rejects_invalid_id(self):
+        from agents_relay.workspaces import get_persona
+
+        ws = create_workspace("demo")
+        self.assertIsNone(get_persona(ws, "missing-persona"))
+        for bad in ("../evil", "a/b", ""):
+            with self.assertRaises(ValueError):
+                get_persona(ws, bad)
+
+    def test_list_workspaces_uses_host_without_deprecation(self):
+        import warnings
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"AGENTS_HOST_DIR": tmp}, clear=False):
+                os.environ.pop("AGENTS_WORKSPACES_DIR", None)
+                create_workspace("alpha")
+                create_workspace("beta")
+                with warnings.catch_warnings(record=True) as seen:
+                    warnings.simplefilter("always")
+                    ids = [w.id for w in list_workspaces()]
+                self.assertEqual(ids, ["alpha", "beta"])
+                self.assertEqual(
+                    [w for w in seen if issubclass(w.category, DeprecationWarning)],
+                    [],
+                )
+
 
 class TestHandoffWake(unittest.TestCase):
     """POST .../handoff?wake=1 runs the task as a detached turn (#18)."""
