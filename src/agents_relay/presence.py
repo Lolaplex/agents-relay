@@ -131,6 +131,24 @@ def list_offers() -> list[dict]:
     return [_scan_file(p) for p in sorted(d.glob("*.json"))]
 
 
+def maybe_self_publish() -> None:
+    """Announce this relay in the shared registry at boot. Opt-in via
+    ``AGENTS_PRESENCE_LABEL`` + ``AGENTS_PRESENCE_KEY`` + ``AGENTS_PRESENCE_ADDR``
+    (addr as ``host[:port]`` or a full ``scheme://…`` URL). One-sided: the
+    host declares its roads; consumers verify and probe liveness."""
+    label = os.environ.get("AGENTS_PRESENCE_LABEL", "").strip()
+    key = os.environ.get("AGENTS_PRESENCE_KEY", "").strip()
+    addr = os.environ.get("AGENTS_PRESENCE_ADDR", "").strip()
+    if not (label and key and addr):
+        return
+    kind = addr.split("://")[0] if "://" in addr else "https"
+    offer, err = publish_offer(key, label, [{"kind": kind, "addr": addr}])
+    if err:
+        log.warning("presence self-publish failed: %s", err)
+    else:
+        log.info("presence offer published: %s -> %s", label, addr)
+
+
 def publish_offer(key_slug: str, label: str, roads: list[dict]) -> tuple[dict | None, str]:
     """Mint + sign + write a declaration. The finished document is
     self-verified before it touches the registry: an unverifiable offer

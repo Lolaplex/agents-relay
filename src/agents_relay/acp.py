@@ -23,6 +23,7 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -139,6 +140,63 @@ class _AcpSession:
         self.cwd = cwd
         self.cancel = threading.Event()
         self.busy = False
+        self.provider = ""
+        self.model = ""
+
+
+_STATUS_NOISE = re.compile(
+    r"Processing request of type|server\.py:\d+|ListToolsRequest"
+    r"|^\[\d{2}/\d{2}/\d{2} [^\]]*\] INFO"
+)
+
+
+def _config_options(session: _AcpSession) -> list[dict[str, Any]]:
+    """ACP configOptions for session/new — provider + model selects."""
+    options: list[dict[str, Any]] = []
+    try:
+        from runner.providers import find_provider, list_providers
+    except ImportError:
+        return options
+    providers = [
+        str(r.get("name") or "") for r in list_providers() if r.get("name")
+    ]
+    current_provider = (
+        session.provider
+        or os.environ.get("LOOP_PROVIDER", "").strip()
+        or "openai.default"
+    )
+    if providers:
+        options.append(
+            {
+                "id": "provider",
+                "name": "Provider",
+                "type": "select",
+                "options": [{"value": p, "name": p} for p in providers],
+                "currentValue": current_provider
+                if current_provider in providers
+                else providers[0],
+            }
+        )
+    manifest = find_provider(current_provider) or {}
+    models = [str(m) for m in manifest.get("models") or [] if m]
+    current_model = (
+        session.model
+        or os.environ.get(manifest.get("model_env") or "LLM_MODEL", "")
+        or str(manifest.get("model") or "")
+    )
+    if models:
+        options.append(
+            {
+                "id": "model",
+                "name": "Model",
+                "type": "select",
+                "options": [{"value": m, "name": m} for m in models],
+                "currentValue": current_model
+                if current_model in models
+                else models[0],
+            }
+        )
+    return options
 
 
 def _bridge_pending_approvals(
@@ -196,13 +254,17 @@ def _bridge_pending_approvals(
         stop.wait(0.4)
 
 
-def _provider_problem() -> str:
+def _provider_problem(provider: str = "") -> str:
     """Empty when the selected provider can resolve url+model+key.
 
     Mirrors OpenAICompatProvider's resolution so a misconfigured turn fails
     loudly here instead of inside the spawned loop process.
     """
-    name = os.environ.get("LOOP_PROVIDER", "").strip() or "openai.default"
+    name = (
+        provider.strip()
+        or os.environ.get("LOOP_PROVIDER", "").strip()
+        or "openai.default"
+    )
     try:
         from agents_workspace import resolve_secret
         from runner.providers import find_provider
@@ -240,6 +302,8 @@ def _run_prompt(
         message=message,
         session=session.session_id,
         workdir=session.cwd,
+        provider=session.provider,
+        model=session.model,
     )
     stop_reason = "end_turn"
     for event in iter_loop_stream_live(
@@ -251,6 +315,8 @@ def _run_prompt(
         if event.type == "delta" and event.text:
             _chunk(writer, session.session_id, event.text)
         elif event.type == "status" and event.text:
+            if _STATUS_NOISE.search(event.text):
+                continue
             _chunk(writer, session.session_id, event.text + "\n", thought=True)
         elif event.type == "error" and event.text:
             _chunk(writer, session.session_id, event.text)
@@ -268,6 +334,8 @@ def _run_prompt(
 
 def serve_acp(config: RelayConfig) -> int:
     """ACP agent server over stdio. One prompt at a time per session."""
+    # Quiet FastMCP children; their INFO chatter would flood thought chunks.
+    os.environ.setdefault("FASTMCP_LOG_LEVEL", "WARNING")
     reader = _read_messages(sys.stdin)
     writer = _Writer(sys.stdout)
     sessions: dict[str, _AcpSession] = {}
@@ -376,8 +444,33 @@ def serve_acp(config: RelayConfig) -> int:
             )
             if not sid:
                 sid = f"ses_acp_{uuid.uuid4().hex[:16]}"
-            sessions[sid] = _AcpSession(sid, cwd)
-            writer.respond(req_id, {"sessionId": sid})
+            session = _AcpSession(sid, cwd)
+            sessions[sid] = session
+            writer.respond(
+                req_id,
+                {"sessionId": sid, "configOptions": _config_options(session)},
+            )
+            continue
+
+        if method == "session/set_config_option":
+            params = msg.get("params") or {}
+            sid = str(params.get("sessionId") or "")
+            session = sessions.get(sid)
+            if session is None:
+                writer.respond_error(
+                    req_id, ERR_INVALID_PARAMS, f"unknown sessionId {sid!r}"
+                )
+                continue
+            config_id = str(params.get("configId") or "")
+            value = str(params.get("value") or "")
+            if config_id == "provider":
+                session.provider = value
+                session.model = ""  # models are per-provider; reset pick
+            elif config_id == "model":
+                session.model = value
+            writer.respond(
+                req_id, {"configOptions": _config_options(session)}
+            )
             continue
 
         if method == "session/prompt":
@@ -395,7 +488,7 @@ def serve_acp(config: RelayConfig) -> int:
                 )
                 continue
             message = _prompt_text(params.get("prompt"))
-            problem = _provider_problem()
+            problem = _provider_problem(session.provider)
             if problem:
                 _chunk(
                     writer,

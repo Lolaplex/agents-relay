@@ -12,7 +12,7 @@ agents-relay inject --user <chat_id> --text "hello"
 agents-relay approve --user <chat_id> --timeout 300  # JSON request on stdin
 ```
 
-Env: `LOOP_CMD`, `LOOP_PROVIDER`, `RELAY_SECRET` (fallback `GATEWAY_SECRET`), `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_CHAT_IDS`, `AGENTS_RELAY_ALLOW_ANYONE`, `AGENTS_RELAY_APPROVER`, `AGENTS_RELAY_STATE`, `AGENTS_RELAY_ATTACH_DIR`, `AGENTS_RELAY_VISION` (`auto`/`on`/`off`), `AGENTS_RELAY_MAX_JOBS`, `AGENTS_RELAY_MAX_JOBS_PER_CHAT`, `RELAY_HOST`, `RELAY_PORT`, `TELEGRAM_POLL_TIMEOUT`, `AGENTS_RELAY_WEB_DIR`.
+Env: `LOOP_CMD`, `LOOP_PROVIDER`, `RELAY_SECRET` (fallback `GATEWAY_SECRET`), `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_CHAT_IDS`, `AGENTS_RELAY_ALLOW_ANYONE`, `AGENTS_RELAY_APPROVER`, `AGENTS_RELAY_STATE`, `AGENTS_RELAY_ATTACH_DIR`, `AGENTS_RELAY_VISION` (`auto`/`on`/`off`), `AGENTS_RELAY_MAX_JOBS`, `AGENTS_RELAY_MAX_JOBS_PER_CHAT`, `RELAY_HOST`, `RELAY_PORT`, `TELEGRAM_POLL_TIMEOUT`, `AGENTS_RELAY_WEB_DIR`, `AGENTS_RELAY_TURN_TIMEOUT` (secs, default 900), `AGENTS_PRESENCE_DIR`, `AGENTS_PRESENCE_LABEL` + `AGENTS_PRESENCE_KEY` + `AGENTS_PRESENCE_ADDR` (self-publish a signed road declaration at serve start).
 
 Telegram `serve` refuses an empty allowlist unless `AGENTS_RELAY_ALLOW_ANYONE=1`. Approval and inbox files go under `AGENTS_RELAY_STATE` (default `<ws>/relay`). Poll commands: `/jobs`, `/stop`, `/stop <id>`.
 
@@ -34,7 +34,11 @@ Handoffs: `POST .../inbox/<task>/handoff` moves task ownership (peer policy enfo
   stores the received key as `LLM_API_KEY` in the host `secrets.json`.
   Before each turn the selected `LOOP_PROVIDER` manifest is resolved —
   missing url/model/key is reported as an `agent_message_chunk` instead
-  of letting the spawned loop die.
+  of letting the spawned loop die. `session/new`/`session/load` advertise
+  `provider`/`model` `configOptions` (model list = manifest `models`
+  field); `session/set_config_option` stores the pick per session and it
+  reaches the turn as `--provider`/`--model`. MCP child log spam is kept
+  out of thought chunks (`FASTMCP_LOG_LEVEL=WARNING` + a status filter).
 - `agents-relay acp-run` — klanker as an ACP **client**. Accepts the
   `runner.loop` argv shape so it is a `LOOP_CMD` drop-in; spawns the agent
   named by `AGENTS_ACP_CMD` (e.g. `devin acp`, `ssh box devin acp`), reuses

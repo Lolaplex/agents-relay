@@ -279,6 +279,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     config = RelayConfig.from_env()
+    try:
+        from .presence import maybe_self_publish
+
+        maybe_self_publish()
+    except Exception:
+        log.exception("presence self-publish failed")
     server = serve_http(config)
     tg_thread = None
     tg_stop = None

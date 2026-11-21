@@ -191,3 +191,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.1.0]: https://github.com/Lolaplex/agents-relay/compare/v0.0.2...v0.1.0
 [0.0.2]: https://github.com/Lolaplex/agents-relay/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/Lolaplex/agents-relay/releases/tag/v0.0.1
+
+### Added
+
+- `serve` self-publishes a signed presence road declaration at boot when
+  `AGENTS_PRESENCE_LABEL`, `AGENTS_PRESENCE_KEY` (agents-keys slug), and
+  `AGENTS_PRESENCE_ADDR` (`host[:port]` or `scheme://…`) are set. Hosts
+  announce themselves one-sided; the manual publish UI was removed from
+  klanker in favour of this env.
