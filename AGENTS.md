@@ -12,9 +12,9 @@ agents-relay inject --user <chat_id> --text "hello"
 agents-relay approve --user <chat_id> --timeout 300  # JSON request on stdin
 ```
 
-Env: `LOOP_CMD`, `LOOP_PROVIDER`, `RELAY_SECRET` (fallback `GATEWAY_SECRET`), `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_CHAT_IDS`, `AGENTS_RELAY_ALLOW_ANYONE`, `AGENTS_RELAY_APPROVER`, `AGENTS_RELAY_STATE`, `AGENTS_RELAY_ATTACH_DIR`, `AGENTS_RELAY_VISION` (`auto`/`on`/`off`), `AGENTS_RELAY_MAX_JOBS`, `AGENTS_RELAY_MAX_JOBS_PER_CHAT`, `RELAY_HOST`, `RELAY_PORT`, `TELEGRAM_POLL_TIMEOUT`, `AGENTS_RELAY_WEB_DIR`, `AGENTS_RELAY_TURN_TIMEOUT` (secs, default 900). `GET /v1/discover` scans the tailnet for `klanker serve` health probes (server-side mirror of the desktop scan).
+Env: `LOOP_CMD`, `LOOP_PROVIDER`, `RELAY_SECRET` (fallback `GATEWAY_SECRET`), `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_CHAT_IDS`, `AGENTS_RELAY_ALLOW_ANYONE`, `AGENTS_RELAY_APPROVER`, `AGENTS_RELAY_DIR` (legacy `AGENTS_RELAY_STATE`), `AGENTS_RELAY_ATTACH_DIR`, `AGENTS_RELAY_VISION` (`auto`/`on`/`off`), `AGENTS_RELAY_MAX_JOBS`, `AGENTS_RELAY_MAX_JOBS_PER_CHAT`, `RELAY_HOST`, `RELAY_PORT`, `TELEGRAM_POLL_TIMEOUT`, `AGENTS_RELAY_WEB_DIR`, `AGENTS_RELAY_TURN_TIMEOUT` (secs, default 900). `GET /v1/discover` scans the tailnet for `klanker serve` health probes (server-side mirror of the desktop scan).
 
-Telegram `serve` refuses an empty allowlist unless `AGENTS_RELAY_ALLOW_ANYONE=1`. Approval and inbox files go under `AGENTS_RELAY_STATE` (default `<ws>/relay`). Poll commands: `/jobs`, `/stop`, `/stop <id>`.
+Telegram `serve` refuses an empty allowlist unless `AGENTS_RELAY_ALLOW_ANYONE=1`. Approval and inbox files go under `AGENTS_RELAY_DIR` (default `<ws>/relay`). Poll commands: `/jobs`, `/stop`, `/stop <id>`.
 
 Handoffs: `POST .../inbox/<task>/handoff` moves task ownership (peer policy enforced by `agents_workspace.inbox`); `?wake=1` also runs it detached as `routine:handoff:<task>` and writes `done`/`failed` + `reply_summary` back. `GET /v1/workspaces/<ws>/inbox` is the team feed (per-persona counts + recent handoffs).
 
