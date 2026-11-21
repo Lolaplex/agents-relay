@@ -111,22 +111,47 @@ class TestTelegramModelCommand(unittest.TestCase):
         from agents_relay.telegram_adapter import _model_text, _set_chat_pref, _chat_model
 
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = _cfg(state_dir=str(Path(tmp) / "relay"))
-            chat_id = 42
-            seen: dict[str, str] = {}
+            host_dir = Path(tmp) / "host"
+            with patch.dict(os.environ, {"AGENTS_HOST_DIR": str(host_dir)}, clear=False):
+                cfg = _cfg(state_dir=str(Path(tmp) / "relay"))
+                chat_id = 42
 
-            _set_chat_pref(chat_id, "model", "echo:fast", cfg)
-            self.assertEqual(_chat_model(chat_id, cfg), ("echo", "fast"))
+                _set_chat_pref(chat_id, "model", "echo:fast", cfg)
+                self.assertEqual(_chat_model(chat_id, cfg), ("echo", "fast"))
+                self.assertTrue((host_dir / "clients" / "telegram.json").is_file())
+                self.assertFalse((Path(tmp) / "relay" / "chat_prefs.json").exists())
 
-            text = _model_text(chat_id, "", cfg)
-            self.assertIn("model: echo:fast", text)
-            text = _model_text(chat_id, "nope.nothing", cfg)
-            self.assertIn("unknown provider", text)
-            text = _model_text(chat_id, "echo", cfg)
-            self.assertIn("model: echo", text)
-            self.assertEqual(_chat_model(chat_id, cfg), ("echo", ""))
-            _model_text(chat_id, "clear", cfg)
-            self.assertEqual(_chat_model(chat_id, cfg), ("", ""))
+                text = _model_text(chat_id, "", cfg)
+                self.assertIn("model: echo:fast", text)
+                text = _model_text(chat_id, "nope.nothing", cfg)
+                self.assertIn("unknown provider", text)
+                text = _model_text(chat_id, "echo", cfg)
+                self.assertIn("model: echo", text)
+                self.assertEqual(_chat_model(chat_id, cfg), ("echo", ""))
+                _model_text(chat_id, "clear", cfg)
+                self.assertEqual(_chat_model(chat_id, cfg), ("", ""))
+
+    def test_telegram_prefs_legacy_fallback(self):
+        import warnings
+        from agents_relay.telegram_adapter import _chat_model, _set_chat_pref
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host_dir = Path(tmp) / "host"
+            legacy_dir = Path(tmp) / "relay"
+            legacy_dir.mkdir(parents=True, exist_ok=True)
+            (legacy_dir / "chat_prefs.json").write_text(
+                json.dumps({"42": {"model": "echo:legacy"}}),
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"AGENTS_HOST_DIR": str(host_dir)}, clear=False):
+                cfg = _cfg(state_dir=str(legacy_dir))
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always", DeprecationWarning)
+                    self.assertEqual(_chat_model(42, cfg), ("echo", "legacy"))
+                self.assertTrue(any(issubclass(w.category, DeprecationWarning) for w in caught))
+                _set_chat_pref(42, "model", "echo:fresh", cfg)
+                self.assertEqual(_chat_model(42, cfg), ("echo", "fresh"))
+                self.assertTrue((host_dir / "clients" / "telegram.json").is_file())
 
 
 if __name__ == "__main__":

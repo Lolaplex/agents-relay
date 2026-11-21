@@ -403,6 +403,80 @@ class TestWorkspaceRoutes(unittest.TestCase):
             "POST", "/v1/workspaces/demo/personas/default/inbox", {})
         self.assertEqual(resp.status, 400)
 
+    def test_create_persona_enforces_field_allowlist(self):
+        from agents_relay.workspaces import create_persona, get_persona
+
+        ws = create_workspace("demo")
+        row = create_persona(
+            ws,
+            "analyst",
+            {
+                "id": "hijack",
+                "name": "Analyst",
+                "role": "research",
+                "notes": "read only",
+                "accepts_messages": True,
+                "allow_peers": ["cos"],
+                "allowed_kinds": ["admin"],
+                "caps_ref": "root",
+                "arbitrary": "drop-me",
+            },
+        )
+        self.assertEqual(row["id"], "analyst")
+        self.assertEqual(row["name"], "Analyst")
+        self.assertNotIn("allowed_kinds", row)
+        self.assertNotIn("caps_ref", row)
+        self.assertNotIn("arbitrary", row)
+
+        on_disk = json.loads(
+            (ws.personas / "analyst" / "persona.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(on_disk["id"], "analyst")
+        self.assertEqual(on_disk["role"], "research")
+        self.assertNotIn("allowed_kinds", on_disk)
+        self.assertNotIn("caps_ref", on_disk)
+        self.assertNotIn("arbitrary", on_disk)
+        self.assertEqual(get_persona(ws, "analyst")["name"], "Analyst")
+
+        resp = self.srv.request(
+            "POST",
+            "/v1/workspaces/demo/personas",
+            {"id": "ops", "name": "Ops", "allowed_kinds": ["*"]},
+        )
+        self.assertEqual(resp.status, 201)
+        body = json.loads(resp.read().decode())
+        self.assertNotIn("allowed_kinds", body["persona"])
+        ops_disk = json.loads(
+            (ws.personas / "ops" / "persona.json").read_text(encoding="utf-8")
+        )
+        self.assertNotIn("allowed_kinds", ops_disk)
+
+    def test_get_persona_rejects_invalid_id(self):
+        from agents_relay.workspaces import get_persona
+
+        ws = create_workspace("demo")
+        self.assertIsNone(get_persona(ws, "missing-persona"))
+        for bad in ("../evil", "a/b", ""):
+            with self.assertRaises(ValueError):
+                get_persona(ws, bad)
+
+    def test_list_workspaces_uses_host_without_deprecation(self):
+        import warnings
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"AGENTS_HOST_DIR": tmp}, clear=False):
+                os.environ.pop("AGENTS_WORKSPACES_DIR", None)
+                create_workspace("alpha")
+                create_workspace("beta")
+                with warnings.catch_warnings(record=True) as seen:
+                    warnings.simplefilter("always")
+                    ids = [w.id for w in list_workspaces()]
+                self.assertEqual(ids, ["alpha", "beta"])
+                self.assertEqual(
+                    [w for w in seen if issubclass(w.category, DeprecationWarning)],
+                    [],
+                )
+
 
 class TestHandoffWake(unittest.TestCase):
     """POST .../handoff?wake=1 runs the task as a detached turn (#18)."""
@@ -569,8 +643,11 @@ class TestHandoffWake(unittest.TestCase):
         self.assertEqual(resp.status, 202)
         resp.read()
         self._wait_task("cos", tid)
+        from agents_relay import wake
         from agents_workspace import Host
 
+        # status=done lands before _dequeue; join the wake thread first.
+        wake.drain(timeout=5)
         qdir = Host.from_env().workspace("demo").relay_state / "handoffs"
         self.assertEqual(list(qdir.glob("*.json")), [])
 
@@ -700,6 +777,68 @@ class StateDirTests(unittest.TestCase):
         self.assertTrue(str(out).startswith(str(host)), out)
         self.assertTrue(out.is_dir())
         self.assertTrue(any("agents-workspace migrate" in str(w.message) for w in seen))
+
+    def test_turn_env_scoped_by_role_and_provider_key(self):
+        from agents_workspace import Host
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host_dir = Path(tmp) / "host"
+            prov_dir = host_dir / "providers"
+            prov_dir.mkdir(parents=True)
+            (prov_dir / "custom.openai.json").write_text(
+                json.dumps({
+                    "name": "custom.openai",
+                    "kind": "openai_compat",
+                    "url": "https://api.example/v1",
+                    "model": "gpt-test",
+                    "key_env": "OPENAI_API_KEY",
+                    "verb": "chat.completions",
+                    "cadence": "on_request",
+                    "rests_on": "custom openai provider",
+                }),
+                encoding="utf-8",
+            )
+            env_patch = {
+                "AGENTS_HOST_DIR": str(host_dir),
+                "RELAY_SECRET": "rsec",
+                "RELAY_WEB_TOKEN": "wtok",
+                "WEBHOOK_SECRET": "wsec",
+                "TELEGRAM_BOT_TOKEN": "ttok",
+                "AGENTS_SYNC_TOKEN": "stok",
+                "AGENTS_APPROVAL_TOKEN": "atok",
+                "AGENTS_RELAY_URL": "http://127.0.0.1:8787",
+                "OPENAI_API_KEY": "oak",
+                "ANTHROPIC_API_KEY": "aak",
+                "LLM_API_KEY": "lak",
+            }
+            with patch.dict(os.environ, env_patch, clear=False):
+                Host.from_env().create("demo")
+                Host.from_env().create("cws", isolation="container")
+                turn_env = workspace_env("demo", provider="custom.openai")
+                self.assertIsNotNone(turn_env)
+                assert turn_env is not None
+                self.assertNotIn("RELAY_SECRET", turn_env)
+                self.assertNotIn("RELAY_WEB_TOKEN", turn_env)
+                self.assertNotIn("WEBHOOK_SECRET", turn_env)
+                self.assertNotIn("TELEGRAM_BOT_TOKEN", turn_env)
+                self.assertNotIn("AGENTS_SYNC_TOKEN", turn_env)
+                self.assertEqual(turn_env["AGENTS_APPROVAL_TOKEN"], "atok")
+                self.assertEqual(turn_env["AGENTS_RELAY_URL"], "http://127.0.0.1:8787")
+                self.assertEqual(turn_env["OPENAI_API_KEY"], "oak")
+                self.assertNotIn("ANTHROPIC_API_KEY", turn_env)
+                self.assertNotIn("LLM_API_KEY", turn_env)
+
+                tg_env = workspace_env("demo", provider="custom.openai", approver="telegram")
+                assert tg_env is not None
+                self.assertNotIn("TELEGRAM_BOT_TOKEN", tg_env)
+                self.assertEqual(tg_env.get("AGENTS_APPROVAL_TOKEN"), "atok")
+                self.assertEqual(tg_env.get("AGENTS_RELAY_URL"), "http://127.0.0.1:8787")
+
+                c_env = workspace_env("cws", provider="openai.default")
+                assert c_env is not None
+                self.assertEqual(c_env["LLM_API_KEY"], "lak")
+                self.assertNotIn("OPENAI_API_KEY", c_env)
+                self.assertNotIn("RELAY_SECRET", c_env)
 
     def test_explicit_config_state_dir_wins(self) -> None:
         from agents_relay.state import resolve_state_dir

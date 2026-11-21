@@ -5,12 +5,19 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import signal
 import sys
 import threading
+from dataclasses import replace
 
 from . import __version__
-from .approvals import decide_approval, resolve_approver_chat, run_local_approve
+from .approvals import (
+    decide_approval,
+    resolve_approver_chat,
+    run_http_approve,
+    run_local_approve,
+)
 from .client import GatewayClient
 from .config import RelayConfig
 from .http_adapter import serve_http
@@ -105,6 +112,31 @@ def _cmd_approve(args: argparse.Namespace) -> int:
         print(json.dumps({"note": note}, ensure_ascii=False))
         return code
     raw_user = str(getattr(args, "user", "") or getattr(args, "chat_id", "") or "")
+    relay_url = os.environ.get("AGENTS_RELAY_URL", "").strip() or (config.relay_url or "").strip()
+    approval_token = os.environ.get("AGENTS_APPROVAL_TOKEN", "").strip()
+    if relay_url and approval_token:
+        ws_id = os.environ.get("AGENTS_WORKSPACE", "").strip()
+        code, note = run_http_approve(
+            relay_url,
+            approval_token,
+            request,
+            float(args.timeout),
+            user=raw_user,
+            workspace=ws_id,
+        )
+        print(json.dumps({"note": note}, ensure_ascii=False))
+        return code
+    if not config.telegram_bot_token:
+        ident = str(request.get("id") or "").strip()
+        if ident:
+            print(
+                f"Approval pending ({ident}) — decide with: "
+                f"agents-relay approve --decide {ident} --allow",
+                file=sys.stderr,
+            )
+        code, note = run_local_approve(config, request, float(args.timeout))
+        print(json.dumps({"note": note}, ensure_ascii=False))
+        return code
     chat_id, why = resolve_approver_chat(
         raw_user,
         approver=config.approver,
@@ -280,6 +312,11 @@ def main(argv: list[str] | None = None) -> int:
 
     config = RelayConfig.from_env()
     server = serve_http(config)
+    bound_url = str(getattr(server, "relay_url", "") or "").strip()
+    if bound_url:
+        if not config.relay_url:
+            config = replace(config, relay_url=bound_url)
+        os.environ.setdefault("AGENTS_RELAY_URL", bound_url)
     tg_thread = None
     tg_stop = None
     if not args.no_telegram and config.telegram_bot_token:

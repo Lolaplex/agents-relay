@@ -11,8 +11,27 @@ from agents_workspace import Host, Workspace
 from agents_workspace.workspace import _slug, _valid_id
 
 
+WS_PERSONA_FIELDS = frozenset(
+    {
+        "id",
+        "name",
+        "system_append",
+        "notes",
+        "role",
+        "accepts_messages",
+        "allow_peers",
+        "memory",
+    }
+)
+
+
 def list_workspaces() -> list[Workspace]:
-    return Workspace.list_all()
+    host = Host.from_env()
+    items = host.list_workspaces()
+    if not items:
+        host.create("default")
+        items = host.list_workspaces()
+    return items
 
 
 def create_workspace(label: str = "", ws_id: str = "") -> Workspace:
@@ -56,6 +75,7 @@ def list_personas(ws: Workspace) -> list[dict]:
 
 
 def get_persona(ws: Workspace, persona_id: str) -> dict | None:
+    _valid_id(persona_id)
     manifest = Path(ws.personas) / persona_id / "persona.json"
     if not manifest.is_file():
         return None
@@ -74,7 +94,8 @@ def create_persona(ws: Workspace, persona_id: str, body: dict | None = None) -> 
     _valid_id(persona_id)
     pdir = Path(ws.personas) / persona_id
     manifest = pdir / "persona.json"
-    data = dict(body or {})
+    raw = body if isinstance(body, dict) else {}
+    data = {k: v for k, v in raw.items() if k in WS_PERSONA_FIELDS}
     data["id"] = persona_id
     if manifest.is_file():
         return data

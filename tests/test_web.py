@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import tempfile
 import threading
 import time
@@ -378,14 +379,21 @@ class TestChatStream(unittest.TestCase):
 class TestPush(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        os.environ["AGENTS_KEYS_DIR"] = str(Path(self._tmp.name) / "keys")
-        os.environ["AGENTS_HOST_DIR"] = str(Path(self._tmp.name) / "host")
+        self._env = patch.dict(
+            os.environ,
+            {
+                "AGENTS_KEYS_DIR": str(Path(self._tmp.name) / "keys"),
+                "AGENTS_HOST_DIR": str(Path(self._tmp.name) / "host"),
+            },
+            clear=False,
+        )
+        self._env.start()
         self.srv = _Server(_cfg(state_dir=str(Path(self._tmp.name) / "relay-state")))
 
     def tearDown(self):
         self.srv.close()
-        os.environ.pop("AGENTS_KEYS_DIR", None)
-        os.environ.pop("AGENTS_HOST_DIR", None)
+        self._env.stop()
+        self._tmp.cleanup()
 
     def test_vapid_key_mints_and_stays_stable(self):
         resp = self.srv.request(
@@ -398,6 +406,11 @@ class TestPush(unittest.TestCase):
         raw = base64.urlsafe_b64decode(key + "=" * (-len(key) % 4))
         self.assertEqual(len(raw), 65)
         self.assertEqual(raw[0], 4)
+        vapid_path = Path(self._tmp.name) / "host" / "keys" / "vapid.json"
+        self.assertTrue(vapid_path.is_file())
+        self.assertFalse((Path(self._tmp.name) / "relay-state" / "vapid.json").exists())
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(vapid_path.stat().st_mode), 0o600)
         # same key on second call (persisted under <host>/keys/vapid.json)
         resp2 = self.srv.request(
             "GET", "/v1/push/vapid-key", headers={"X-Relay-Secret": "expected"}
@@ -418,10 +431,80 @@ class TestPush(unittest.TestCase):
             )
             self.assertEqual(resp.status, 200)
             self.assertEqual(json.loads(resp.read().decode())["subscriptions"], 1)
-        stored = json.loads(
-            (Path(self._tmp.name) / "relay-state" / "push.json").read_text()
-        )
+        push_path = Path(self._tmp.name) / "host" / "secrets" / "push.json"
+        self.assertTrue(push_path.is_file())
+        self.assertFalse((Path(self._tmp.name) / "relay-state" / "push.json").exists())
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(push_path.stat().st_mode), 0o600)
+        stored = json.loads(push_path.read_text(encoding="utf-8"))
         self.assertEqual(len(stored), 1)
+
+    def test_legacy_fallback_read_and_no_cwd_fallback(self):
+        import warnings
+        from agents_relay import push as push_mod
+
+        legacy_dir = Path(self._tmp.name) / "legacy-relay"
+        legacy_dir.mkdir(parents=True, exist_ok=True)
+        legacy_sub = [
+            {
+                "endpoint": "https://push.example/legacy",
+                "keys": {"p256dh": "k1", "auth": "k2"},
+                "workspace": "",
+                "persona": "default",
+                "created_at": 1.0,
+            }
+        ]
+        (legacy_dir / "push.json").write_text(json.dumps(legacy_sub), encoding="utf-8")
+        (legacy_dir / "vapid.json").write_text(
+            json.dumps({"private": "1" * 64, "public": "B64-LEGACY"}),
+            encoding="utf-8",
+        )
+        legacy_cfg = _cfg(state_dir=str(legacy_dir))
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", DeprecationWarning)
+            subs = push_mod.load_subscriptions(config=legacy_cfg)
+            self.assertEqual(len(subs), 1)
+            self.assertEqual(subs[0]["endpoint"], "https://push.example/legacy")
+            self.assertEqual(push_mod.vapid_keypair(legacy_cfg)["public"], "B64-LEGACY")
+        self.assertTrue(any(issubclass(w.category, DeprecationWarning) for w in caught))
+
+        # Subscribe & VAPID with blank state_dir never fall back to CWD.
+        cwd_tmp = Path(self._tmp.name) / "cwd"
+        cwd_tmp.mkdir(parents=True, exist_ok=True)
+        old_cwd = Path.cwd()
+        blank_srv = _Server(_cfg(state_dir=""))
+        try:
+            os.chdir(cwd_tmp)
+            resp_v = blank_srv.request(
+                "GET", "/v1/push/vapid-key", headers={"X-Relay-Secret": "expected"}
+            )
+            self.assertEqual(resp_v.status, 200)
+            resp_v.read()
+            resp = blank_srv.request(
+                "POST",
+                "/v1/push/subscribe",
+                {
+                    "subscription": {
+                        "endpoint": "https://push.example/new",
+                        "keys": {"p256dh": "a", "auth": "b"},
+                    },
+                    "persona": "p2",
+                },
+                headers={"X-Relay-Secret": "expected"},
+            )
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(json.loads(resp.read().decode())["subscriptions"], 1)
+            self.assertTrue((Path(self._tmp.name) / "host" / "secrets" / "push.json").is_file())
+            self.assertFalse((cwd_tmp / "push.json").exists())
+            self.assertFalse((cwd_tmp / "vapid.json").exists())
+            # Primary host store now supersedes legacy fallback reads.
+            self.assertEqual(
+                [r["endpoint"] for r in push_mod.load_subscriptions(config=legacy_cfg)],
+                ["https://push.example/new"],
+            )
+        finally:
+            os.chdir(old_cwd)
+            blank_srv.close()
 
     def test_push_send_501_without_pywebpush(self):
         resp = self.srv.request(

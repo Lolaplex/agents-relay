@@ -6,6 +6,7 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import time
 import urllib.parse
 from collections import deque
 from dataclasses import replace
@@ -502,6 +503,11 @@ class TurnHandler(BaseHTTPRequestHandler):
                 self.send_error(401, "unauthorized")
                 return
             self._handle_persona_post(parts, query_params)
+            return
+
+        # POST /v1/approvals/request — turn-authenticated via Bearer AGENTS_APPROVAL_TOKEN
+        if path == "/v1/approvals/request":
+            self._handle_approval_request(query_params)
             return
 
         # POST /v1/approvals/<id> {allow: true|false}
@@ -1070,16 +1076,227 @@ class TurnHandler(BaseHTTPRequestHandler):
             {"ok": True, "jobs": list_jobs(ws, persona=persona)}, 200)
 
     def _approvals_dir(self, query_params: dict) -> Path:
-        """``<ws>/relay/approvals`` for ?workspace=<id>, else the serve state dir."""
+        """Host-owned ``<host>/run/approvals``. Still validates ?workspace=<id>."""
         from .state import approval_dir
         from .workspaces import get_workspace
 
         ws_ref = str(query_params.get("workspace") or "").strip()
-        if not ws_ref:
-            return approval_dir(self._cfg())
-        if not valid_id(ws_ref):
-            raise ValueError(f"invalid workspace id: {ws_ref!r}")
-        return get_workspace(ws_ref).relay_state / "approvals"
+        if ws_ref:
+            if not valid_id(ws_ref):
+                raise ValueError(f"invalid workspace id: {ws_ref!r}")
+            get_workspace(ws_ref)
+        return approval_dir(self._cfg())
+
+    def _approval_bearer(self) -> str:
+        auth_header = (self.headers.get("Authorization") or "").strip()
+        if auth_header.lower().startswith("bearer "):
+            return auth_header[7:].strip()
+        return ""
+
+    def _verify_turn_approval(self, req_ws: str = "") -> tuple[str, dict[str, Any]] | None:
+        from .approvals import verify_approval_token
+
+        bearer = self._approval_bearer()
+        tok_rec = verify_approval_token(bearer)
+        if tok_rec is None:
+            self._write_json({"ok": False, "error": "unauthorized"}, 401)
+            return None
+        tok_ws = str(tok_rec.get("workspace") or "").strip()
+        if req_ws and req_ws != tok_ws:
+            self._write_json({"ok": False, "error": "workspace mismatch"}, 403)
+            return None
+        return bearer, tok_rec
+
+    def _handle_approval_request(self, query_params: dict) -> None:
+        """``POST /v1/approvals/request`` — create host approval + dispatch prompt."""
+        body = self._read_json()
+        if body is None:
+            return
+        req_obj = body.get("request") if isinstance(body.get("request"), dict) else body
+        req_ws = str(
+            body.get("workspace")
+            or req_obj.get("workspace")
+            or query_params.get("workspace")
+            or ""
+        ).strip()
+        verified = self._verify_turn_approval(req_ws=req_ws)
+        if verified is None:
+            return
+        _bearer, tok_rec = verified
+
+        from .approvals import (
+            APPROVAL_ID_RE,
+            approval_keyboard,
+            create_pending,
+            format_approval_html,
+            read_approval,
+            resolve_approver_chat,
+        )
+
+        ident = str(req_obj.get("id") or body.get("id") or "").strip()
+        if not ident or not APPROVAL_ID_RE.match(ident):
+            self._write_json({"ok": False, "error": "invalid approval id"}, 400)
+            return
+
+        cfg = self._cfg()
+        tok_ws = str(tok_rec.get("workspace") or "").strip()
+        tok_hash = str(tok_rec.get("token_hash") or "").strip()
+        existing = read_approval(cfg, ident)
+        if existing is not None:
+            ex_tok = str(existing.get("token_hash") or "").strip()
+            if ex_tok and not hmac.compare_digest(ex_tok, tok_hash):
+                self._write_json({"ok": False, "error": "approval id conflict"}, 403)
+                return
+            ex_ws = str(existing.get("workspace") or "").strip()
+            if (ex_ws or tok_ws) and ex_ws != tok_ws:
+                self._write_json({"ok": False, "error": "workspace mismatch"}, 403)
+                return
+            self._write_json(
+                {
+                    "ok": True,
+                    "id": ident,
+                    "status": str(existing.get("status") or "pending"),
+                    "note": str(existing.get("note") or ""),
+                    "workspace": ex_ws or tok_ws,
+                },
+                200,
+            )
+            return
+
+        raw_user = str(body.get("user") or req_obj.get("user") or "")
+        chat_id, _ = resolve_approver_chat(
+            raw_user,
+            approver=cfg.approver,
+            allowed=cfg.telegram_allowed_chat_ids,
+        )
+        tg_chat = 0
+        send_tg = False
+        if cfg.telegram_bot_token and chat_id is not None:
+            from .telegram_adapter import chat_allowed
+
+            if chat_allowed(chat_id, cfg):
+                tg_chat = chat_id
+                send_tg = True
+
+        req_payload = dict(req_obj)
+        req_payload["id"] = ident
+        if tok_ws:
+            req_payload["workspace"] = tok_ws
+        rec = create_pending(
+            cfg,
+            tg_chat,
+            req_payload,
+            workspace=tok_ws,
+            token_hash=tok_hash,
+        )
+        if send_tg:
+            try:
+                from .telegram_adapter import send_message
+
+                send_message(
+                    cfg.telegram_bot_token,
+                    tg_chat,
+                    format_approval_html(req_payload),
+                    parse_mode="HTML",
+                    reply_markup=approval_keyboard(ident),
+                )
+            except Exception:
+                log.warning("approval telegram prompt failed for %s", ident)
+
+        self._write_json(
+            {
+                "ok": True,
+                "id": ident,
+                "status": str(rec.get("status") or "pending"),
+                "workspace": tok_ws,
+            },
+            200,
+        )
+
+    def _handle_approval_wait(self, ident: str, query_params: dict) -> None:
+        """``GET /v1/approvals/<id>/wait`` — wait on host approval decision."""
+        req_ws = str(query_params.get("workspace") or "").strip()
+        verified = self._verify_turn_approval(req_ws=req_ws)
+        if verified is None:
+            return
+        bearer, tok_rec = verified
+
+        from .approvals import (
+            APPROVAL_ID_RE,
+            expire_pending,
+            read_approval,
+            verify_approval_token,
+        )
+
+        if not APPROVAL_ID_RE.match(ident):
+            self._write_json({"ok": False, "error": "invalid approval id"}, 400)
+            return
+
+        cfg = self._cfg()
+        rec = read_approval(cfg, ident)
+        if rec is None:
+            self._write_json({"ok": False, "error": "unknown approval"}, 404)
+            return
+
+        tok_ws = str(tok_rec.get("workspace") or "").strip()
+        tok_hash = str(tok_rec.get("token_hash") or "").strip()
+        ap_ws = str(rec.get("workspace") or "").strip()
+        ap_tok = str(rec.get("token_hash") or "").strip()
+        if (ap_ws or tok_ws) and ap_ws != tok_ws:
+            self._write_json({"ok": False, "error": "workspace mismatch"}, 403)
+            return
+        if ap_tok and not hmac.compare_digest(ap_tok, tok_hash):
+            self._write_json({"ok": False, "error": "forbidden"}, 403)
+            return
+
+        try:
+            wait_sec = max(0.0, min(600.0, float(query_params.get("timeout") or "30")))
+        except ValueError:
+            wait_sec = 30.0
+        finalize = str(query_params.get("finalize") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        deadline = time.monotonic() + wait_sec
+        while True:
+            cur = read_approval(cfg, ident) or {}
+            status = str(cur.get("status") or "")
+            if status in ("approved", "denied", "timeout"):
+                self._write_json(
+                    {
+                        "ok": True,
+                        "id": ident,
+                        "status": status,
+                        "note": str(cur.get("note") or status),
+                    },
+                    200,
+                )
+                return
+            if verify_approval_token(bearer) is None:
+                self._write_json(
+                    {"ok": False, "error": "approval token expired or revoked"},
+                    401,
+                )
+                return
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(min(0.1, max(0.01, deadline - time.monotonic())))
+
+        if finalize:
+            cur = expire_pending(cfg, ident)
+            status = str(cur.get("status") or "timeout")
+            self._write_json(
+                {
+                    "ok": True,
+                    "id": ident,
+                    "status": status,
+                    "note": str(cur.get("note") or status),
+                },
+                200,
+            )
+            return
+        self._write_json({"ok": True, "id": ident, "status": "pending", "note": "pending"}, 200)
 
     def _handle_approvals_get(self, query_params: dict) -> None:
         from .state import read_json
@@ -1092,6 +1309,7 @@ class TurnHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self.send_error(400, str(exc))
             return
+        ws_ref = str(query_params.get("workspace") or "").strip()
         pending: list[tuple[float, dict]] = []
         if adir.is_dir():
             for path in adir.glob("*.json"):
@@ -1101,23 +1319,26 @@ class TurnHandler(BaseHTTPRequestHandler):
                 req = rec.get("request")
                 if not isinstance(req, dict):
                     req = {}
+                rec_ws = str(rec.get("workspace") or req.get("workspace") or "").strip()
+                if ws_ref and rec_ws and rec_ws != ws_ref:
+                    continue
                 try:
                     created = float(rec.get("created_at") or 0)
                 except (TypeError, ValueError):
                     created = 0.0
-                pending.append((
-                    created,
-                    {
-                        "id": str(rec.get("id") or path.stem),
-                        "tool": str(req.get("tool") or ""),
-                        "summary": str(req.get("summary") or ""),
-                    },
-                ))
+                row = {
+                    "id": str(rec.get("id") or path.stem),
+                    "tool": str(req.get("tool") or ""),
+                    "summary": str(req.get("summary") or ""),
+                }
+                if rec_ws:
+                    row["workspace"] = rec_ws
+                pending.append((created, row))
         rows = [row for _, row in sorted(pending, key=lambda item: item[0])]
         self._write_json({"ok": True, "approvals": rows}, 200)
 
     def _handle_approval_post(self, ident: str, query_params: dict) -> None:
-        """Resolve a pending approval through the same file /v1/turn waits on."""
+        """Resolve a pending approval through the host-owned approval file."""
         body = self._read_json()
         if body is None:
             return
@@ -1129,15 +1350,22 @@ class TurnHandler(BaseHTTPRequestHandler):
         ws_ref = str(query_params.get("workspace") or "").strip()
         if ws_ref:
             try:
-                cfg = replace(cfg, state_dir=str(self._approvals_dir(query_params).parent))
+                self._approvals_dir(query_params)
             except KeyError:
                 self.send_error(404, "unknown workspace")
                 return
             except ValueError as exc:
                 self.send_error(400, str(exc))
                 return
-        from .approvals import decide_approval
+        from .approvals import decide_approval, read_approval
 
+        if ws_ref:
+            rec = read_approval(cfg, ident)
+            if rec is not None:
+                rec_ws = str(rec.get("workspace") or "").strip()
+                if rec_ws and rec_ws != ws_ref:
+                    self.send_error(403, "workspace mismatch")
+                    return
         try:
             code, note = decide_approval(cfg, ident, allow=allow)
         except ValueError as exc:
@@ -1371,6 +1599,11 @@ class TurnHandler(BaseHTTPRequestHandler):
             handle_proxy(self, rid, "/" + parts[4] if len(parts) > 4 else "/")
             return
         parts = path.split("/")
+        # GET /v1/approvals/<id>/wait — turn-authenticated via Bearer AGENTS_APPROVAL_TOKEN
+        if (len(parts) == 5 and parts[1] == "v1"
+                and parts[2] == "approvals" and parts[4] == "wait"):
+            self._handle_approval_wait(parts[3], query_params)
+            return
         # GET /v1/workspaces/<ws>/inbox — team feed: counts + recent handoffs
         if (len(parts) == 5 and parts[1] == "v1"
                 and parts[2] == "workspaces" and parts[4] == "inbox"):
@@ -1555,6 +1788,14 @@ class TurnHandler(BaseHTTPRequestHandler):
         self.send_error(404)
 
 
+def _bound_relay_url(server: ThreadingHTTPServer) -> str:
+    host, port = server.server_address[:2]
+    connect_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+    if ":" in connect_host and not connect_host.startswith("["):
+        return f"http://[{connect_host}]:{port}"
+    return f"http://{connect_host}:{port}"
+
+
 def serve_http(config: RelayConfig, *, on_turn: Callable[..., LoopTurnResult] | None = None) -> ThreadingHTTPServer:
     attrs: dict = {
         "relay_secret": config.relay_secret,
@@ -1572,13 +1813,17 @@ def serve_http(config: RelayConfig, *, on_turn: Callable[..., LoopTurnResult] | 
         pass
     handler = type("ConfiguredRelayHandler", (TurnHandler,), attrs)
     server = ThreadingHTTPServer((config.relay_host, config.relay_port), handler)
+    bound_url = _bound_relay_url(server)
+    effective_cfg = config if config.relay_url else replace(config, relay_url=bound_url)
+    handler.config = effective_cfg
+    server.relay_url = bound_url  # type: ignore[attr-defined]
     try:
         from .wake import replay_all
 
         if on_turn is not None:
             run_turn = attrs["turn_hook"]
         else:
-            run_turn = lambda **kw: run_loop_turn(config=config, **kw)  # noqa: E731
+            run_turn = lambda **kw: run_loop_turn(config=effective_cfg, **kw)  # noqa: E731
         replayed = replay_all(run_turn=run_turn)
         if replayed:
             log.info("replayed %d unfinished handoff wake(s)", sum(replayed.values()))

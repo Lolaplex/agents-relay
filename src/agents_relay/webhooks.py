@@ -1,4 +1,8 @@
-"""Inbound alert webhooks (CI, Coolify, schedule failures)."""
+"""Inbound alert webhooks (CI, Coolify, schedule failures).
+
+Verification fails closed: an unset, empty, or invalid ``WEBHOOK_SECRET``
+always rejects the request as unauthorized.
+"""
 
 from __future__ import annotations
 
@@ -7,20 +11,25 @@ import hmac
 import json
 from typing import Any
 
-from .config import GatewayConfig
+from .config import RelayConfig
 from .turn import TurnParams, run_loop_turn
 
 
 def _verify_secret(raw_body: bytes, header: str, expected: str) -> bool:
-    if not expected:
-        return True
+    """Verify webhook secret header or HMAC-SHA256 digest; fail closed when unset."""
+    expected_clean = (expected or "").strip()
+    if not expected_clean:
+        return False
     got = (header or "").strip()
     if not got:
         return False
-    if got == expected:
+    if hmac.compare_digest(got.encode("utf-8"), expected_clean.encode("utf-8")):
         return True
-    digest = hmac.new(expected.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(got, digest) or hmac.compare_digest(got, f"sha256={digest}")
+    digest = hmac.new(expected_clean.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+    return (
+        hmac.compare_digest(got.encode("utf-8"), digest.encode("utf-8"))
+        or hmac.compare_digest(got.encode("utf-8"), f"sha256={digest}".encode("utf-8"))
+    )
 
 
 def _format_alert(source: str, body: dict[str, Any]) -> str:
@@ -47,10 +56,10 @@ def handle_webhook(
     *,
     raw_body: bytes,
     secret_header: str,
-    config: GatewayConfig | None = None,
+    config: RelayConfig | None = None,
     notify_turn: bool = True,
 ) -> dict[str, Any]:
-    cfg = config or GatewayConfig.from_env()
+    cfg = config or RelayConfig.from_env()
     if not _verify_secret(raw_body, secret_header, cfg.webhook_secret):
         return {"ok": False, "error": "unauthorized"}
     text = _format_alert(source, body)

@@ -3,14 +3,13 @@
 P-256 key generation is done in pure stdlib Python: a scalar multiply on
 secp256r1 runs once per host, so the ~60-line EC implementation beats pulling
 in a crypto dependency the relay does not otherwise need. The private key is
-stored hex-encoded under ``<ws>/relay/vapid.json`` (mode 0600) — i.e. the
-configured relay state dir; the public key served to browsers is the
-base64url uncompressed point (65 bytes).
+stored hex-encoded under ``<host>/keys/vapid.json`` (mode 0600); the public
+key served to browsers is the base64url uncompressed point (65 bytes).
 
 Subscriptions (PushSubscription JSON from the web app) live in
-``<ws>/relay/push.json`` — a JSON array deduped by ``endpoint`` so a
-re-subscribe replaces, never appends. Without a ``?workspace=`` the serve
-state dir is used instead.
+``<host>/secrets/push.json`` (mode 0600) — a JSON array deduped by
+``endpoint`` so a re-subscribe replaces, never appends. A 1-release fallback
+reads legacy ``<ws>/relay/{vapid.json,push.json}`` when host files are absent.
 
 Sending needs ``pywebpush`` (lazy import): it signs the VAPID JWT and does
 the aes128gcm payload encryption. Absent → :class:`PushUnavailable`; the
@@ -21,10 +20,14 @@ from __future__ import annotations
 
 import json
 import secrets
-import stat
 import time
+import warnings
 from pathlib import Path
 from typing import Any
+
+from agents_workspace import Host
+
+from .state import legacy_relay_dirs, read_json, read_json_any, write_json_atomic
 
 # --- secp256r1 / P-256 (NIST) -------------------------------------------------
 
@@ -77,32 +80,46 @@ def _public_key_b64(priv: int) -> str:
 
 # --- host key file ------------------------------------------------------------
 
-def _state_dir(config) -> Path:
-    return Path(config.state_dir)
+def _vapid_path() -> Path:
+    return Host.from_env().keys / "vapid.json"
 
 
-def vapid_keypair(config) -> dict[str, str]:
-    """Load or mint the relay VAPID keypair. Public key is base64url, 65 bytes."""
-    path = _state_dir(config) / "vapid.json"
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(data, dict) and data.get("public") and data.get("private"):
-            return {"public": data["public"], "private": data["private"]}
-    except (OSError, json.JSONDecodeError):
-        pass
+def _push_path() -> Path:
+    return Host.from_env().secrets_dir / "push.json"
+
+
+def _valid_vapid(data: Any) -> dict[str, str] | None:
+    if isinstance(data, dict) and data.get("public") and data.get("private"):
+        return {"public": str(data["public"]), "private": str(data["private"])}
+    return None
+
+
+def vapid_keypair(config=None) -> dict[str, str]:
+    """Load or mint the host VAPID keypair at ``<host>/keys/vapid.json``.
+
+    Public key is base64url, 65 bytes. Falls back once to legacy
+    ``<ws>/relay/vapid.json`` when the host file does not exist yet.
+    """
+    path = _vapid_path()
+    pair = _valid_vapid(read_json(path))
+    if pair is not None:
+        return pair
+
+    for legacy_dir in legacy_relay_dirs(config):
+        legacy_path = legacy_dir / "vapid.json"
+        pair = _valid_vapid(read_json(legacy_path))
+        if pair is not None:
+            warnings.warn(
+                f"legacy VAPID keypair at {legacy_path} is deprecated; relocate to {path}",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            return pair
+
     priv = secrets.randbelow(_N - 1) + 1
     public = _public_key_b64(priv)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(
-        json.dumps({"private": format(priv, "064x"), "public": public}, indent=1),
-        encoding="utf-8",
-    )
-    try:
-        tmp.chmod(stat.S_IRUSR | stat.S_IWUSR)
-    except OSError:
-        pass
-    tmp.replace(path)
+    payload = {"private": format(priv, "064x"), "public": public}
+    write_json_atomic(path, payload, mode=0o600)
     return {"public": public, "private": format(priv, "064x")}
 
 
@@ -118,38 +135,56 @@ def handle_vapid_key(handler, config) -> None:
 
 # --- subscription store --------------------------------------------------------
 
-def _push_dir(config, ws_ref: str) -> Path:
-    if ws_ref:
-        from .turn import resolve_workspace_id
-
-        return resolve_workspace_id(ws_ref).relay_state
-    return _state_dir(config)
-
-
 def _store_file(root: Path) -> Path:
-    return root / "push.json"
+    return root if root.name == "push.json" else root / "push.json"
 
 
-def load_subscriptions(root: Path) -> list[dict[str, Any]]:
-    path = _store_file(root)
-    try:
-        rows = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return []
+def _filter_subscriptions(rows: Any) -> list[dict[str, Any]]:
     if not isinstance(rows, list):
         return []
     return [r for r in rows if isinstance(r, dict) and r.get("endpoint")]
 
 
-def _write_subscriptions(root: Path, rows: list[dict[str, Any]]) -> None:
-    root.mkdir(parents=True, exist_ok=True)
-    tmp = _store_file(root).with_suffix(".tmp")
-    tmp.write_text(json.dumps(rows, indent=1), encoding="utf-8")
-    try:
-        tmp.chmod(stat.S_IRUSR | stat.S_IWUSR)
-    except OSError:
-        pass
-    tmp.replace(_store_file(root))
+def load_subscriptions(
+    root: Path | None = None,
+    *,
+    config=None,
+    ws_ref: str = "",
+) -> list[dict[str, Any]]:
+    """Load push subscriptions from ``<host>/secrets/push.json`` (or explicit root).
+
+    Falls back once to legacy ``<ws>/relay/push.json`` when the host file is absent.
+    """
+    if root is not None:
+        return _filter_subscriptions(read_json_any(_store_file(root)))
+
+    path = _push_path()
+    if path.is_file():
+        return _filter_subscriptions(read_json_any(path))
+
+    seen: dict[str, dict[str, Any]] = {}
+    legacy_sources: list[Path] = []
+    for legacy_dir in legacy_relay_dirs(config, ws_ref=ws_ref):
+        legacy_path = legacy_dir / "push.json"
+        if not legacy_path.is_file():
+            continue
+        rows = _filter_subscriptions(read_json_any(legacy_path))
+        if rows:
+            legacy_sources.append(legacy_path)
+            for row in rows:
+                seen[str(row["endpoint"])] = row
+    if legacy_sources:
+        warnings.warn(
+            f"legacy push subscriptions at {legacy_sources[0]} are deprecated; relocate to {path}",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    return list(seen.values())
+
+
+def _write_subscriptions(rows: list[dict[str, Any]], root: Path | None = None) -> None:
+    target = _store_file(root) if root is not None else _push_path()
+    write_json_atomic(target, rows, mode=0o600)
 
 
 def handle_push_subscribe(handler, config, body: dict, query: dict[str, Any]) -> None:
@@ -162,11 +197,14 @@ def handle_push_subscribe(handler, config, body: dict, query: dict[str, Any]) ->
         handler._write_json({"ok": False, "error": "subscription.endpoint required"}, 400)  # type: ignore[attr-defined]
         return
     ws_ref = str(query.get("workspace") or body.get("workspace") or "").strip()
-    try:
-        root = _push_dir(config, ws_ref)
-    except ValueError as exc:
-        handler._write_json({"ok": False, "error": str(exc)}, 400)  # type: ignore[attr-defined]
-        return
+    if ws_ref:
+        from .turn import resolve_workspace_id
+
+        try:
+            resolve_workspace_id(ws_ref)
+        except ValueError as exc:
+            handler._write_json({"ok": False, "error": str(exc)}, 400)  # type: ignore[attr-defined]
+            return
     row = {
         "endpoint": endpoint,
         "keys": {k: str(v) for k, v in (sub.get("keys") or {}).items() if isinstance(v, str)},
@@ -175,9 +213,9 @@ def handle_push_subscribe(handler, config, body: dict, query: dict[str, Any]) ->
         "ua": str(handler.headers.get("User-Agent") or "")[:200],
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
-    rows = [r for r in load_subscriptions(root) if r.get("endpoint") != endpoint]
+    rows = [r for r in load_subscriptions(config=config) if r.get("endpoint") != endpoint]
     rows.append(row)
-    _write_subscriptions(root, rows)
+    _write_subscriptions(rows)
     handler._write_json({"ok": True, "subscriptions": len(rows)}, 200)  # type: ignore[attr-defined]
 
 
@@ -196,11 +234,21 @@ def send_push_all(config, payload: dict[str, Any], ws_ref: str = "") -> int:
             from webpush import webpush  # type: ignore
         except ImportError:
             raise PushUnavailable("pywebpush not installed") from None
+    ws_ref = (ws_ref or "").strip()
+    if ws_ref:
+        from .turn import resolve_workspace_id
+
+        resolve_workspace_id(ws_ref)
     pair = vapid_keypair(config)
-    root = _push_dir(config, ws_ref)
+    all_rows = load_subscriptions(config=config, ws_ref=ws_ref)
+    targets = [
+        sub
+        for sub in all_rows
+        if not ws_ref or str(sub.get("workspace") or "") in ("", ws_ref)
+    ]
     sent = 0
     dead: list[str] = []
-    for sub in load_subscriptions(root):
+    for sub in targets:
         try:
             webpush(
                 subscription_info={
@@ -217,14 +265,15 @@ def send_push_all(config, payload: dict[str, Any], ws_ref: str = "") -> int:
             if status in (404, 410):
                 dead.append(str(sub.get("endpoint")))
     if dead:
-        rows = [r for r in load_subscriptions(root) if r.get("endpoint") not in dead]
-        _write_subscriptions(root, rows)
+        rows = [r for r in load_subscriptions(config=config) if r.get("endpoint") not in dead]
+        _write_subscriptions(rows)
     return sent
 
 
 def notify_approval_pending(config, request: dict[str, Any], ws_ref: str = "") -> None:
     """Best-effort push when an approval goes pending. Never raises."""
     try:
+        eff_ws = str(ws_ref or request.get("workspace") or "").strip()
         send_push_all(
             config,
             {
@@ -232,7 +281,7 @@ def notify_approval_pending(config, request: dict[str, Any], ws_ref: str = "") -
                 "id": str(request.get("id") or request.get("ident") or ""),
                 "summary": str(request.get("summary") or request.get("command") or "")[:160],
             },
-            ws_ref=ws_ref,
+            ws_ref=eff_ws,
         )
     except Exception:
         pass

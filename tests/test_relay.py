@@ -7,9 +7,11 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from dataclasses import dataclass, replace
 from http.client import HTTPConnection
+from pathlib import Path
 from unittest.mock import patch
 
 from agents_relay.config import RelayConfig
@@ -17,6 +19,21 @@ from agents_relay.http_adapter import serve_http
 from agents_relay.loop_client import LOOP_TRAILER_MARKER, parse_loop_stdout, run_loop_turn
 from agents_relay.turn import StreamEvent, iter_loop_stream, turn_params_from_body
 from agents_relay.webhooks import handle_webhook
+
+_ISOLATED_TMP = tempfile.TemporaryDirectory()
+
+
+def setUpModule():
+    tmp = _ISOLATED_TMP.name
+    os.environ["AGENTS_WORKSPACES_DIR"] = os.path.join(tmp, "workspaces")
+    os.environ["AGENTS_TRACES_DIR"] = os.path.join(tmp, "traces")
+    os.environ["AGENTS_HOME"] = os.path.join(tmp, "home")
+
+
+def tearDownModule():
+    for key in ("AGENTS_WORKSPACES_DIR", "AGENTS_TRACES_DIR", "AGENTS_HOME"):
+        os.environ.pop(key, None)
+    _ISOLATED_TMP.cleanup()
 
 
 def _test_config(**overrides) -> RelayConfig:
@@ -923,9 +940,12 @@ class TestInject(unittest.TestCase):
 
 class TestWebhook(unittest.TestCase):
     def test_webhook_auth(self):
+        import hashlib, hmac
         cfg = _test_config()
         bad = handle_webhook("ci", {"status": "failed"}, raw_body=b"{}", secret_header="nope", config=cfg, notify_turn=False)
         self.assertFalse(bad["ok"])
+        missing_hdr = handle_webhook("ci", {"status": "failed"}, raw_body=b"{}", secret_header="", config=cfg, notify_turn=False)
+        self.assertFalse(missing_hdr["ok"])
         good = handle_webhook(
             "ci",
             {"repo": "agents-harness", "status": "failed"},
@@ -936,6 +956,19 @@ class TestWebhook(unittest.TestCase):
         )
         self.assertTrue(good["ok"])
         self.assertIn("CI alert", good["alert"])
+        sig = hmac.new(b"whsec", b"{}", hashlib.sha256).hexdigest()
+        signed = handle_webhook(
+            "ci", {"status": "failed"}, raw_body=b"{}", secret_header=f"sha256={sig}", config=cfg, notify_turn=False
+        )
+        self.assertTrue(signed["ok"])
+
+    def test_webhook_fails_closed_when_secret_unset(self):
+        for empty in ("", "   "):
+            cfg = _test_config(webhook_secret=empty)
+            res = handle_webhook("ci", {"status": "failed"}, raw_body=b"{}", secret_header="", config=cfg, notify_turn=False)
+            self.assertEqual(res, {"ok": False, "error": "unauthorized"})
+            res2 = handle_webhook("ci", {"status": "failed"}, raw_body=b"{}", secret_header="anything", config=cfg, notify_turn=False)
+            self.assertEqual(res2, {"ok": False, "error": "unauthorized"})
 
 
 class TestStream(unittest.TestCase):
@@ -1010,8 +1043,16 @@ class TestDashboardApi(unittest.TestCase):
     def _workspace(self, ws_id: str = "demo"):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
+        host_dir = Path(tmp.name) / "host"
+        self._host_dir = host_dir
         env = patch.dict(
-            os.environ, {"AGENTS_WORKSPACES_DIR": tmp.name}, clear=False)
+            os.environ,
+            {
+                "AGENTS_HOST_DIR": str(host_dir),
+                "AGENTS_WORKSPACES_DIR": str(host_dir / "workspaces"),
+            },
+            clear=False,
+        )
         env.start()
         self.addCleanup(env.stop)
         from agents_workspace import Workspace
@@ -1090,9 +1131,9 @@ class TestDashboardApi(unittest.TestCase):
 
         ws_cfg = replace(cfg, state_dir=str(ws.relay_state))
         create_pending(ws_cfg, 0, {"id": "ap1", "tool": "shell",
-                                   "summary": "run tests"})
+                                   "summary": "run tests"}, workspace="demo")
         create_pending(ws_cfg, 0, {"id": "ap2", "tool": "write",
-                                   "summary": "edit file"})
+                                   "summary": "edit file"}, workspace="demo")
         host, port = self._serve(cfg)
 
         resp = self._req(host, port, "GET", "/v1/approvals?workspace=demo")
@@ -1101,6 +1142,7 @@ class TestDashboardApi(unittest.TestCase):
         self.assertEqual([a["id"] for a in data["approvals"]], ["ap1", "ap2"])
         self.assertEqual(data["approvals"][0]["tool"], "shell")
         self.assertEqual(data["approvals"][0]["summary"], "run tests")
+        self.assertFalse((ws.relay_state / "approvals" / "ap1.json").exists())
 
         resp = self._req(
             host, port, "POST", "/v1/approvals/ap1?workspace=demo",
@@ -1114,7 +1156,7 @@ class TestDashboardApi(unittest.TestCase):
         self.assertEqual(resp.status, 200)
         data = json.loads(resp.read().decode())
         self.assertEqual(data["status"], "approved")
-        rec = read_json(ws.relay_state / "approvals" / "ap1.json")
+        rec = read_json(self._host_dir / "run" / "approvals" / "ap1.json")
         self.assertEqual(rec["status"], "approved")
 
         resp = self._req(host, port, "GET", "/v1/approvals?workspace=demo")
@@ -1132,8 +1174,158 @@ class TestDashboardApi(unittest.TestCase):
             {"allow": False})
         self.assertEqual(resp.status, 200)
         resp.read()
-        rec = read_json(ws.relay_state / "approvals" / "ap2.json")
+        rec = read_json(self._host_dir / "run" / "approvals" / "ap2.json")
         self.assertEqual(rec["status"], "denied")
+
+    def test_http_turn_approval_request_wait_and_token_lifecycle(self):
+        from agents_relay.approvals import (
+            hash_approval_token,
+            mint_approval_token,
+            revoke_approval_token,
+            run_http_approve,
+        )
+        from agents_relay.state import read_json
+        from agents_workspace import Host
+
+        ws = self._workspace("demo")
+        Host.from_env().create("other")
+        cfg = _test_config(
+            telegram_bot_token="bot-tok",
+            telegram_allowed_chat_ids=(12345,),
+            approver="12345",
+        )
+        host, port = self._serve(cfg)
+        token, thash = mint_approval_token("demo")
+        other_token, _ = mint_approval_token("other")
+        self.assertTrue((self._host_dir / "run" / "approvals" / "tokens" / f"{thash}.json").is_file())
+
+        # Missing or invalid token -> 401
+        r = self._req(host, port, "POST", "/v1/approvals/request",
+                      {"id": "req-unauth", "tool": "shell", "summary": "ls"}, secret=False)
+        self.assertEqual(r.status, 401)
+        r.read()
+        r = self._req(host, port, "POST", "/v1/approvals/request",
+                      {"id": "req-bad", "tool": "shell", "summary": "ls"},
+                      headers={"Authorization": "Bearer wrong-token"}, secret=False)
+        self.assertEqual(r.status, 401)
+        r.read()
+
+        # Cross-workspace request -> 403
+        r = self._req(host, port, "POST", "/v1/approvals/request",
+                      {"id": "req-xws", "workspace": "other", "tool": "shell", "summary": "ls"},
+                      headers={"Authorization": f"Bearer {token}"}, secret=False)
+        self.assertEqual(r.status, 403)
+        r.read()
+
+        # Full round-trip with Telegram dispatch + operator WebUI decision
+        req_payload = {
+            "id": "req-http-1",
+            "session": "ses_1",
+            "user": "12345",
+            "workspace": "demo",
+            "tool": "mcp.terminal.run",
+            "args": {"cmd": "ls"},
+            "summary": "run ls",
+            "timeout": 5,
+        }
+        with patch("agents_relay.telegram_adapter.send_message", return_value={"ok": True}) as tg_sent:
+            holder: dict[str, object] = {}
+
+            def _waiter() -> None:
+                code, note = run_http_approve(
+                    f"http://{host}:{port}", token, req_payload, 5.0,
+                    workspace="demo", poll_slice=0.5,
+                )
+                holder["code"] = code
+                holder["note"] = note
+
+            th = threading.Thread(target=_waiter, daemon=True)
+            th.start()
+
+            ap_file = self._host_dir / "run" / "approvals" / "req-http-1.json"
+            deadline = time.time() + 3
+            while time.time() < deadline and not ap_file.is_file():
+                time.sleep(0.02)
+            self.assertTrue(ap_file.is_file())
+            self.assertFalse((ws.relay_state / "approvals" / "req-http-1.json").exists())
+            rec = read_json(ap_file)
+            self.assertEqual(rec["workspace"], "demo")
+            self.assertEqual(rec["token_hash"], hash_approval_token(token))
+            tg_sent.assert_called()
+
+            # Different turn's token cannot wait on this approval id -> 403
+            r_other = self._req(
+                host, port, "GET", "/v1/approvals/req-http-1/wait?timeout=1",
+                headers={"Authorization": f"Bearer {other_token}"}, secret=False,
+            )
+            self.assertEqual(r_other.status, 403)
+            r_other.read()
+
+            # Wrong workspace on operator POST -> 403
+            r_wrong_ws = self._req(
+                host, port, "POST", "/v1/approvals/req-http-1?workspace=other",
+                {"allow": True},
+            )
+            self.assertEqual(r_wrong_ws.status, 403)
+            r_wrong_ws.read()
+
+            # Operator resolves on right workspace -> wait thread unblocks
+            r_ok = self._req(
+                host, port, "POST", "/v1/approvals/req-http-1?workspace=demo",
+                {"allow": True},
+            )
+            self.assertEqual(r_ok.status, 200)
+            r_ok.read()
+            th.join(timeout=3)
+            self.assertEqual(holder.get("code"), 0)
+            self.assertEqual(holder.get("note"), "approved")
+
+        # Timeout finalization + token revocation
+        code_to, note_to = run_http_approve(
+            f"http://{host}:{port}", token,
+            {"id": "req-http-timeout", "tool": "shell", "summary": "slow", "user": "local"},
+            0.25, workspace="demo", poll_slice=0.25,
+        )
+        self.assertEqual((code_to, note_to), (2, "timeout"))
+        self.assertEqual(
+            read_json(self._host_dir / "run" / "approvals" / "req-http-timeout.json")["status"],
+            "timeout",
+        )
+
+        revoke_approval_token(token)
+        self.assertFalse((self._host_dir / "run" / "approvals" / "tokens" / f"{thash}.json").exists())
+        r_revoked = self._req(
+            host, port, "POST", "/v1/approvals/request",
+            {"id": "req-after-revoke", "workspace": "demo", "tool": "shell", "summary": "x"},
+            headers={"Authorization": f"Bearer {token}"}, secret=False,
+        )
+        self.assertEqual(r_revoked.status, 401)
+        r_revoked.read()
+
+    def test_turn_approval_env_lifecycle_and_telegram_isolation(self):
+        from agents_relay.approvals import hash_approval_token, verify_approval_token
+        from agents_relay.turn import _container_rewrite, turn_approval_env
+
+        self._workspace("demo")
+        cfg = replace(_test_config(relay_port=8787), relay_url="http://127.0.0.1:8787")
+        seen_tok = ""
+        with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "top-secret-tg"}, clear=False):
+            os.environ.pop("AGENTS_RELAY_URL", None)
+            os.environ.pop("AGENTS_APPROVAL_TOKEN", None)
+            with turn_approval_env("demo", config=cfg) as extra:
+                seen_tok = extra["AGENTS_APPROVAL_TOKEN"]
+                self.assertEqual(extra["AGENTS_RELAY_URL"], "http://127.0.0.1:8787")
+                self.assertTrue(len(seen_tok) >= 32)
+                self.assertIsNotNone(verify_approval_token(seen_tok, workspace="demo"))
+                tok_file = self._host_dir / "run" / "approvals" / "tokens" / f"{hash_approval_token(seen_tok)}.json"
+                self.assertTrue(tok_file.is_file())
+                _, child_env, _ = _container_rewrite(["echo"], "demo", "", extra_env=extra)
+                assert child_env is not None
+                self.assertNotIn("TELEGRAM_BOT_TOKEN", child_env)
+                self.assertEqual(child_env["AGENTS_APPROVAL_TOKEN"], seen_tok)
+                self.assertEqual(child_env["AGENTS_RELAY_URL"], "http://127.0.0.1:8787")
+            self.assertIsNone(verify_approval_token(seen_tok, workspace="demo"))
+            self.assertFalse((self._host_dir / "run" / "approvals" / "tokens" / f"{hash_approval_token(seen_tok)}.json").exists())
 
     def test_cors_off_by_default(self):
         self._workspace()
@@ -1245,16 +1437,20 @@ class TestMemberRoleAuthz(unittest.TestCase):
 
         self._tmp = tempfile.TemporaryDirectory()
         root = _P(self._tmp.name)
-        os.environ["AGENTS_HOST_DIR"] = str(root / "host")
-        os.environ["AGENTS_WORKSPACE"] = "demo"
+        self._env = patch.dict(
+            os.environ,
+            {
+                "AGENTS_HOST_DIR": str(root / "host"),
+                "AGENTS_WORKSPACES_DIR": str(root / "host" / "workspaces"),
+                "AGENTS_WORKSPACE": "demo",
+            },
+        )
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        self.addCleanup(self._tmp.cleanup)
         from agents_workspace import Host
 
         self.ws = Host(dir=root / "host").create("demo")
-
-    def tearDown(self):
-        os.environ.pop("AGENTS_HOST_DIR", None)
-        os.environ.pop("AGENTS_WORKSPACE", None)
-        self._tmp.cleanup()
 
     def _cfg(self, allowed=()):
         return _test_config(telegram_allowed_chat_ids=allowed)
