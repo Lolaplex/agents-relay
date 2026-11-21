@@ -113,7 +113,35 @@ def _session_store(ws: Workspace):
 
 
 def list_sessions(ws: Workspace, persona: str = "", user: str = "") -> list[dict]:
-    return [r.to_dict() for r in _session_store(ws).list(persona=persona, user=user)]
+    rows = [r.to_dict() for r in _session_store(ws).list(persona=persona, user=user)]
+    want = {str(r.get("id") or "") for r in rows} - {""}
+    if not want:
+        return rows
+    # One pass over the trace store: first user message per session becomes
+    # the sidebar title, so clients need no per-session history fetch.
+    try:
+        from agents_traces.store import TraceStore
+
+        titles: dict[str, str] = {}
+        for e in TraceStore(ws.traces).iter_events():
+            sid = e.session
+            if sid not in want or sid in titles or e.type != "message":
+                continue
+            md = e.metadata or {}
+            if md.get("role") != "user":
+                continue
+            text = " ".join(str(md.get("content") or "").split())
+            if text:
+                titles[sid] = text[:160]
+            if len(titles) >= len(want):
+                break
+        for r in rows:
+            title = titles.get(str(r.get("id") or ""))
+            if title:
+                r["title"] = title
+    except Exception:
+        pass
+    return rows
 
 
 def get_session(ws: Workspace, persona: str, session_id: str) -> dict | None:

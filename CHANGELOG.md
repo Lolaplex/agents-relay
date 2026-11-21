@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `GET /v1/workspaces/<ws>/personas/<p>/sessions` rows now carry a `title` derived from the session's first user message (one pass over the trace store), so sidebars can label chats without a per-session history fetch.
 - `acp.<name>` providers are first-class: `serve` drops `<host>/providers/acp.<name>.json` (`kind: acp-agent`) whenever `AGENTS_ACP_CMD` is set, so `/v1/providers`, `/v1/model`, and `runner.model` pick validation treat the foreign agent like any manifest provider. The rows are enriched with the agent's own model/mode config options — probed via a throwaway `initialize`+`session/new`, cached in `<state>/acp_models/<name>.json` for 24 h, re-probed on `GET /v1/model?refresh=1`. Turns with `provider=acp.*` spawn `acp-run` instead of `LOOP_CMD` (precedence: flag > workspace pick > env), and `--model` reaches the agent as `session/set_config_option` `configId=model`. `AGENTS_ACP_CMD_<NAME>` overrides `AGENTS_ACP_CMD` per provider; `AGENTS_ACP_NAME` pins the provider name (otherwise derived from the command basename).
 - `acp-serve` advertises an `llm_api_key` authMethod: the client's `authenticate` call stores the key as `LLM_API_KEY` in the host `secrets.json`. `session/prompt` resolves the selected provider up front and answers with a configuration hint when url/model/key are missing instead of letting the spawned loop fail invisibly.
 
