@@ -195,8 +195,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `serve` self-publishes a signed presence road declaration at boot when
-  `AGENTS_PRESENCE_LABEL`, `AGENTS_PRESENCE_KEY` (agents-keys slug), and
-  `AGENTS_PRESENCE_ADDR` (`host[:port]` or `scheme://…`) are set. Hosts
-  announce themselves one-sided; the manual publish UI was removed from
-  klanker in favour of this env.
+- `GET /v1/discover` runs the tailnet health probe server-side (`tailscale
+  status --json` roster, `GET /health` on ports 8787/8000) — same scan the
+  desktop runs natively, now reachable for the web surface.
+
+### Removed
+
+- Presence offers (`presence.py`, `/v1/presence/offers`, `/v1/presence/publish`)
+  dropped: remotes are mounted by URL anyway, and same-network hosts are found
+  by the probe — a shared declaration registry added machinery without a user.
