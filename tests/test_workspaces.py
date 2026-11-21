@@ -643,8 +643,11 @@ class TestHandoffWake(unittest.TestCase):
         self.assertEqual(resp.status, 202)
         resp.read()
         self._wait_task("cos", tid)
+        from agents_relay import wake
         from agents_workspace import Host
 
+        # status=done lands before _dequeue; join the wake thread first.
+        wake.drain(timeout=5)
         qdir = Host.from_env().workspace("demo").relay_state / "handoffs"
         self.assertEqual(list(qdir.glob("*.json")), [])
 
