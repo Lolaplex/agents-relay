@@ -136,8 +136,13 @@ class TestAcpRun(unittest.TestCase):
             import io, contextlib
 
             out = io.StringIO()
-            env_save = os.environ.get("AGENTS_RELAY_STATE")
-            os.environ["AGENTS_RELAY_STATE"] = tmp
+            env_save = {
+                k: os.environ.get(k)
+                for k in ("AGENTS_RELAY_DIR", "AGENTS_HOST_DIR", "AGENTS_WORKSPACE")
+            }
+            os.environ["AGENTS_RELAY_DIR"] = tmp
+            os.environ["AGENTS_HOST_DIR"] = tmp
+            os.environ.pop("AGENTS_WORKSPACE", None)
             config = RelayConfig.from_env()
             try:
                 with contextlib.redirect_stdout(out):
@@ -149,17 +154,17 @@ class TestAcpRun(unittest.TestCase):
                         config=config,
                     )
             finally:
-                if env_save is None:
-                    os.environ.pop("AGENTS_RELAY_STATE", None)
-                else:
-                    os.environ["AGENTS_RELAY_STATE"] = env_save
+                for k, v in env_save.items():
+                    os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
             self.assertEqual(rc, 0)
             text = out.getvalue()
             self.assertIn("STUB-AGENT:reply", text)
             self.assertIn("---agents-loop-trailer---", text)
             self.assertIn('"session": "ses_t1"', text)
-            # session id persisted for load on the next turn
-            stored = json.loads((Path(tmp) / "acp_sessions" / "ses_t1.json").read_text())
+            # session id persisted in host cache for load on the next turn
+            stored = json.loads(
+                (Path(tmp) / "cache" / "acp_sessions" / "ses_t1.json").read_text()
+            )
             self.assertEqual(stored["acpSessionId"], "acp_stub_1")
 
     def test_model_goes_to_set_config_option(self) -> None:
@@ -171,9 +176,18 @@ class TestAcpRun(unittest.TestCase):
             log = str(Path(tmp) / "agent.log")
             import io, contextlib
 
-            env_save = {k: os.environ.get(k) for k in (
-                "AGENTS_RELAY_STATE", "AGENT_LOG")}
-            os.environ["AGENTS_RELAY_STATE"] = tmp
+            env_save = {
+                k: os.environ.get(k)
+                for k in (
+                    "AGENTS_RELAY_DIR",
+                    "AGENTS_HOST_DIR",
+                    "AGENTS_WORKSPACE",
+                    "AGENT_LOG",
+                )
+            }
+            os.environ["AGENTS_RELAY_DIR"] = tmp
+            os.environ["AGENTS_HOST_DIR"] = tmp
+            os.environ.pop("AGENTS_WORKSPACE", None)
             os.environ["AGENT_LOG"] = log
             config = RelayConfig.from_env()
             try:
@@ -191,6 +205,58 @@ class TestAcpRun(unittest.TestCase):
             self.assertEqual(calls, [{
                 "sessionId": "acp_stub_1", "configId": "model",
                 "value": "swe-2-high"}])
+
+    def test_acp_run_strips_secrets_and_authenticate_chmods_0600(self) -> None:
+        from unittest.mock import patch
+        from agents_relay.acp import _acp_env, serve_acp
+        from agents_relay.config import RelayConfig
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                "AGENTS_HOST_DIR": tmp,
+                "OPENAI_API_KEY": "oak",
+                "LLM_API_KEY": "lak",
+                "RELAY_SECRET": "rsec",
+                "AGENTS_ACP_API_KEY": "acpsec",
+                "GITHUB_TOKEN": "ght",
+                "PATH": os.environ.get("PATH", ""),
+            }
+            with patch.dict(os.environ, env, clear=True):
+                child = _acp_env(tmp)
+            self.assertIsNotNone(child)
+            assert child is not None
+            for secret in (
+                "OPENAI_API_KEY",
+                "LLM_API_KEY",
+                "RELAY_SECRET",
+                "AGENTS_ACP_API_KEY",
+                "GITHUB_TOKEN",
+            ):
+                self.assertNotIn(secret, child)
+
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            req = json.dumps({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "authenticate",
+                "params": {"methodId": "llm_api_key", "meta": {"api_key": "k-secret"}},
+            })
+            out = io.StringIO()
+            chmod_calls: list[tuple[str, int]] = []
+            with patch.dict(os.environ, {"AGENTS_HOST_DIR": tmp, "AGENTS_RELAY_DIR": tmp}, clear=False):
+                with patch("sys.stdin", io.StringIO(req + "\n")), \
+                     patch("sys.stdout", out), \
+                     patch("agents_relay.state._is_posix", return_value=True), \
+                     patch("agents_relay.state.os.open", wraps=os.open), \
+                     patch("agents_relay.state.os.chmod", side_effect=lambda p, m: chmod_calls.append((str(p), m))), \
+                     patch("agents_relay.acp.os.chmod", side_effect=lambda p, m: chmod_calls.append((str(p), m))):
+                    rc = serve_acp(RelayConfig.from_env())
+            self.assertEqual(rc, 0)
+            saved = json.loads((Path(tmp) / "secrets.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved["LLM_API_KEY"], "k-secret")
+            self.assertTrue(any(m == 0o600 for _, m in chmod_calls))
 
 
 class TestAcpProviderWiring(unittest.TestCase):
@@ -299,8 +365,8 @@ class TestAcpProviderWiring(unittest.TestCase):
             acp.ensure_acp_manifest()
             fake = {"model": "swe-2-high", "models": ["a", "b"],
                     "mode": "accept-edits", "modes": []}
-            os.environ["AGENTS_RELAY_DIR"] = tmp
             self._env_save("AGENTS_RELAY_DIR")
+            os.environ["AGENTS_RELAY_DIR"] = tmp
             with patch.object(acp, "acp_agent_info", return_value=fake):
                 rows = acp.acp_provider_rows(RelayConfig.from_env())
             self.assertEqual(len(rows), 1)

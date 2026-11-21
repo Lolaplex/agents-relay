@@ -59,11 +59,31 @@ def read_json(path: Path) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def write_json_atomic(path: Path, payload: dict) -> None:
+def _is_posix() -> bool:
+    return os.name != "nt"
+
+
+def write_json_atomic(path: Path, payload: dict, *, mode: int | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    raw = json.dumps(payload, ensure_ascii=False)
+    if mode is not None and _is_posix():
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(raw)
+        except BaseException:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
+        os.chmod(tmp, mode)
+    else:
+        tmp.write_text(raw, encoding="utf-8")
     os.replace(tmp, path)
+    if mode is not None and _is_posix():
+        os.chmod(path, mode)
 
 
 @contextmanager

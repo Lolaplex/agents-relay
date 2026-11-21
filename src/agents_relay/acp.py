@@ -426,7 +426,9 @@ def serve_acp(config: RelayConfig) -> int:
                 secrets_path = Host.from_env().secrets
                 data = read_json(secrets_path) or {}
                 data["LLM_API_KEY"] = key
-                write_json_atomic(secrets_path, data)
+                write_json_atomic(secrets_path, data, mode=0o600)
+                if os.name != "nt":
+                    os.chmod(secrets_path, 0o600)
                 writer.respond(req_id, {})
             except Exception as exc:
                 writer.respond_error(
@@ -534,10 +536,50 @@ def serve_acp(config: RelayConfig) -> int:
 # acp client — drive a foreign ACP agent, present a runner.loop-shaped CLI
 
 
+def _acp_env(workdir: str = "") -> dict[str, str] | None:
+    """Construct child env for foreign ACP agent subprocesses with role='acp'."""
+    try:
+        from agents_workspace import Workspace
+
+        ws = Workspace.from_env()
+        return (
+            ws.env(workdir=workdir, role="acp")
+            if workdir.strip()
+            else ws.env(role="acp")
+        )
+    except Exception:
+        pass
+    try:
+        from agents_workspace.workspace import (
+            INFRA_SECRET_KEYS,
+            LLM_SECRET_KEYS,
+            _ACP_STRIP_PREFIXES,
+            _TOOL_ONLY_STRIP_KEYS,
+        )
+    except ImportError:
+        return None
+    out = dict(os.environ)
+    for key in list(out):
+        if (
+            key in INFRA_SECRET_KEYS
+            or key == "AGENTS_SYNC_TOKEN"
+            or key in LLM_SECRET_KEYS
+            or key in _TOOL_ONLY_STRIP_KEYS
+            or any(key.startswith(p) for p in _ACP_STRIP_PREFIXES)
+        ):
+            out.pop(key, None)
+    return out
+
+
 class _AgentConn:
     """Spawn an ACP agent child; send requests, consume responses/updates."""
 
-    def __init__(self, argv: list[str], cwd: str | None = None) -> None:
+    def __init__(
+        self,
+        argv: list[str],
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+    ) -> None:
         self.proc = subprocess.Popen(
             argv,
             stdin=subprocess.PIPE,
@@ -548,6 +590,7 @@ class _AgentConn:
             errors="replace",
             bufsize=1,
             cwd=cwd,
+            env=env,
         )
         assert self.proc.stdin is not None and self.proc.stdout is not None
         self.writer = _Writer(self.proc.stdin)
@@ -616,9 +659,12 @@ class _AgentConn:
             pass
 
 
-def _acp_sessions_dir(config: RelayConfig) -> Path:
-    base = Path(config.state_dir or ".")
-    path = base / "acp_sessions"
+def _acp_sessions_dir(config: RelayConfig | None = None) -> Path:
+    """Store ACP session id mappings under host cache (<host>/cache/acp_sessions)."""
+    del config
+    from agents_workspace import Host
+
+    path = Host.from_env().cache / "acp_sessions"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -652,7 +698,7 @@ def acp_provider_name() -> str:
 def probe_acp_agent(agent_argv: list[str], timeout: float = 20) -> dict[str, Any]:
     """Spawn the agent briefly; collect its model/mode config options."""
     out: dict[str, Any] = {"model": "", "models": [], "mode": "", "modes": []}
-    conn = _AgentConn(agent_argv)
+    conn = _AgentConn(agent_argv, env=_acp_env())
     try:
         conn.request(
             "initialize",
@@ -792,7 +838,7 @@ def run_acp_turn(
     key = session or f"ses_acp_{uuid.uuid4().hex[:12]}"
     state_path = state_dir / f"{key}.json"
     stored = read_json(state_path) or {}
-    conn = _AgentConn(agent_argv, cwd=workdir or None)
+    conn = _AgentConn(agent_argv, cwd=workdir or None, env=_acp_env(workdir=workdir))
     try:
         init = conn.request(
             "initialize",

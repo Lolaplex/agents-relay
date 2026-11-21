@@ -701,6 +701,62 @@ class StateDirTests(unittest.TestCase):
         self.assertTrue(out.is_dir())
         self.assertTrue(any("agents-workspace migrate" in str(w.message) for w in seen))
 
+    def test_turn_env_scoped_by_role_and_provider_key(self):
+        from agents_workspace import Host
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host_dir = Path(tmp) / "host"
+            prov_dir = host_dir / "providers"
+            prov_dir.mkdir(parents=True)
+            (prov_dir / "custom.openai.json").write_text(
+                json.dumps({
+                    "name": "custom.openai",
+                    "kind": "openai_compat",
+                    "url": "https://api.example/v1",
+                    "model": "gpt-test",
+                    "key_env": "OPENAI_API_KEY",
+                    "verb": "chat.completions",
+                    "cadence": "on_request",
+                    "rests_on": "custom openai provider",
+                }),
+                encoding="utf-8",
+            )
+            env_patch = {
+                "AGENTS_HOST_DIR": str(host_dir),
+                "RELAY_SECRET": "rsec",
+                "RELAY_WEB_TOKEN": "wtok",
+                "WEBHOOK_SECRET": "wsec",
+                "TELEGRAM_BOT_TOKEN": "ttok",
+                "AGENTS_SYNC_TOKEN": "stok",
+                "OPENAI_API_KEY": "oak",
+                "ANTHROPIC_API_KEY": "aak",
+                "LLM_API_KEY": "lak",
+            }
+            with patch.dict(os.environ, env_patch, clear=False):
+                Host.from_env().create("demo")
+                Host.from_env().create("cws", isolation="container")
+                turn_env = workspace_env("demo", provider="custom.openai")
+                self.assertIsNotNone(turn_env)
+                assert turn_env is not None
+                self.assertNotIn("RELAY_SECRET", turn_env)
+                self.assertNotIn("RELAY_WEB_TOKEN", turn_env)
+                self.assertNotIn("WEBHOOK_SECRET", turn_env)
+                self.assertNotIn("TELEGRAM_BOT_TOKEN", turn_env)
+                self.assertNotIn("AGENTS_SYNC_TOKEN", turn_env)
+                self.assertEqual(turn_env["OPENAI_API_KEY"], "oak")
+                self.assertNotIn("ANTHROPIC_API_KEY", turn_env)
+                self.assertNotIn("LLM_API_KEY", turn_env)
+
+                tg_env = workspace_env("demo", provider="custom.openai", approver="telegram")
+                assert tg_env is not None
+                self.assertEqual(tg_env.get("TELEGRAM_BOT_TOKEN"), "ttok")
+
+                c_env = workspace_env("cws", provider="openai.default")
+                assert c_env is not None
+                self.assertEqual(c_env["LLM_API_KEY"], "lak")
+                self.assertNotIn("OPENAI_API_KEY", c_env)
+                self.assertNotIn("RELAY_SECRET", c_env)
+
     def test_explicit_config_state_dir_wins(self) -> None:
         from agents_relay.state import resolve_state_dir
 

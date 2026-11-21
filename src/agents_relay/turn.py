@@ -12,9 +12,9 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
-from .config import GatewayConfig
+from .config import RelayConfig
 
 LOOP_TRAILER_MARKER = "---agents-loop-trailer---"
 _STREAM_READ = 4096
@@ -128,7 +128,9 @@ def turn_params_from_body(body: dict[str, Any]) -> TurnParams:
     )
 
 
-def build_loop_argv(params: TurnParams, config: GatewayConfig) -> list[str]:
+def _resolve_provider_and_model(
+    params: TurnParams, config: RelayConfig
+) -> tuple[str, str]:
     provider = params.provider.strip()
     model = params.model.strip()
     if params.workspace and (not provider or not model):
@@ -141,7 +143,61 @@ def build_loop_argv(params: TurnParams, config: GatewayConfig) -> list[str]:
             model = model or str(pick.get("model") or "")
         except Exception:
             pass
-    provider = provider or config.loop_provider
+    return provider or config.loop_provider, model
+
+
+def _provider_from_argv(argv: list[str] | tuple[str, ...]) -> str:
+    items = list(argv)
+    for idx, item in enumerate(items):
+        if item == "--provider" and idx + 1 < len(items):
+            return str(items[idx + 1]).strip()
+        if item.startswith("--provider="):
+            return item.split("=", 1)[1].strip()
+    return ""
+
+
+def _provider_key_env(provider: str, ws: "Workspace | None" = None) -> str:
+    """Resolve the active provider's API key env var from its manifest."""
+    name = (provider or "").strip()
+    if not name and ws is not None:
+        try:
+            from runner.model import selected
+
+            name = str(selected(ws).get("provider") or "").strip()
+        except Exception:
+            pass
+    if not name:
+        name = os.environ.get("LOOP_PROVIDER", "").strip()
+    if not name:
+        return ""
+    try:
+        from runner.providers import find_provider
+
+        manifest = find_provider(name)
+    except Exception:
+        manifest = None
+    if not isinstance(manifest, dict):
+        try:
+            from agents_workspace import Host
+
+            candidate = Host.from_env().dir / "providers" / f"{name}.json"
+            if candidate.is_file():
+                raw = json.loads(candidate.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    manifest = raw
+        except Exception:
+            manifest = None
+    if isinstance(manifest, dict):
+        key_env = str(manifest.get("key_env") or "").strip()
+        if key_env:
+            return key_env
+        if manifest.get("kind", "openai_compat") == "openai_compat":
+            return "LLM_API_KEY"
+    return ""
+
+
+def build_loop_argv(params: TurnParams, config: RelayConfig) -> list[str]:
+    provider, model = _resolve_provider_and_model(params, config)
     argv = list(config.loop_cmd)
     if provider.startswith("acp."):
         # Foreign ACP agent drives the turn; model maps to a config option.
@@ -179,7 +235,7 @@ def build_loop_argv(params: TurnParams, config: GatewayConfig) -> list[str]:
     return argv
 
 
-def prepare_loop(params: TurnParams, config: GatewayConfig) -> tuple[TurnParams, list[str], dict[str, str]]:
+def prepare_loop(params: TurnParams, config: RelayConfig) -> tuple[TurnParams, list[str], dict[str, str]]:
     """Mirror attachments into the workdir and decide the vision notice.
 
     The returned env is merged into the child before container path rewrite.
@@ -245,7 +301,10 @@ def _container_rewrite(
     when isolation=container so callers can dispatch via runtime.spawn/run.
     Without docker + container isolation the runtime raises (loud, no
     silent local fallback)."""
-    env = _merge_extra_env(workspace_env(workspace, workdir), extra_env)
+    provider = _provider_from_argv(argv)
+    env = _merge_extra_env(
+        workspace_env(workspace, workdir, provider=provider), extra_env
+    )
     if not workspace:
         return argv, env, None
     try:
@@ -283,7 +342,13 @@ def resolve_workspace_id(ref: str) -> "Workspace":
     return host.workspace(needle)
 
 
-def workspace_env(ref: str, workdir: str = "") -> dict[str, str] | None:
+def workspace_env(
+    ref: str,
+    workdir: str = "",
+    *,
+    provider: str = "",
+    approver: str = "",
+) -> dict[str, str] | None:
     """Env for a turn that must run inside a named workspace.
 
     Empty ref means the process default, so the subprocess inherits the env.
@@ -293,7 +358,26 @@ def workspace_env(ref: str, workdir: str = "") -> dict[str, str] | None:
     if not needle:
         return None
     ws = resolve_workspace_id(needle)
-    return ws.env(workdir=workdir) if workdir.strip() else ws.env()
+    try:
+        from agents_workspace.runtime import isolation_of
+
+        isolation = isolation_of(ws)
+    except ImportError:
+        isolation = "container" if (ws.isolation or "").strip().lower() == "container" else "local"
+    role = "container" if isolation == "container" else "turn"
+    key_env = _provider_key_env(provider, ws)
+    extra_allow: tuple[str, ...] = ()
+    # Wave 1.2 moves approvals to host; keep TELEGRAM_BOT_TOKEN only if approver == "telegram".
+    if approver == "telegram":
+        extra_allow = ("TELEGRAM_BOT_TOKEN",)
+    kwargs: dict[str, Any] = {
+        "role": role,
+        "provider_key_env": key_env,
+        "extra_allow": extra_allow,
+    }
+    if workdir.strip():
+        kwargs["workdir"] = workdir
+    return ws.env(**kwargs)
 
 
 def run_loop_turn(
@@ -301,7 +385,7 @@ def run_loop_turn(
     channel: str,
     user: str,
     message: str,
-    config: GatewayConfig | None = None,
+    config: RelayConfig | None = None,
     session: str = "",
     user_id: str = "",
     new_session: bool = False,
@@ -329,7 +413,7 @@ def run_loop_turn(
         workdir=workdir,
         deliver="buffered",
     )
-    cfg = config or GatewayConfig.from_env()
+    cfg = config or RelayConfig.from_env()
     params, notes, extra = prepare_loop(params, cfg)
     if interrupt_file:
         extra = dict(extra or {})
@@ -417,11 +501,11 @@ def _finish_stream(
 
 def iter_loop_stream(
     params: TurnParams,
-    config: GatewayConfig | None = None,
+    config: RelayConfig | None = None,
     timeout_sec: int = 600,
 ) -> Iterator[StreamEvent]:
     """Yield SSE-shaped events from runner.loop --deliver stream."""
-    cfg = config or GatewayConfig.from_env()
+    cfg = config or RelayConfig.from_env()
     params, notes, extra = prepare_loop(params, cfg)
     stream_params = replace(params, deliver="stream")
     argv = build_loop_argv(stream_params, cfg)
@@ -489,7 +573,7 @@ def _parse_trailer(trailer_part: str) -> dict[str, Any]:
 
 def iter_loop_stream_live(
     params: TurnParams,
-    config: GatewayConfig | None = None,
+    config: RelayConfig | None = None,
     *,
     timeout_sec: int = 900,
     cancel: threading.Event | None = None,
@@ -509,7 +593,7 @@ def iter_loop_stream_live(
         timeout_sec = int(os.environ.get("AGENTS_RELAY_TURN_TIMEOUT", "") or timeout_sec)
     except ValueError:
         pass
-    cfg = config or GatewayConfig.from_env()
+    cfg = config or RelayConfig.from_env()
     params, notes, extra = prepare_loop(params, cfg)
     argv = build_loop_argv(replace(params, deliver="stream"), cfg)
     proc, _ws = _spawn_stream(argv, env=None, workspace=params.workspace, workdir=params.workdir, extra=extra)

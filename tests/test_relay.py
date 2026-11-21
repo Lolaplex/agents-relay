@@ -923,9 +923,12 @@ class TestInject(unittest.TestCase):
 
 class TestWebhook(unittest.TestCase):
     def test_webhook_auth(self):
+        import hashlib, hmac
         cfg = _test_config()
         bad = handle_webhook("ci", {"status": "failed"}, raw_body=b"{}", secret_header="nope", config=cfg, notify_turn=False)
         self.assertFalse(bad["ok"])
+        missing_hdr = handle_webhook("ci", {"status": "failed"}, raw_body=b"{}", secret_header="", config=cfg, notify_turn=False)
+        self.assertFalse(missing_hdr["ok"])
         good = handle_webhook(
             "ci",
             {"repo": "agents-harness", "status": "failed"},
@@ -936,6 +939,19 @@ class TestWebhook(unittest.TestCase):
         )
         self.assertTrue(good["ok"])
         self.assertIn("CI alert", good["alert"])
+        sig = hmac.new(b"whsec", b"{}", hashlib.sha256).hexdigest()
+        signed = handle_webhook(
+            "ci", {"status": "failed"}, raw_body=b"{}", secret_header=f"sha256={sig}", config=cfg, notify_turn=False
+        )
+        self.assertTrue(signed["ok"])
+
+    def test_webhook_fails_closed_when_secret_unset(self):
+        for empty in ("", "   "):
+            cfg = _test_config(webhook_secret=empty)
+            res = handle_webhook("ci", {"status": "failed"}, raw_body=b"{}", secret_header="", config=cfg, notify_turn=False)
+            self.assertEqual(res, {"ok": False, "error": "unauthorized"})
+            res2 = handle_webhook("ci", {"status": "failed"}, raw_body=b"{}", secret_header="anything", config=cfg, notify_turn=False)
+            self.assertEqual(res2, {"ok": False, "error": "unauthorized"})
 
 
 class TestStream(unittest.TestCase):
