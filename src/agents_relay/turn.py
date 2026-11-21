@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Iterable, Iterator
 
@@ -348,12 +349,15 @@ def workspace_env(
     *,
     provider: str = "",
     approver: str = "",
+    extra_allow: Iterable[str] = (),
 ) -> dict[str, str] | None:
     """Env for a turn that must run inside a named workspace.
 
     Empty ref means the process default, so the subprocess inherits the env.
     ``workdir`` sets the session cwd (``AGENTS_WORKDIR``) for that child only.
+    Passes ``AGENTS_APPROVAL_TOKEN`` and ``AGENTS_RELAY_URL`` via ``extra_allow``.
     """
+    del approver
     needle = (ref or "").strip()
     if not needle:
         return None
@@ -366,18 +370,59 @@ def workspace_env(
         isolation = "container" if (ws.isolation or "").strip().lower() == "container" else "local"
     role = "container" if isolation == "container" else "turn"
     key_env = _provider_key_env(provider, ws)
-    extra_allow: tuple[str, ...] = ()
-    # Wave 1.2 moves approvals to host; keep TELEGRAM_BOT_TOKEN only if approver == "telegram".
-    if approver == "telegram":
-        extra_allow = ("TELEGRAM_BOT_TOKEN",)
+    allow: list[str] = ["AGENTS_APPROVAL_TOKEN", "AGENTS_RELAY_URL"]
+    for item in extra_allow:
+        key = str(item).strip()
+        if key and key not in allow:
+            allow.append(key)
     kwargs: dict[str, Any] = {
         "role": role,
         "provider_key_env": key_env,
-        "extra_allow": extra_allow,
+        "extra_allow": tuple(allow),
     }
     if workdir.strip():
         kwargs["workdir"] = workdir
     return ws.env(**kwargs)
+
+
+def _resolve_relay_url(config: RelayConfig | None = None) -> str:
+    raw = os.environ.get("AGENTS_RELAY_URL", "").strip()
+    if raw:
+        return raw.rstrip("/")
+    if config is not None:
+        cfg_url = str(getattr(config, "relay_url", "") or "").strip()
+        if cfg_url:
+            return cfg_url.rstrip("/")
+    return ""
+
+
+@contextmanager
+def turn_approval_env(
+    workspace: str = "",
+    *,
+    config: RelayConfig | None = None,
+    ttl_sec: float = 3600.0,
+) -> Iterator[dict[str, str]]:
+    """Mint an ephemeral per-turn AGENTS_APPROVAL_TOKEN and revoke it on exit."""
+    from .approvals import mint_approval_token, revoke_approval_token
+
+    ws_id = ""
+    if (workspace or "").strip():
+        try:
+            ws_id = resolve_workspace_id(workspace).id
+        except Exception:
+            ws_id = workspace.strip()
+    else:
+        ws_id = os.environ.get("AGENTS_WORKSPACE", "").strip()
+    token, token_hash = mint_approval_token(ws_id, ttl_sec=ttl_sec)
+    extra: dict[str, str] = {"AGENTS_APPROVAL_TOKEN": token}
+    relay_url = _resolve_relay_url(config)
+    if relay_url:
+        extra["AGENTS_RELAY_URL"] = relay_url
+    try:
+        yield extra
+    finally:
+        revoke_approval_token(token_hash, is_hash=True)
 
 
 def run_loop_turn(
@@ -415,24 +460,27 @@ def run_loop_turn(
     )
     cfg = config or RelayConfig.from_env()
     params, notes, extra = prepare_loop(params, cfg)
+    extra = dict(extra or {})
     if interrupt_file:
-        extra = dict(extra or {})
         extra["AGENTS_INTERRUPT_FILE"] = interrupt_file
     argv = build_loop_argv(params, cfg)
-    argv, env, ws = _container_rewrite(argv, params.workspace, params.workdir, extra)
-    if ws is not None:
-        from agents_workspace.runtime import run as ws_run
+    ttl_sec = max(float(timeout_sec or 0), 300.0) + 60.0 if timeout_sec and timeout_sec > 0 else 3600.0
+    with turn_approval_env(params.workspace, config=cfg, ttl_sec=ttl_sec) as approval_extra:
+        extra.update(approval_extra)
+        argv, env, ws = _container_rewrite(argv, params.workspace, params.workdir, extra)
+        if ws is not None:
+            from agents_workspace.runtime import run as ws_run
 
-        proc = ws_run(ws, argv, env, capture=True, timeout=timeout_sec)
-    else:
-        proc = subprocess.run(
-            argv,
-            capture_output=True,
-            encoding="utf-8", errors="replace",
-            timeout=timeout_sec,
-            shell=False,
-            env=env,
-        )
+            proc = ws_run(ws, argv, env, capture=True, timeout=timeout_sec)
+        else:
+            proc = subprocess.run(
+                argv,
+                capture_output=True,
+                encoding="utf-8", errors="replace",
+                timeout=timeout_sec,
+                shell=False,
+                env=env,
+            )
     parsed = parse_loop_stdout(proc.stdout or "")
     from .attachments import apply_notes
 
@@ -509,43 +557,48 @@ def iter_loop_stream(
     params, notes, extra = prepare_loop(params, cfg)
     stream_params = replace(params, deliver="stream")
     argv = build_loop_argv(stream_params, cfg)
-    proc, _ws = _spawn_stream(argv, env=None, workspace=params.workspace, workdir=params.workdir, extra=extra)
-    assert proc.stdout is not None
-    read = _pipe_reader(proc.stdout)
-    dec = _utf8_decoder()
-    marker = LOOP_TRAILER_MARKER
-    pending = ""
-    emitted = 0
-    try:
-        while True:
-            block = read()
-            if block:
-                pending += _decode(dec, block)
-            else:
-                pending += dec.decode(b"", final=True)
-                break
-            if marker in pending:
-                body, _, trailer_part = pending.partition(marker)
-                meta = _parse_trailer(trailer_part) or None
-                if meta is None and proc.poll() is None:
-                    continue
-                tail = body[emitted:]
-                if tail:
-                    yield StreamEvent(type="delta", text=tail)
-                emitted = len(body)
-                rc = int(proc.wait(timeout=timeout_sec))
-                yield from _finish_stream(pending, emitted, notes, meta, rc)
-                return
-            safe = len(pending) - len(marker)
-            if safe > emitted:
-                piece = pending[emitted:safe]
-                emitted = safe
-                yield StreamEvent(type="delta", text=piece)
-        rc = int(proc.wait(timeout=timeout_sec))
-        yield from _finish_stream(pending, emitted, notes, None, rc)
-    finally:
-        if proc.poll() is None:
-            proc.kill()
+    ttl_sec = max(float(timeout_sec or 0), 300.0) + 60.0 if timeout_sec and timeout_sec > 0 else 3600.0
+    with turn_approval_env(params.workspace, config=cfg, ttl_sec=ttl_sec) as approval_extra:
+        merged_extra = {**dict(extra or {}), **approval_extra}
+        proc, _ws = _spawn_stream(
+            argv, env=None, workspace=params.workspace, workdir=params.workdir, extra=merged_extra
+        )
+        assert proc.stdout is not None
+        read = _pipe_reader(proc.stdout)
+        dec = _utf8_decoder()
+        marker = LOOP_TRAILER_MARKER
+        pending = ""
+        emitted = 0
+        try:
+            while True:
+                block = read()
+                if block:
+                    pending += _decode(dec, block)
+                else:
+                    pending += dec.decode(b"", final=True)
+                    break
+                if marker in pending:
+                    body, _, trailer_part = pending.partition(marker)
+                    meta = _parse_trailer(trailer_part) or None
+                    if meta is None and proc.poll() is None:
+                        continue
+                    tail = body[emitted:]
+                    if tail:
+                        yield StreamEvent(type="delta", text=tail)
+                    emitted = len(body)
+                    rc = int(proc.wait(timeout=timeout_sec))
+                    yield from _finish_stream(pending, emitted, notes, meta, rc)
+                    return
+                safe = len(pending) - len(marker)
+                if safe > emitted:
+                    piece = pending[emitted:safe]
+                    emitted = safe
+                    yield StreamEvent(type="delta", text=piece)
+            rc = int(proc.wait(timeout=timeout_sec))
+            yield from _finish_stream(pending, emitted, notes, None, rc)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
 
 
 def _note_deltas(notes: list[str], body: str) -> Iterator[StreamEvent]:
@@ -596,141 +649,146 @@ def iter_loop_stream_live(
     cfg = config or RelayConfig.from_env()
     params, notes, extra = prepare_loop(params, cfg)
     argv = build_loop_argv(replace(params, deliver="stream"), cfg)
-    proc, _ws = _spawn_stream(argv, env=None, workspace=params.workspace, workdir=params.workdir, extra=extra)
-    if on_pid is not None and proc.pid:
-        try:
-            on_pid(int(proc.pid))
-        except Exception:
-            pass
-
-    events: "queue.Queue[tuple[str, str]]" = queue.Queue()
-
-    def _pump(stream, tag: str) -> None:
-        """OS-chunk pipe reads + incremental UTF-8 decode.
-
-        stdout events are chunk deltas (the consumer batches them); stderr
-        events are complete lines, so a partial last line stays buffered.
-        """
-        try:
-            if stream is None:
-                return
-            read = _pipe_reader(stream)
-            dec = _utf8_decoder()
-            buf = ""
-            while True:
-                try:
-                    block = read()
-                except OSError:
-                    break
-                if not block:
-                    break
-                text = _decode(dec, block)
-                if tag == "err":
-                    buf += text
-                    while "\n" in buf:
-                        line, buf = buf.split("\n", 1)
-                        events.put((tag, line + "\n"))
-                else:
-                    events.put((tag, text))
-            buf += dec.decode(b"", final=True)
-            if buf:
-                events.put((tag, buf))
-        except Exception:
-            pass
-        finally:
-            events.put((tag + "-eof", ""))
-
-    threading.Thread(target=_pump, args=(proc.stdout, "out"), daemon=True).start()
-    threading.Thread(target=_pump, args=(proc.stderr, "err"), daemon=True).start()
-
-    marker = LOOP_TRAILER_MARKER
-    pending = ""
-    emitted = 0
-    out_eof = False
-    err_eof = False
-    deadline = time.monotonic() + max(1, int(timeout_sec))
-    outbuf = ""
-    last_emit = time.monotonic()
-
-    def _kill() -> None:
-        from .jobs import kill_process_tree
-
-        if proc.poll() is None:
-            kill_process_tree(proc.pid)
-
-    try:
-        while True:
-            if cancel is not None and cancel.is_set():
-                _kill()
-                return
-            if time.monotonic() > deadline:
-                _kill()
-                from .attachments import apply_notes
-
-                yield StreamEvent(type="error", text=apply_notes("Turn timed out.", notes))
-                return
+    ttl_sec = max(float(timeout_sec or 0), 300.0) + 60.0 if timeout_sec and timeout_sec > 0 else 3600.0
+    with turn_approval_env(params.workspace, config=cfg, ttl_sec=ttl_sec) as approval_extra:
+        merged_extra = {**dict(extra or {}), **approval_extra}
+        proc, _ws = _spawn_stream(
+            argv, env=None, workspace=params.workspace, workdir=params.workdir, extra=merged_extra
+        )
+        if on_pid is not None and proc.pid:
             try:
-                tag, data = events.get(timeout=_BATCH_WAIT)
-            except queue.Empty:
-                # >=30ms since the last event: flush the delta batch, keep the
-                # connection alive during silent tool phases, or end on EOF.
-                if outbuf:
-                    piece, outbuf = outbuf, ""
-                    last_emit = time.monotonic()
-                    yield StreamEvent(type="delta", text=piece)
-                elif time.monotonic() - last_emit > _KEEPALIVE_SEC and not (out_eof and err_eof):
-                    last_emit = time.monotonic()
-                    yield StreamEvent(type="keepalive")
-                if out_eof and err_eof:
-                    break
-                continue
+                on_pid(int(proc.pid))
+            except Exception:
+                pass
 
-            if tag == "err":
-                if outbuf:
-                    piece, outbuf = outbuf, ""
-                    yield StreamEvent(type="delta", text=piece)
-                line = data.strip()
-                if line:
-                    last_emit = time.monotonic()
-                    yield StreamEvent(type="status", text=line)
-                continue
-            if tag == "err-eof":
-                err_eof = True
-                continue
-            if tag == "out-eof":
-                out_eof = True
-                if outbuf:
-                    piece, outbuf = outbuf, ""
-                    yield StreamEvent(type="delta", text=piece)
-                continue
+        events: "queue.Queue[tuple[str, str]]" = queue.Queue()
 
-            pending += data
-            if marker in pending:
-                if not out_eof and proc.poll() is None:
+        def _pump(stream, tag: str) -> None:
+            """OS-chunk pipe reads + incremental UTF-8 decode.
+
+            stdout events are chunk deltas (the consumer batches them); stderr
+            events are complete lines, so a partial last line stays buffered.
+            """
+            try:
+                if stream is None:
+                    return
+                read = _pipe_reader(stream)
+                dec = _utf8_decoder()
+                buf = ""
+                while True:
+                    try:
+                        block = read()
+                    except OSError:
+                        break
+                    if not block:
+                        break
+                    text = _decode(dec, block)
+                    if tag == "err":
+                        buf += text
+                        while "\n" in buf:
+                            line, buf = buf.split("\n", 1)
+                            events.put((tag, line + "\n"))
+                    else:
+                        events.put((tag, text))
+                buf += dec.decode(b"", final=True)
+                if buf:
+                    events.put((tag, buf))
+            except Exception:
+                pass
+            finally:
+                events.put((tag + "-eof", ""))
+
+        threading.Thread(target=_pump, args=(proc.stdout, "out"), daemon=True).start()
+        threading.Thread(target=_pump, args=(proc.stderr, "err"), daemon=True).start()
+
+        marker = LOOP_TRAILER_MARKER
+        pending = ""
+        emitted = 0
+        out_eof = False
+        err_eof = False
+        deadline = time.monotonic() + max(1, int(timeout_sec))
+        outbuf = ""
+        last_emit = time.monotonic()
+
+        def _kill() -> None:
+            from .jobs import kill_process_tree
+
+            if proc.poll() is None:
+                kill_process_tree(proc.pid)
+
+        try:
+            while True:
+                if cancel is not None and cancel.is_set():
+                    _kill()
+                    return
+                if time.monotonic() > deadline:
+                    _kill()
+                    from .attachments import apply_notes
+
+                    yield StreamEvent(type="error", text=apply_notes("Turn timed out.", notes))
+                    return
+                try:
+                    tag, data = events.get(timeout=_BATCH_WAIT)
+                except queue.Empty:
+                    # >=30ms since the last event: flush the delta batch, keep the
+                    # connection alive during silent tool phases, or end on EOF.
+                    if outbuf:
+                        piece, outbuf = outbuf, ""
+                        last_emit = time.monotonic()
+                        yield StreamEvent(type="delta", text=piece)
+                    elif time.monotonic() - last_emit > _KEEPALIVE_SEC and not (out_eof and err_eof):
+                        last_emit = time.monotonic()
+                        yield StreamEvent(type="keepalive")
+                    if out_eof and err_eof:
+                        break
                     continue
-                body, _, trailer_part = pending.partition(marker)
-                # emitted already counts the safe region parked in outbuf —
-                # the tail is the batch plus whatever came after it.
-                tail = outbuf + body[emitted:]
-                outbuf = ""
-                if tail:
-                    yield StreamEvent(type="delta", text=tail)
-                emitted = len(body)
-                meta = _parse_trailer(trailer_part)
-                rc = proc.wait(timeout=5) if proc.poll() is None else int(proc.returncode or 0)
-                yield from _finish_stream(pending, emitted, notes, meta, rc)
-                return
-            safe = len(pending) - len(marker)
-            if safe > emitted:
-                outbuf += pending[emitted:safe]
-                emitted = safe
-            if outbuf and (len(outbuf) >= _BATCH_MAX or outbuf.endswith("\n")):
-                piece, outbuf = outbuf, ""
-                last_emit = time.monotonic()
-                yield StreamEvent(type="delta", text=piece)
 
-        rc = proc.wait(timeout=5) if proc.poll() is None else int(proc.returncode or 0)
-        yield from _finish_stream(pending, emitted, notes, None, rc)
-    finally:
-        if proc.poll() is None:
-            _kill()
+                if tag == "err":
+                    if outbuf:
+                        piece, outbuf = outbuf, ""
+                        yield StreamEvent(type="delta", text=piece)
+                    line = data.strip()
+                    if line:
+                        last_emit = time.monotonic()
+                        yield StreamEvent(type="status", text=line)
+                    continue
+                if tag == "err-eof":
+                    err_eof = True
+                    continue
+                if tag == "out-eof":
+                    out_eof = True
+                    if outbuf:
+                        piece, outbuf = outbuf, ""
+                        yield StreamEvent(type="delta", text=piece)
+                    continue
+
+                pending += data
+                if marker in pending:
+                    if not out_eof and proc.poll() is None:
+                        continue
+                    body, _, trailer_part = pending.partition(marker)
+                    # emitted already counts the safe region parked in outbuf —
+                    # the tail is the batch plus whatever came after it.
+                    tail = outbuf + body[emitted:]
+                    outbuf = ""
+                    if tail:
+                        yield StreamEvent(type="delta", text=tail)
+                    emitted = len(body)
+                    meta = _parse_trailer(trailer_part)
+                    rc = proc.wait(timeout=5) if proc.poll() is None else int(proc.returncode or 0)
+                    yield from _finish_stream(pending, emitted, notes, meta, rc)
+                    return
+                safe = len(pending) - len(marker)
+                if safe > emitted:
+                    outbuf += pending[emitted:safe]
+                    emitted = safe
+                if outbuf and (len(outbuf) >= _BATCH_MAX or outbuf.endswith("\n")):
+                    piece, outbuf = outbuf, ""
+                    last_emit = time.monotonic()
+                    yield StreamEvent(type="delta", text=piece)
+
+            rc = proc.wait(timeout=5) if proc.poll() is None else int(proc.returncode or 0)
+            yield from _finish_stream(pending, emitted, notes, None, rc)
+        finally:
+            if proc.poll() is None:
+                _kill()

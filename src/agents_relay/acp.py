@@ -6,7 +6,7 @@ Two roles, one wire:
   spawns this over stdio; ``session/prompt`` drives ``runner.loop`` and
   streams the reply back as ``agent_message_chunk`` updates. Harness tool
   approvals (``AGENTS_APPROVAL_CMD`` writing pending files under
-  ``AGENTS_RELAY_STATE/approvals``) are bridged to
+  ``<host>/run/approvals``) are bridged to
   ``session/request_permission``, so the client's native allow/deny UI
   decides them.
 
@@ -32,7 +32,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Iterator, TextIO
 
-from .approvals import record_decision
+from .approvals import decide_approval
 from .config import RelayConfig
 from .state import approval_dir, read_json, write_json_atomic
 from .turn import TurnParams, iter_loop_stream_live
@@ -381,7 +381,7 @@ def serve_acp(config: RelayConfig) -> int:
             if ident:
                 outcome = (msg.get("result") or {}).get("outcome") or {}
                 selected = str(outcome.get("optionId") or "")
-                record_decision(config, ident, allow=selected != "deny")
+                decide_approval(config, ident, allow=selected != "deny")
             continue
 
         if method == "initialize":

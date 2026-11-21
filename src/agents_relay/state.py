@@ -1,15 +1,16 @@
-"""Relay-local state directory. Lives in the workspace relay domain."""
+"""Relay-local state and host runtime helpers."""
 
 from __future__ import annotations
 
 import json
 import os
+import secrets
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
-from agents_workspace import Workspace
+from agents_workspace import Host, Workspace
 
 from .config import RelayConfig
 
@@ -43,8 +44,60 @@ def resolve_state_dir(config: RelayConfig | None = None) -> Path:
 _legacy_warned = False
 
 
+def legacy_relay_dirs(config: RelayConfig | None = None, *, ws_ref: str = "") -> list[Path]:
+    """Candidate legacy ``<ws>/relay`` (and explicit ``state_dir``) paths for 1-release reads.
+
+    Never resolves ``""`` to CWD and never creates workspaces on disk.
+    """
+    candidates: list[Path] = []
+    try:
+        host = Host.from_env()
+    except Exception:
+        host = None
+
+    if host is not None and ws_ref.strip():
+        try:
+            if host.workspace_exists(ws_ref.strip()):
+                candidates.append(host.workspace(ws_ref.strip()).relay_state)
+        except Exception:
+            pass
+
+    raw_state = str(getattr(config, "state_dir", "") or "").strip() if config is not None else ""
+    if raw_state:
+        candidates.append(Path(raw_state).expanduser())
+
+    if host is not None:
+        env_ws = os.environ.get("AGENTS_WORKSPACE", "").strip()
+        if env_ws:
+            try:
+                if host.workspace_exists(env_ws):
+                    candidates.append(host.workspace(env_ws).relay_state)
+            except Exception:
+                pass
+        if not ws_ref.strip():
+            try:
+                for ws in host.list_workspaces():
+                    candidates.append(ws.relay_state)
+            except Exception:
+                pass
+
+    out: list[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        try:
+            key = str(path.resolve(strict=False))
+        except OSError:
+            key = str(path)
+        if key not in seen:
+            seen.add(key)
+            out.append(path)
+    return out
+
+
 def approval_dir(config: RelayConfig | None = None) -> Path:
-    return resolve_state_dir(config) / "approvals"
+    """Host-owned approval dir ``<host>/run/approvals``."""
+    del config
+    return Host.from_env().run / "approvals"
 
 
 def inbox_dir(config: RelayConfig | None = None) -> Path:
@@ -59,13 +112,33 @@ def read_json(path: Path) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def read_json_any(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 def _is_posix() -> bool:
     return os.name != "nt"
 
 
-def write_json_atomic(path: Path, payload: dict, *, mode: int | None = None) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+def ensure_private_dir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    if _is_posix():
+        try:
+            os.chmod(path, 0o700)
+        except OSError:
+            pass
+    return path
+
+
+def write_json_atomic(path: Path, payload: Any, *, mode: int | None = None) -> None:
+    if mode is not None:
+        ensure_private_dir(path.parent)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
     raw = json.dumps(payload, ensure_ascii=False)
     if mode is not None and _is_posix():
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)

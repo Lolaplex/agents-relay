@@ -12,8 +12,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import warnings
 from pathlib import Path
 from typing import Callable
+
+from agents_workspace import Host
 
 from .approvals import (
     APPROVAL_ID_RE,
@@ -30,7 +33,7 @@ from .attachments import MAX_ATTACHMENT_BYTES, read_capped, safe_filename
 from .config import RelayConfig
 from .jobs import Job, JobRegistry, get_registry
 from .loop_client import LoopTurnResult, run_loop_turn
-from .state import inbox_dir
+from .state import inbox_dir, legacy_relay_dirs, read_json, write_json_atomic
 from .telegram_format import (
     extract_traces,
     format_telegram_html,
@@ -46,18 +49,33 @@ API_BASE = "https://api.telegram.org"
 _CONTROL_COMMANDS = {"jobs", "stop", "persona", "workspace", "model"}
 
 
-def _prefs_path(config: RelayConfig) -> Path:
-    from .state import resolve_state_dir
+def _prefs_path(config: RelayConfig | None = None) -> Path:
+    del config
+    return Host.from_env().clients / "telegram.json"
 
-    return resolve_state_dir(config) / "chat_prefs.json"
+
+def _load_all_prefs(config: RelayConfig | None = None) -> dict:
+    path = _prefs_path(config)
+    if path.is_file():
+        return read_json(path) or {}
+    for legacy_dir in legacy_relay_dirs(config):
+        legacy_path = legacy_dir / "chat_prefs.json"
+        if not legacy_path.is_file():
+            continue
+        data = read_json(legacy_path)
+        if data is not None:
+            warnings.warn(
+                f"legacy chat prefs at {legacy_path} are deprecated; relocate to {path}",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+            return data
+    return {}
 
 
 def _chat_prefs(chat_id: int, config: RelayConfig) -> dict:
-    """Per-chat prefs {ws, persona}. Legacy flat value = persona only."""
-    try:
-        raw = json.loads(_prefs_path(config).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
+    """Per-chat prefs {ws, persona, model}. Legacy flat value = persona only."""
+    raw = _load_all_prefs(config)
     row = raw.get(str(chat_id))
     if isinstance(row, str):
         return {"persona": row}
@@ -66,10 +84,7 @@ def _chat_prefs(chat_id: int, config: RelayConfig) -> dict:
 
 def _set_chat_pref(chat_id: int, key: str, value: str, config: RelayConfig) -> None:
     path = _prefs_path(config)
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        data = {}
+    data = dict(_load_all_prefs(config))
     row = data.get(str(chat_id))
     if not isinstance(row, dict):
         row = {"persona": row} if isinstance(row, str) else {}
@@ -80,9 +95,7 @@ def _set_chat_pref(chat_id: int, key: str, value: str, config: RelayConfig) -> N
         row.pop(key, None)
     if not row:
         data.pop(str(chat_id), None)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=1, sort_keys=True) + "\n",
-                    encoding="utf-8")
+    write_json_atomic(path, data)
 
 
 def _chat_persona(chat_id: int, config: RelayConfig) -> str:

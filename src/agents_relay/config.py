@@ -95,6 +95,7 @@ class RelayConfig:
     tts: bool = False
     tts_voice: str = ""
     tts_model: str = ""
+    relay_url: str = ""
 
     @classmethod
     def from_env(cls) -> "RelayConfig":
@@ -140,6 +141,7 @@ class RelayConfig:
             tts=_flag(os.environ.get("AGENTS_RELAY_TTS", "")),
             tts_voice=_clean(os.environ.get("AGENTS_RELAY_TTS_VOICE", "")),
             tts_model=_clean(os.environ.get("AGENTS_RELAY_TTS_MODEL", "")),
+            relay_url=_clean(os.environ.get("AGENTS_RELAY_URL", "")).rstrip("/"),
         )
 
 

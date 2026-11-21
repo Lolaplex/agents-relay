@@ -728,6 +728,8 @@ class StateDirTests(unittest.TestCase):
                 "WEBHOOK_SECRET": "wsec",
                 "TELEGRAM_BOT_TOKEN": "ttok",
                 "AGENTS_SYNC_TOKEN": "stok",
+                "AGENTS_APPROVAL_TOKEN": "atok",
+                "AGENTS_RELAY_URL": "http://127.0.0.1:8787",
                 "OPENAI_API_KEY": "oak",
                 "ANTHROPIC_API_KEY": "aak",
                 "LLM_API_KEY": "lak",
@@ -743,13 +745,17 @@ class StateDirTests(unittest.TestCase):
                 self.assertNotIn("WEBHOOK_SECRET", turn_env)
                 self.assertNotIn("TELEGRAM_BOT_TOKEN", turn_env)
                 self.assertNotIn("AGENTS_SYNC_TOKEN", turn_env)
+                self.assertEqual(turn_env["AGENTS_APPROVAL_TOKEN"], "atok")
+                self.assertEqual(turn_env["AGENTS_RELAY_URL"], "http://127.0.0.1:8787")
                 self.assertEqual(turn_env["OPENAI_API_KEY"], "oak")
                 self.assertNotIn("ANTHROPIC_API_KEY", turn_env)
                 self.assertNotIn("LLM_API_KEY", turn_env)
 
                 tg_env = workspace_env("demo", provider="custom.openai", approver="telegram")
                 assert tg_env is not None
-                self.assertEqual(tg_env.get("TELEGRAM_BOT_TOKEN"), "ttok")
+                self.assertNotIn("TELEGRAM_BOT_TOKEN", tg_env)
+                self.assertEqual(tg_env.get("AGENTS_APPROVAL_TOKEN"), "atok")
+                self.assertEqual(tg_env.get("AGENTS_RELAY_URL"), "http://127.0.0.1:8787")
 
                 c_env = workspace_env("cws", provider="openai.default")
                 assert c_env is not None

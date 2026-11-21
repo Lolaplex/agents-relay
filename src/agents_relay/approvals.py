@@ -1,18 +1,29 @@
-"""Approval files under the relay state dir.
+"""Host-owned approval files and ephemeral turn approval tokens.
 
-`agents-relay approve` writes `$AGENTS_RELAY_DIR/approvals/<id>.json` and
-blocks. Telegram inline buttons and `approve --decide` both call
-`record_decision`. `--local` skips Telegram and waits on that same file.
-No HTTP endpoint.
+Pending and resolved approval records live under ``<host>/run/approvals/<id>.json``
+(mode 0600 on POSIX); active per-turn approval tokens live under
+``<host>/run/approvals/tokens/<token_hash>.json`` (mode 0600 on POSIX).
+
+Inside relay-hosted turns, ``agents-relay approve`` uses ``AGENTS_RELAY_URL`` +
+``AGENTS_APPROVAL_TOKEN`` to drive ``POST /v1/approvals/request`` and
+``GET /v1/approvals/<id>/wait`` over HTTP without holding Telegram or relay
+secrets. When relay HTTP env is unset (e.g. direct ``klanker chat`` or
+``--local``), it falls back cleanly to host-side ``<host>/run/approvals/``.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import html
 import json
 import logging
 import re
+import secrets
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -23,10 +34,87 @@ log = logging.getLogger("agents_relay.approvals")
 
 # UUID is 36 chars. Callback data is `ap:<id>:1` and must stay <= 64 bytes.
 APPROVAL_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+_TOKEN_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _PENDING = "pending"
 _APPROVED = "approved"
 _DENIED = "denied"
 _TIMEOUT = "timeout"
+
+
+def approval_tokens_dir(config: RelayConfig | None = None) -> Path:
+    return approval_dir(config) / "tokens"
+
+
+def hash_approval_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def mint_approval_token(
+    workspace: str = "",
+    *,
+    ttl_sec: float = 3600.0,
+) -> tuple[str, str]:
+    """Mint an ephemeral per-turn approval token and register its hash host-side."""
+    token = secrets.token_urlsafe(32)
+    token_hash = hash_approval_token(token)
+    now = time.time()
+    ttl = max(1.0, float(ttl_sec or 3600.0))
+    payload = {
+        "token_hash": token_hash,
+        "workspace": (workspace or "").strip(),
+        "created_at": now,
+        "expires_at": now + ttl,
+    }
+    write_json_atomic(approval_tokens_dir() / f"{token_hash}.json", payload, mode=0o600)
+    return token, token_hash
+
+
+def revoke_approval_token(token_or_hash: str, *, is_hash: bool = False) -> None:
+    """Invalidate an active turn approval token."""
+    raw = (token_or_hash or "").strip()
+    if not raw:
+        return
+    token_hash = raw if is_hash else hash_approval_token(raw)
+    if not _TOKEN_HASH_RE.fullmatch(token_hash):
+        return
+    try:
+        (approval_tokens_dir() / f"{token_hash}.json").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def verify_approval_token(token: str, *, workspace: str = "") -> dict[str, Any] | None:
+    """Constant-time hash check against registered active turn tokens."""
+    raw = (token or "").strip()
+    if not raw:
+        return None
+    token_hash = hash_approval_token(raw)
+    path = approval_tokens_dir() / f"{token_hash}.json"
+    if not path.is_file():
+        return None
+    rec = read_json(path)
+    if not rec:
+        return None
+    stored_hash = str(rec.get("token_hash") or "").strip()
+    if not stored_hash or not hmac.compare_digest(
+        stored_hash.encode("utf-8"), token_hash.encode("utf-8")
+    ):
+        return None
+    try:
+        expires_at = float(rec.get("expires_at") or 0)
+    except (TypeError, ValueError):
+        expires_at = 0.0
+    if time.time() > expires_at:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+    req_ws = (workspace or "").strip()
+    tok_ws = str(rec.get("workspace") or "").strip()
+    if req_ws and req_ws != tok_ws:
+        return None
+    return rec
 
 
 def approval_path(config: RelayConfig, ident: str) -> Path:
@@ -88,33 +176,45 @@ def _mutate(config: RelayConfig, ident: str, fn) -> dict | None:
         updated = fn(current)
         if updated is None:
             return current or None
-        write_json_atomic(path, updated)
+        write_json_atomic(path, updated, mode=0o600)
         return updated
 
 
-def create_pending(config: RelayConfig, chat_id: int, request: dict) -> dict:
+def create_pending(
+    config: RelayConfig,
+    chat_id: int,
+    request: dict,
+    *,
+    workspace: str = "",
+    token_hash: str = "",
+) -> dict:
     ident = str(request.get("id") or "")
+    eff_ws = (workspace or str(request.get("workspace") or "")).strip()
 
     def _apply(current: dict) -> dict | None:
         status = str(current.get("status") or "")
         if status in (_APPROVED, _DENIED) and current.get("id") == ident:
             return None
-        return {
+        record: dict[str, Any] = {
             "id": ident,
             "status": _PENDING,
             "chat_id": int(chat_id),
+            "workspace": eff_ws,
             "request": request,
             "note": "",
             "decided_by": None,
             "created_at": time.time(),
             "decided_at": None,
         }
+        if token_hash:
+            record["token_hash"] = token_hash
+        return record
 
     updated = _mutate(config, ident, _apply)
     if updated and updated.get("status") == _PENDING:
         from .push import notify_approval_pending
 
-        notify_approval_pending(config, {**request, "id": ident})
+        notify_approval_pending(config, {**request, "id": ident}, ws_ref=eff_ws)
     return updated or {}
 
 
@@ -160,6 +260,27 @@ def read_approval(config: RelayConfig, ident: str) -> dict | None:
     return read_json(approval_path(config, ident))
 
 
+def expire_pending(config: RelayConfig, ident: str, *, note: str = "timeout") -> dict:
+    """Transition a pending approval record to timeout atomically."""
+    path = approval_path(config, ident)
+
+    def _apply(current: dict) -> dict | None:
+        status = str(current.get("status") or "")
+        if status in (_APPROVED, _DENIED):
+            return None
+        if not current:
+            current = {"id": ident, "chat_id": None, "request": {}}
+        current["status"] = _TIMEOUT
+        current["note"] = note
+        current["decided_at"] = time.time()
+        return current
+
+    try:
+        return _mutate(config, ident, _apply) or {}
+    except TimeoutError:
+        return read_json(path) or {}
+
+
 def wait_for_decision(
     config: RelayConfig,
     ident: str,
@@ -180,21 +301,7 @@ def wait_for_decision(
             break
         time.sleep(interval)
 
-    def _apply(current: dict) -> dict | None:
-        status = str(current.get("status") or "")
-        if status in (_APPROVED, _DENIED):
-            return None
-        if not current:
-            current = {"id": ident, "chat_id": None, "request": {}}
-        current["status"] = _TIMEOUT
-        current["note"] = "timeout"
-        current["decided_at"] = time.time()
-        return current
-
-    try:
-        updated = _mutate(config, ident, _apply) or {}
-    except TimeoutError:
-        updated = read_json(path) or {}
+    updated = expire_pending(config, ident)
     status = str(updated.get("status") or _TIMEOUT)
     if status in (_APPROVED, _DENIED):
         return status, str(updated.get("note") or status)
@@ -288,3 +395,91 @@ def decide_approval(config: RelayConfig, ident: str, *, allow: bool) -> tuple[in
     if updated is None:
         return 2, "not pending"
     return 0, status
+
+
+def _http_json(
+    url: str,
+    *,
+    token: str,
+    method: str = "GET",
+    body: dict[str, Any] | None = None,
+    timeout: float = 15.0,
+) -> dict[str, Any]:
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
+    headers = {"Authorization": f"Bearer {token}"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=max(1.0, float(timeout))) as resp:
+        raw = resp.read().decode("utf-8", errors="replace")
+    parsed = json.loads(raw) if raw.strip() else {}
+    if not isinstance(parsed, dict):
+        raise ValueError("invalid relay approval response")
+    return parsed
+
+
+def run_http_approve(
+    relay_url: str,
+    approval_token: str,
+    request: dict,
+    timeout: float,
+    *,
+    user: str = "",
+    workspace: str = "",
+    poll_slice: float = 25.0,
+) -> tuple[int, str]:
+    """Submit an approval via relay HTTP using Bearer AGENTS_APPROVAL_TOKEN and wait."""
+    ident = str(request.get("id") or "").strip()
+    if not APPROVAL_ID_RE.match(ident):
+        return 2, "invalid approval id"
+    base = (relay_url or "").strip().rstrip("/")
+    token = (approval_token or "").strip()
+    if not base or not token:
+        return 2, "relay approval HTTP env not configured"
+    payload = dict(request)
+    if user and not payload.get("user"):
+        payload["user"] = user
+    if workspace and not payload.get("workspace"):
+        payload["workspace"] = workspace
+    try:
+        created = _http_json(
+            f"{base}/v1/approvals/request",
+            token=token,
+            method="POST",
+            body=payload,
+            timeout=15.0,
+        )
+    except urllib.error.HTTPError as exc:
+        return 2, f"approval request rejected ({exc.code})"
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        return 2, f"approval relay unreachable: {exc}"
+
+    status = str(created.get("status") or "")
+    if status in (_APPROVED, _DENIED):
+        return status_exit_code(status), str(created.get("note") or status)
+
+    slice_sec = max(0.05, float(poll_slice or 25.0))
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    wait_url_base = f"{base}/v1/approvals/{urllib.parse.quote(ident, safe='')}/wait"
+    while True:
+        remaining = max(0.0, deadline - time.monotonic())
+        chunk = min(slice_sec, remaining)
+        finalize = "1" if remaining <= slice_sec else "0"
+        qs = urllib.parse.urlencode({"timeout": f"{chunk:.3f}", "finalize": finalize})
+        try:
+            res = _http_json(
+                f"{wait_url_base}?{qs}",
+                token=token,
+                method="GET",
+                timeout=max(5.0, chunk + 10.0),
+            )
+        except urllib.error.HTTPError as exc:
+            return 2, f"approval wait rejected ({exc.code})"
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+            return 2, f"approval relay unreachable: {exc}"
+        status = str(res.get("status") or "")
+        note = str(res.get("note") or status)
+        if status in (_APPROVED, _DENIED, _TIMEOUT):
+            return status_exit_code(status), note or status
+        if time.monotonic() >= deadline:
+            return 2, "timeout"

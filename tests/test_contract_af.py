@@ -220,134 +220,139 @@ class TestApproval(unittest.TestCase):
 
         for decision, expected in (("1", 0), ("0", 1)):
             with tempfile.TemporaryDirectory() as tmp:
-                cfg = _cfg(Path(tmp))
-                request = dict(self._request())
-                if decision == "0":
-                    request["id"] = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-                holder: dict[str, int | str] = {}
+                with patch.dict(os.environ, {"AGENTS_HOST_DIR": tmp}, clear=False):
+                    cfg = _cfg(Path(tmp))
+                    request = dict(self._request())
+                    if decision == "0":
+                        request["id"] = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+                    holder: dict[str, int | str] = {}
 
-                def _run() -> None:
-                    code, note = run_approve(
-                        chat_id=12345,
-                        timeout=5,
-                        request=request,
-                        config=cfg,
-                        poll_interval=0.05,
-                    )
-                    holder["code"] = code
-                    holder["note"] = note
+                    def _run() -> None:
+                        code, note = run_approve(
+                            chat_id=12345,
+                            timeout=5,
+                            request=request,
+                            config=cfg,
+                            poll_interval=0.05,
+                        )
+                        holder["code"] = code
+                        holder["note"] = note
 
-                with patch("agents_relay.telegram_adapter.send_message", return_value={"ok": True}) as sent:
-                    with patch("agents_relay.telegram_adapter._post_json") as posted:
-                        with patch("agents_relay.telegram_adapter.edit_message", return_value={"ok": True}):
-                            thread = threading.Thread(target=_run)
-                            thread.start()
-                            deadline = time.time() + 2
-                            path = Path(tmp) / "approvals" / f"{request['id']}.json"
-                            while time.time() < deadline and not path.is_file():
-                                time.sleep(0.02)
-                            self.assertTrue(path.is_file())
-                            handle_callback_query(
-                                {
-                                    "id": "cb-1",
-                                    "from": {"id": 12345},
-                                    "data": f"ap:{request['id']}:{decision}",
-                                    "message": {"message_id": 9, "chat": {"id": 12345}, "text": "Approval needed"},
-                                },
-                                config=cfg,
-                            )
-                            thread.join(timeout=3)
-                self.assertFalse(thread.is_alive())
-                self.assertEqual(holder["code"], expected)
-                sent.assert_called()
-                markup = sent.call_args.kwargs["reply_markup"]
-                self.assertEqual(markup["inline_keyboard"][0][0]["text"], "Approve")
-                self.assertEqual(markup["inline_keyboard"][0][1]["text"], "Deny")
-                answered = posted.call_args[0][1]["text"]
-                self.assertIn("Approved" if expected == 0 else "Denied", answered)
-                self.assertNotIn(str(tmp), json.dumps(sent.call_args.args) + "secret")
+                    with patch("agents_relay.telegram_adapter.send_message", return_value={"ok": True}) as sent:
+                        with patch("agents_relay.telegram_adapter._post_json") as posted:
+                            with patch("agents_relay.telegram_adapter.edit_message", return_value={"ok": True}):
+                                thread = threading.Thread(target=_run)
+                                thread.start()
+                                deadline = time.time() + 2
+                                path = Path(tmp) / "run" / "approvals" / f"{request['id']}.json"
+                                while time.time() < deadline and not path.is_file():
+                                    time.sleep(0.02)
+                                self.assertTrue(path.is_file())
+                                handle_callback_query(
+                                    {
+                                        "id": "cb-1",
+                                        "from": {"id": 12345},
+                                        "data": f"ap:{request['id']}:{decision}",
+                                        "message": {"message_id": 9, "chat": {"id": 12345}, "text": "Approval needed"},
+                                    },
+                                    config=cfg,
+                                )
+                                thread.join(timeout=3)
+                    self.assertFalse(thread.is_alive())
+                    self.assertEqual(holder["code"], expected)
+                    sent.assert_called()
+                    markup = sent.call_args.kwargs["reply_markup"]
+                    self.assertEqual(markup["inline_keyboard"][0][0]["text"], "Approve")
+                    self.assertEqual(markup["inline_keyboard"][0][1]["text"], "Deny")
+                    answered = posted.call_args[0][1]["text"]
+                    self.assertIn("Approved" if expected == 0 else "Denied", answered)
+                    self.assertNotIn(str(tmp), json.dumps(sent.call_args.args) + "secret")
 
     def test_non_allowlisted_cannot_decide(self):
         from agents_relay.approvals import create_pending, read_approval
         from agents_relay.telegram_adapter import handle_callback_query
 
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = _cfg(Path(tmp))
-            request = self._request()
-            create_pending(cfg, 12345, request)
-            with patch("agents_relay.telegram_adapter._post_json") as posted:
-                handle_callback_query(
-                    {
-                        "id": "cb-2",
-                        "from": {"id": 999},
-                        "data": f"ap:{request['id']}:1",
-                        "message": {"message_id": 3, "chat": {"id": 12345}, "text": "Approval"},
-                    },
-                    config=cfg,
-                )
-            self.assertEqual(read_approval(cfg, request["id"])["status"], "pending")
-            self.assertEqual(posted.call_args[0][1]["text"], "Not allowed")
+            with patch.dict(os.environ, {"AGENTS_HOST_DIR": tmp}, clear=False):
+                cfg = _cfg(Path(tmp))
+                request = self._request()
+                create_pending(cfg, 12345, request)
+                with patch("agents_relay.telegram_adapter._post_json") as posted:
+                    handle_callback_query(
+                        {
+                            "id": "cb-2",
+                            "from": {"id": 999},
+                            "data": f"ap:{request['id']}:1",
+                            "message": {"message_id": 3, "chat": {"id": 12345}, "text": "Approval"},
+                        },
+                        config=cfg,
+                    )
+                self.assertEqual(read_approval(cfg, request["id"])["status"], "pending")
+                self.assertEqual(posted.call_args[0][1]["text"], "Not allowed")
 
     def test_local_file_allow_deny_and_timeout(self):
         from agents_relay.approvals import decide_approval, run_local_approve
 
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = _cfg(Path(tmp), token="")
-            request = self._request()
-            holder: dict[str, int | str] = {}
+            with patch.dict(os.environ, {"AGENTS_HOST_DIR": tmp}, clear=False):
+                cfg = _cfg(Path(tmp), token="")
+                request = self._request()
+                holder: dict[str, int | str] = {}
 
-            def _run() -> None:
+                def _run() -> None:
+                    code, note = run_local_approve(
+                        cfg, request, 5, poll_interval=0.05
+                    )
+                    holder["code"] = code
+                    holder["note"] = note
+
+                thread = threading.Thread(target=_run)
+                thread.start()
+                path = Path(tmp) / "run" / "approvals" / f"{request['id']}.json"
+                deadline = time.time() + 2
+                while time.time() < deadline and not path.is_file():
+                    time.sleep(0.02)
+                self.assertTrue(path.is_file())
+                code, note = decide_approval(cfg, request["id"], allow=True)
+                self.assertEqual((code, note), (0, "approved"))
+                thread.join(timeout=3)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(holder["code"], 0)
+                self.assertEqual(holder["note"], "approved")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"AGENTS_HOST_DIR": tmp}, clear=False):
+                cfg = _cfg(Path(tmp), token="")
+                request = dict(self._request())
+                request["id"] = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+                holder = {}
+
+                def _deny() -> None:
+                    code, note = run_local_approve(cfg, request, 5, poll_interval=0.05)
+                    holder["code"] = code
+                    holder["note"] = note
+
+                thread = threading.Thread(target=_deny)
+                thread.start()
+                path = Path(tmp) / "run" / "approvals" / f"{request['id']}.json"
+                deadline = time.time() + 2
+                while time.time() < deadline and not path.is_file():
+                    time.sleep(0.02)
+                self.assertTrue(path.is_file())
+                self.assertEqual(decide_approval(cfg, request["id"], allow=False), (0, "denied"))
+                thread.join(timeout=3)
+                self.assertEqual(holder["code"], 1)
+                self.assertEqual(holder["note"], "denied")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"AGENTS_HOST_DIR": tmp}, clear=False):
+                cfg = _cfg(Path(tmp), token="")
                 code, note = run_local_approve(
-                    cfg, request, 5, poll_interval=0.05
+                    cfg, self._request(), 0.2, poll_interval=0.05
                 )
-                holder["code"] = code
-                holder["note"] = note
-
-            thread = threading.Thread(target=_run)
-            thread.start()
-            path = Path(tmp) / "approvals" / f"{request['id']}.json"
-            deadline = time.time() + 2
-            while time.time() < deadline and not path.is_file():
-                time.sleep(0.02)
-            self.assertTrue(path.is_file())
-            code, note = decide_approval(cfg, request["id"], allow=True)
-            self.assertEqual((code, note), (0, "approved"))
-            thread.join(timeout=3)
-            self.assertFalse(thread.is_alive())
-            self.assertEqual(holder["code"], 0)
-            self.assertEqual(holder["note"], "approved")
-
-        with tempfile.TemporaryDirectory() as tmp:
-            cfg = _cfg(Path(tmp), token="")
-            request = dict(self._request())
-            request["id"] = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-            holder = {}
-
-            def _deny() -> None:
-                code, note = run_local_approve(cfg, request, 5, poll_interval=0.05)
-                holder["code"] = code
-                holder["note"] = note
-
-            thread = threading.Thread(target=_deny)
-            thread.start()
-            path = Path(tmp) / "approvals" / f"{request['id']}.json"
-            deadline = time.time() + 2
-            while time.time() < deadline and not path.is_file():
-                time.sleep(0.02)
-            self.assertTrue(path.is_file())
-            self.assertEqual(decide_approval(cfg, request["id"], allow=False), (0, "denied"))
-            thread.join(timeout=3)
-            self.assertEqual(holder["code"], 1)
-            self.assertEqual(holder["note"], "denied")
-
-        with tempfile.TemporaryDirectory() as tmp:
-            cfg = _cfg(Path(tmp), token="")
-            code, note = run_local_approve(
-                cfg, self._request(), 0.2, poll_interval=0.05
-            )
-            self.assertEqual(code, 2)
-            self.assertEqual(note, "timeout")
-            self.assertEqual(decide_approval(cfg, "missing-id", allow=True)[0], 2)
+                self.assertEqual(code, 2)
+                self.assertEqual(note, "timeout")
+                self.assertEqual(decide_approval(cfg, "missing-id", allow=True)[0], 2)
 
     def test_cli_local_decide(self):
         request = {
@@ -360,9 +365,12 @@ class TestApproval(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as tmp:
             env = os.environ.copy()
+            env["AGENTS_HOST_DIR"] = tmp
             env["AGENTS_RELAY_STATE"] = tmp
             env["AGENTS_NO_UPDATE_CHECK"] = "1"
             env.pop("TELEGRAM_BOT_TOKEN", None)
+            env.pop("AGENTS_RELAY_URL", None)
+            env.pop("AGENTS_APPROVAL_TOKEN", None)
             proc = subprocess.Popen(
                 [sys.executable, "-m", "agents_relay", "approve", "--local", "--timeout", "5"],
                 stdin=subprocess.PIPE,
@@ -379,7 +387,7 @@ class TestApproval(unittest.TestCase):
                 proc.stdin.close()
                 # communicate() flushes stdin; a closed pipe raises.
                 proc.stdin = None
-                path = Path(tmp) / "approvals" / "cli-local-1.json"
+                path = Path(tmp) / "run" / "approvals" / "cli-local-1.json"
                 deadline = time.time() + 3
                 while time.time() < deadline and not path.is_file():
                     time.sleep(0.02)
@@ -404,17 +412,18 @@ class TestApproval(unittest.TestCase):
         from agents_relay.telegram_adapter import run_approve
 
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = _cfg(Path(tmp))
-            with patch("agents_relay.telegram_adapter.send_message", return_value={"ok": True}):
-                code, note = run_approve(
-                    chat_id=12345,
-                    timeout=0.3,
-                    request=self._request(),
-                    config=cfg,
-                    poll_interval=0.05,
-                )
-            self.assertEqual(code, 2)
-            self.assertEqual(note, "timeout")
+            with patch.dict(os.environ, {"AGENTS_HOST_DIR": tmp}, clear=False):
+                cfg = _cfg(Path(tmp))
+                with patch("agents_relay.telegram_adapter.send_message", return_value={"ok": True}):
+                    code, note = run_approve(
+                        chat_id=12345,
+                        timeout=0.3,
+                        request=self._request(),
+                        config=cfg,
+                        poll_interval=0.05,
+                    )
+                self.assertEqual(code, 2)
+                self.assertEqual(note, "timeout")
 
     def test_cli_invalid_stdin_and_help(self):
         import io
@@ -434,10 +443,11 @@ class TestApproval(unittest.TestCase):
         from agents_relay.telegram_adapter import run_approve
 
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = _cfg(Path(tmp))
-            code, note = run_approve(chat_id=99, timeout=1, request=self._request(), config=cfg)
-            self.assertEqual(code, 2)
-            self.assertIn("allowlist", note)
+            with patch.dict(os.environ, {"AGENTS_HOST_DIR": tmp}, clear=False):
+                cfg = _cfg(Path(tmp))
+                code, note = run_approve(chat_id=99, timeout=1, request=self._request(), config=cfg)
+                self.assertEqual(code, 2)
+                self.assertIn("allowlist", note)
 
     def test_non_numeric_user_falls_back_to_approver_or_single_chat(self):
         import io
@@ -462,26 +472,73 @@ class TestApproval(unittest.TestCase):
 
         request = json.dumps(self._request())
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = _cfg(Path(tmp), allowed=(7, 8), approver="7")
-            with patch("agents_relay.__main__.RelayConfig.from_env", return_value=cfg):
-                with patch("agents_relay.__main__.run_approve", return_value=(0, "approved")) as approved:
-                    with patch("sys.stdin", io.StringIO(request)):
-                        with patch("sys.stdout", io.StringIO()):
-                            rc = relay_main(["approve", "--user", "anonymous", "--timeout", "5"])
-            self.assertEqual(rc, 0)
-            self.assertEqual(approved.call_args.kwargs["chat_id"], 7)
+            with patch.dict(os.environ, {"AGENTS_HOST_DIR": tmp}, clear=False):
+                os.environ.pop("AGENTS_RELAY_URL", None)
+                os.environ.pop("AGENTS_APPROVAL_TOKEN", None)
+                cfg = _cfg(Path(tmp), allowed=(7, 8), approver="7")
+                with patch("agents_relay.__main__.RelayConfig.from_env", return_value=cfg):
+                    with patch("agents_relay.__main__.run_approve", return_value=(0, "approved")) as approved:
+                        with patch("sys.stdin", io.StringIO(request)):
+                            with patch("sys.stdout", io.StringIO()):
+                                rc = relay_main(["approve", "--user", "anonymous", "--timeout", "5"])
+                self.assertEqual(rc, 0)
+                self.assertEqual(approved.call_args.kwargs["chat_id"], 7)
 
-            buf = io.StringIO()
-            denied_cfg = _cfg(Path(tmp), allowed=(7, 8), approver="")
-            with patch("agents_relay.__main__.RelayConfig.from_env", return_value=denied_cfg):
-                with patch("agents_relay.__main__.run_approve") as not_called:
-                    with patch("sys.stdin", io.StringIO(request)):
-                        with patch("sys.stdout", buf):
-                            rc = relay_main(["approve", "--user", "anonymous", "--timeout", "5"])
-            self.assertEqual(rc, 2)
-            not_called.assert_not_called()
-            self.assertIn("anonymous", buf.getvalue())
-            self.assertIn("AGENTS_RELAY_APPROVER", buf.getvalue())
+                buf = io.StringIO()
+                denied_cfg = _cfg(Path(tmp), allowed=(7, 8), approver="")
+                with patch("agents_relay.__main__.RelayConfig.from_env", return_value=denied_cfg):
+                    with patch("agents_relay.__main__.run_approve") as not_called:
+                        with patch("sys.stdin", io.StringIO(request)):
+                            with patch("sys.stdout", buf):
+                                rc = relay_main(["approve", "--user", "anonymous", "--timeout", "5"])
+                self.assertEqual(rc, 2)
+                not_called.assert_not_called()
+                self.assertIn("anonymous", buf.getvalue())
+                self.assertIn("AGENTS_RELAY_APPROVER", buf.getvalue())
+
+    def test_cli_prefers_http_roundtrip_and_falls_back_local(self):
+        import io
+
+        from agents_relay.__main__ import main as relay_main
+
+        req_json = json.dumps(self._request())
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(
+                os.environ,
+                {
+                    "AGENTS_HOST_DIR": tmp,
+                    "AGENTS_RELAY_URL": "http://127.0.0.1:9999",
+                    "AGENTS_APPROVAL_TOKEN": "tok-ephemeral",
+                    "AGENTS_WORKSPACE": "demo",
+                },
+                clear=False,
+            ):
+                cfg = _cfg(Path(tmp), allowed=(7,), approver="7")
+                with patch("agents_relay.__main__.RelayConfig.from_env", return_value=cfg):
+                    with patch("agents_relay.__main__.run_http_approve", return_value=(0, "approved")) as http_ap:
+                        with patch("agents_relay.__main__.run_approve") as tg_ap:
+                            with patch("sys.stdin", io.StringIO(req_json)):
+                                with patch("sys.stdout", io.StringIO()) as out:
+                                    rc = relay_main(["approve", "--user", "local", "--timeout", "5"])
+                self.assertEqual(rc, 0)
+                self.assertEqual(json.loads(out.getvalue())["note"], "approved")
+                http_ap.assert_called_once()
+                self.assertEqual(http_ap.call_args.kwargs["workspace"], "demo")
+                tg_ap.assert_not_called()
+
+            # Without AGENTS_RELAY_URL/TOKEN and without TELEGRAM_BOT_TOKEN -> local host dir
+            with patch.dict(os.environ, {"AGENTS_HOST_DIR": tmp}, clear=False):
+                os.environ.pop("AGENTS_RELAY_URL", None)
+                os.environ.pop("AGENTS_APPROVAL_TOKEN", None)
+                local_cfg = _cfg(Path(tmp), token="")
+                with patch("agents_relay.__main__.RelayConfig.from_env", return_value=local_cfg):
+                    with patch("agents_relay.__main__.run_local_approve", return_value=(1, "denied")) as loc_ap:
+                        with patch("sys.stdin", io.StringIO(req_json)):
+                            with patch("sys.stdout", io.StringIO()) as out:
+                                rc = relay_main(["approve", "--user", "local", "--timeout", "5"])
+                self.assertEqual(rc, 1)
+                self.assertEqual(json.loads(out.getvalue())["note"], "denied")
+                loc_ap.assert_called_once()
 
 
 class TestConcurrency(unittest.TestCase):

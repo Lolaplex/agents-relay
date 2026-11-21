@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import threading
 import unittest
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from unittest.mock import patch
 
 from agents_relay.config import RelayConfig
 from agents_relay.http_adapter import serve_http
@@ -82,16 +85,23 @@ class _Server:
 class TestRemotes(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        self._env = patch.dict(
+            os.environ,
+            {"AGENTS_HOST_DIR": str(Path(self.tmp.name) / "host")},
+            clear=False,
+        )
+        self._env.start()
         self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Upstream)
         self.up_port = self.upstream.server_address[1]
         threading.Thread(target=self.upstream.serve_forever, daemon=True).start()
-        cfg = _cfg(state_dir=self.tmp.name)
+        cfg = _cfg(state_dir=str(Path(self.tmp.name) / "relay"))
         self.relay = _Server(cfg)
         self.base = f"http://127.0.0.1:{self.up_port}"
 
     def tearDown(self):
         self.relay.close()
         self.upstream.shutdown()
+        self._env.stop()
         self.tmp.cleanup()
 
     def test_auth_required(self):
@@ -193,6 +203,43 @@ class TestRemotes(unittest.TestCase):
         self.assertEqual(r.status, 200)
         r = self.relay.request("GET", "/v1/remotes")
         self.assertEqual(json.loads(r.read())["remotes"], [])
+
+    def test_metadata_and_secret_split_and_legacy_fallback(self):
+        import warnings
+        from agents_workspace import resolve_secret
+        from agents_relay import remotes as remotes_mod
+
+        r = self.relay.request("POST", "/v1/remotes", {
+            "id": "vps", "base_url": self.base, "secret": "vault-tok", "label": "VPS",
+        })
+        self.assertEqual(r.status, 200)
+        meta_path = Path(self.tmp.name) / "host" / "clients" / "remotes.json"
+        self.assertTrue(meta_path.is_file())
+        raw_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        self.assertNotIn("secret", raw_meta["remotes"]["vps"])
+        self.assertEqual(raw_meta["remotes"]["vps"]["label"], "VPS")
+        self.assertEqual(resolve_secret("REMOTE_VPS_TOKEN", scope="host"), "vault-tok")
+
+        r = self.relay.request("DELETE", "/v1/remotes/vps")
+        self.assertEqual(r.status, 200)
+        self.assertEqual(resolve_secret("REMOTE_VPS_TOKEN", scope="host"), "")
+
+        # Legacy 1-release fallback read when <host>/clients/remotes.json is absent.
+        meta_path.unlink()
+        legacy_dir = Path(self.tmp.name) / "relay"
+        legacy_dir.mkdir(parents=True, exist_ok=True)
+        (legacy_dir / "remotes.json").write_text(
+            json.dumps({"remotes": {"old": {"base_url": self.base, "secret": "legacy-tok", "label": "Old"}}}),
+            encoding="utf-8",
+        )
+        cfg = _cfg(state_dir=str(legacy_dir))
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", DeprecationWarning)
+            listed = remotes_mod.list_public(cfg)
+            self.assertEqual([x["id"] for x in listed], ["old"])
+            self.assertTrue(listed[0]["has_secret"])
+            self.assertEqual(remotes_mod.load_remotes(cfg)["old"]["secret"], "legacy-tok")
+        self.assertTrue(any(issubclass(w.category, DeprecationWarning) for w in caught))
 
 
 if __name__ == "__main__":
