@@ -1061,8 +1061,12 @@ class TurnHandler(BaseHTTPRequestHandler):
 
         if len(parts) == 7:
             user = str(query_params.get("user") or "").strip()
+            include_empty = str(
+                query_params.get("include_empty") or query_params.get("all") or ""
+            ).strip().lower() in ("1", "true", "yes")
             try:
-                rows = list_sessions(ws, persona=persona, user=user)
+                rows = list_sessions(
+                    ws, persona=persona, user=user, include_empty=include_empty)
             except RuntimeError as exc:
                 self.send_error(501, str(exc))
                 return

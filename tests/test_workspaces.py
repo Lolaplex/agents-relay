@@ -357,6 +357,42 @@ class TestWorkspaceRoutes(unittest.TestCase):
         self.assertEqual(resp.status, 200)
         self.assertEqual(json.loads(resp.read().decode())["sessions"], [])
 
+    def test_session_list_filters_empty_and_delegate(self):
+        ws = create_workspace("demo")
+        base = "/v1/workspaces/demo/personas/cos"
+        resp = self.srv.request(
+            "POST", "/v1/workspaces/demo/personas", {"id": "cos"})
+        self.assertEqual(resp.status, 201)
+
+        def mint(channel: str) -> str:
+            resp = self.srv.request(
+                "POST", base + "/sessions",
+                {"user": "me", "channel": channel})
+            self.assertEqual(resp.status, 201)
+            return json.loads(resp.read().decode())["session"]["id"]
+
+        fresh = mint("http")
+        dlg = mint("delegate")
+        stale = mint("http")
+        # backdate the stale record past the 15 min grace window
+        from datetime import datetime, timedelta, timezone
+        spath = ws.personas / "cos" / "sessions" / f"{stale}.json"
+        rec = json.loads(spath.read_text(encoding="utf-8"))
+        old = (datetime.now(timezone.utc) - timedelta(seconds=7200)).isoformat()
+        rec["created_at"] = rec["last_active"] = old
+        spath.write_text(json.dumps(rec) + "\n", encoding="utf-8")
+
+        # default: fresh empty session visible, delegate + stale hidden
+        resp = self.srv.request("GET", base + "/sessions")
+        self.assertEqual(resp.status, 200)
+        ids = {r["id"] for r in json.loads(resp.read().decode())["sessions"]}
+        self.assertEqual(ids, {fresh})
+        # include_empty=1: everything listed
+        resp = self.srv.request("GET", base + "/sessions?include_empty=1")
+        self.assertEqual(resp.status, 200)
+        ids = {r["id"] for r in json.loads(resp.read().decode())["sessions"]}
+        self.assertEqual(ids, {fresh, dlg, stale})
+
     def test_session_routes_reject_traversal(self):
         create_workspace("demo")
         resp = self.srv.request(
