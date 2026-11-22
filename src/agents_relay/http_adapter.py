@@ -1660,7 +1660,20 @@ class TurnHandler(BaseHTTPRequestHandler):
                     return
             body: dict[str, Any] = {"ok": True}
             if path == "/health":
+                body["service"] = "agents-relay"
                 body["version"] = __version__
+                try:
+                    body["port"] = int(self.server.server_address[1])
+                except (AttributeError, IndexError, TypeError, ValueError):
+                    pass
+                # host_id proves a live serve belongs to this <host>; never
+                # expose host filesystem paths here (public probe).
+                try:
+                    from agents_workspace import Host
+
+                    body["host_id"] = Host.from_env().host_id()
+                except Exception:
+                    pass
                 klanker_version = getattr(self, "klanker_version", "") or getattr(
                     self._cfg(), "klanker_version", "")
                 if klanker_version:

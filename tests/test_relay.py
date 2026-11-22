@@ -1555,3 +1555,54 @@ class TestWave1SecurityHardening(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSymmetricAuthAndHealth(unittest.TestCase):
+    """agents-relay#29: Bearer via RELAY_WEB_TOKEN, host_id on /health."""
+
+    def _serve(self, cfg: RelayConfig) -> tuple[str, int]:
+        server = serve_http(cfg)
+        host, port = server.server_address  # type: ignore[misc]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(thread.join, 2)
+        return host, port
+
+    def test_bearer_via_web_token_only(self):
+        # cfg built as if only RELAY_WEB_TOKEN was set (symmetric fill).
+        cfg = _test_config(relay_secret="tok123", web_token="tok123")
+        host, port = self._serve(cfg)
+        conn = HTTPConnection(host, port, timeout=10)
+        conn.request("GET", "/v1/workspaces",
+                     headers={"Authorization": "Bearer tok123"})
+        resp = conn.getresponse()
+        resp.read()
+        self.assertEqual(resp.status, 200)
+        # Falsifying: no auth -> 401.
+        conn = HTTPConnection(host, port, timeout=10)
+        conn.request("GET", "/v1/workspaces")
+        resp = conn.getresponse()
+        resp.read()
+        self.assertEqual(resp.status, 401)
+
+    def test_health_has_host_id_no_path_leak(self):
+        import tempfile
+        from unittest.mock import patch
+        from agents_workspace import Host
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"AGENTS_HOST_DIR": tmp}):
+                expected_hid = Host.open(tmp).host_id()
+                host, port = self._serve(_test_config())
+                conn = HTTPConnection(host, port, timeout=10)
+                conn.request("GET", "/health")
+                resp = conn.getresponse()
+                data = json.loads(resp.read().decode())
+                self.assertEqual(resp.status, 200)
+                self.assertEqual(data["host_id"], expected_hid)
+                self.assertEqual(data["service"], "agents-relay")
+                self.assertEqual(data["port"], port)
+                raw = json.dumps(data)
+                self.assertNotIn(tmp, raw)
+                self.assertNotIn('"dir"', raw)
