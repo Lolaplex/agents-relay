@@ -89,14 +89,9 @@ class PairingStore:
             }
 
         clean_base = (base_url or "").strip().rstrip("/")
-        if clean_base:
-            pair_url = (
-                f"{clean_base}/#pair={token}"
-                if clean_mode == "web"
-                else f"{clean_base}/v1/pair/redeem"
-            )
-        else:
-            pair_url = f"/#pair={token}" if clean_mode == "web" else "/v1/pair/redeem"
+        # One URL shape for both modes: redeem branches on the stored mode,
+        # so the same link pairs a browser (cookie) and a CLI/desktop (token).
+        pair_url = f"{clean_base}/#pair={token}"
 
         return {
             "mode": clean_mode,

@@ -150,6 +150,12 @@ class TestPairing(unittest.TestCase):
                 headers={"Authorization": "Bearer expected"},
             )
             self.assertEqual(st, 200)
+            # Remote pairs mint the same absolute /#pair= link shape as web —
+            # redeem branches on the stored mode, not the URL.
+            self.assertTrue(
+                created["pair_url"].startswith(f"http://{srv.host}:{srv.port}/#pair="),
+                created["pair_url"],
+            )
             self.assertEqual(created["expires_in"], 15)  # clamped minimum
 
             st1, _, res1 = srv.req("POST", "/v1/pair/redeem", {"token": created["token"]})
@@ -161,6 +167,49 @@ class TestPairing(unittest.TestCase):
             self.assertEqual(st2, 401)
         finally:
             srv.close()
+
+    def test_pair_url_base_resolution(self):
+        # Proxy headers win over the request Host; a configured relay_url
+        # wins over everything; loopback falls back to http.
+        srv = _Srv(_cfg())
+        try:
+            st, _, res = srv.req(
+                "POST",
+                "/v1/pair/create",
+                {"mode": "web"},
+                headers={
+                    "Authorization": "Bearer expected",
+                    "X-Forwarded-Proto": "https",
+                    "X-Forwarded-Host": "relay.example.com",
+                },
+            )
+            self.assertEqual(st, 200)
+            self.assertTrue(
+                res["pair_url"].startswith("https://relay.example.com/#pair="),
+                res["pair_url"],
+            )
+        finally:
+            srv.close()
+
+        srv2 = _Srv(_cfg(relay_url="https://relay.internal:9443"))
+        try:
+            st, _, res = srv2.req(
+                "POST",
+                "/v1/pair/create",
+                {"mode": "remote"},
+                headers={
+                    "Authorization": "Bearer expected",
+                    "X-Forwarded-Proto": "https",
+                    "X-Forwarded-Host": "relay.example.com",
+                },
+            )
+            self.assertEqual(st, 200)
+            self.assertTrue(
+                res["pair_url"].startswith("https://relay.internal:9443/#pair="),
+                res["pair_url"],
+            )
+        finally:
+            srv2.close()
 
     def test_rate_limit_and_expiry_and_log_redaction(self):
         now = [100.0]
