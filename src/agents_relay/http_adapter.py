@@ -1901,6 +1901,7 @@ class TurnHandler(BaseHTTPRequestHandler):
                 ws = resolve_workspace_id(ws_ref) if ws_ref else None
                 from runner.model import selected
                 pick = dict(selected(ws))
+                scope = "workspace"
                 session = str(query_params.get("session") or "").strip()
                 if session:
                     # Session pick wins over the workspace pick; the workspace
@@ -1910,6 +1911,7 @@ class TurnHandler(BaseHTTPRequestHandler):
                     sp = session_pick(session)
                     if sp["provider"]:
                         pick = sp
+                        scope = "session"
                 from .providers_api import provider_rows
                 rows = provider_rows(
                     self._cfg(),
@@ -1921,7 +1923,8 @@ class TurnHandler(BaseHTTPRequestHandler):
                 self.send_error(500, f"model unavailable: {exc}")
                 return
             self._write_json({"ok": True, "provider": pick.get("provider") or "",
-                              "model": pick.get("model") or "", "providers": rows}, 200)
+                              "model": pick.get("model") or "", "scope": scope,
+                              "providers": rows}, 200)
             return
         if path == "/v1/remotes":
             if not _check_secret(self, self.relay_secret, query_params):
