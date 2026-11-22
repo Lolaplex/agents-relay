@@ -6,6 +6,7 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import re
 import time
 import urllib.parse
 from collections import deque
@@ -75,6 +76,7 @@ def _check_secret(
     expected: str,
     query_params: dict[str, str] | None = None,
 ) -> bool:
+    del query_params
     cfg = getattr(handler, "config", None)
     if not expected:
         # A web surface without a relay secret would expose every endpoint to
@@ -85,15 +87,12 @@ def _check_secret(
         return True
     auth_header = (handler.headers.get("Authorization") or "").strip()
     bearer = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else ""
-    qp = query_params or {}
     got = (
         handler.headers.get("X-Relay-Secret")
         or handler.headers.get("Relay-Secret")
         or handler.headers.get("X-Gateway-Secret")
         or handler.headers.get("Gateway-Secret")
         or bearer
-        or qp.get("secret")
-        or qp.get("token")
         or ""
     ).strip()
     if got and hmac.compare_digest(got.encode("utf-8"), expected.encode("utf-8")):
@@ -196,13 +195,20 @@ def _sse_event(payload: dict) -> bytes:
 _OPTIONAL_TURN_KWARGS = ("attachments", "provider", "model", "persona", "project", "workdir", "extra_env")
 
 
+_LOG_SECRET_RE = re.compile(r"([?&](?:token|secret)=)([^&\s]+)", re.IGNORECASE)
+
+
+def _redact_log_text(text: str) -> str:
+    return _LOG_SECRET_RE.sub(r"\1[REDACTED]", text)
+
+
 class TurnHandler(BaseHTTPRequestHandler):
     relay_secret: str = ""
     config: RelayConfig | None = None
     turn_hook: _TurnHook | None = None
 
     def log_message(self, fmt: str, *args) -> None:
-        log.info("%s - %s", self.address_string(), fmt % args)
+        log.info("%s - %s", self.address_string(), _redact_log_text(fmt % args))
 
     def handle_one_request(self) -> None:
         """Last error boundary: an unhandled exception must not drop the

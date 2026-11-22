@@ -4,10 +4,31 @@ from __future__ import annotations
 
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
+
+
+def _is_loopback_url(url: str) -> bool:
+    host = urllib.parse.urlparse(url if "://" in url else f"http://{url}").hostname or ""
+    return host in {"127.0.0.1", "localhost", "::1"}
+
+
+def _resolve_loopback_secret() -> str:
+    try:
+        from agents_workspace import resolve_secret
+    except ImportError:
+        return ""
+    for key in ("RELAY_SECRET", "RELAY_WEB_TOKEN"):
+        try:
+            val = str(resolve_secret(key, scope="host") or "").strip()
+        except Exception:
+            val = ""
+        if val:
+            return val
+    return ""
 
 
 @dataclass
@@ -26,8 +47,11 @@ class GatewayClient:
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
-        if self.secret:
-            headers["X-Gateway-Secret"] = self.secret
+        tok = (self.secret or "").strip()
+        if not tok and _is_loopback_url(self.base_url):
+            tok = _resolve_loopback_secret()
+        if tok:
+            headers["Authorization"] = f"Bearer {tok}"
         return headers
 
     def _apply_meta(self, data: dict[str, Any]) -> None:
@@ -45,7 +69,6 @@ class GatewayClient:
             json.dumps(
                 {
                     "base_url": self.base_url,
-                    "secret": self.secret,
                     "channel": self.channel,
                     "user": self.user,
                     "provider": self.provider,
@@ -58,18 +81,19 @@ class GatewayClient:
             encoding="utf-8",
         )
 
-    def load_prefs(self) -> None:
+    def load_prefs(self, *, explicit: set[str] | None = None) -> None:
         if self.prefs_path is None or not self.prefs_path.exists():
             return
         data = json.loads(self.prefs_path.read_text(encoding="utf-8"))
-        self.base_url = str(data.get("base_url") or self.base_url)
-        self.secret = str(data.get("secret") or self.secret)
-        self.channel = str(data.get("channel") or self.channel)
-        self.user = str(data.get("user") or self.user)
-        self.provider = str(data.get("provider") or self.provider)
-        self.persona = str(data.get("persona") or self.persona)
-        self.project = str(data.get("project") or self.project)
-        self.workspace = str(data.get("workspace") or self.workspace)
+        if not isinstance(data, dict):
+            return
+        explicit_set = set(explicit or ())
+        for field in ("base_url", "channel", "user"):
+            if field not in explicit_set and data.get(field):
+                setattr(self, field, str(data[field]))
+        for field in ("provider", "persona", "project", "workspace"):
+            if field not in explicit_set and not getattr(self, field) and data.get(field):
+                setattr(self, field, str(data[field]))
 
     def _turn_body(self, text: str, *, new_session: bool = False) -> dict[str, Any]:
         body: dict[str, Any] = {
