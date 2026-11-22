@@ -672,9 +672,21 @@ def _acp_sessions_dir(config: RelayConfig | None = None) -> Path:
 def acp_agent_cmd(provider: str = "") -> str:
     """Agent command for provider ``acp.<name>``.
 
-    ``AGENTS_ACP_CMD_<NAME>`` wins over the shared ``AGENTS_ACP_CMD`` so a
+    Manifest ``command`` wins (file-managed agents, ``POST /v1/providers``),
+    then ``AGENTS_ACP_CMD_<NAME>`` over the shared ``AGENTS_ACP_CMD`` so a
     host can register several agents (``acp.devin`` -> ``AGENTS_ACP_CMD_DEVIN``).
     """
+    if provider.startswith("acp."):
+        try:
+            from runner.providers import find_provider
+
+            manifest = find_provider(provider)
+            if isinstance(manifest, dict):
+                cmd = str(manifest.get("command") or "").strip()
+                if cmd:
+                    return cmd
+        except Exception:
+            pass
     suffix = provider.split(".", 1)[1] if provider.startswith("acp.") else ""
     if suffix:
         val = os.environ.get(f"AGENTS_ACP_CMD_{suffix.upper()}", "").strip()
@@ -728,14 +740,20 @@ def probe_acp_agent(agent_argv: list[str], timeout: float = 20) -> dict[str, Any
 _ACP_INFO_TTL = 24 * 3600
 
 
+def acp_models_cache_path(provider: str, config: RelayConfig | None = None) -> Path:
+    """``<state>/acp_models/<name>.json`` for provider ``acp.<name>``."""
+    name = provider.split(".", 1)[1] if provider.startswith("acp.") else provider
+    base = Path(getattr(config, "state_dir", "") or ".")
+    return base / "acp_models" / f"{name}.json"
+
+
 def acp_agent_info(
     config: RelayConfig, provider: str = "", refresh: bool = False
 ) -> dict[str, Any]:
     """Cached agent probe (<state>/acp_models/<name>.json, 24h TTL)."""
     name = provider.split(".", 1)[1] if provider.startswith("acp.") else ""
     name = name or acp_provider_name().split(".", 1)[1]
-    base = Path(config.state_dir or ".")
-    path = base / "acp_models" / f"{name}.json"
+    path = acp_models_cache_path(f"acp.{name}", config)
     cached = read_json(path) or {}
     if cached.get("models") and not refresh and (
         time.time() - float(cached.get("ts") or 0) < _ACP_INFO_TTL
@@ -760,9 +778,11 @@ def acp_agent_info(
 
 
 def acp_provider_rows(config: RelayConfig, refresh: bool = False) -> list[dict[str, Any]]:
-    """``acp-agent`` manifest rows enriched with probed model/mode lists."""
-    if not acp_agent_cmd():
-        return []
+    """``acp-agent`` manifest rows enriched with probed model/mode lists.
+
+    Rows surface even without a resolvable command — ``error`` marks a
+    misconfigured agent instead of silently dropping the row.
+    """
     ensure_acp_manifest()
     try:
         from runner.providers import list_providers
@@ -777,6 +797,12 @@ def acp_provider_rows(config: RelayConfig, refresh: bool = False) -> list[dict[s
             "name": name, "kind": "acp-agent",
             "model": raw.get("model"), "when": raw.get("when"),
         }
+        if str(raw.get("command") or "").strip():
+            row["command"] = str(raw["command"]).strip()
+        if not acp_agent_cmd(name):
+            row["error"] = "no agent command configured"
+            rows.append(row)
+            continue
         info = acp_agent_info(config, name, refresh=refresh)
         for key in ("model", "models", "mode", "modes", "error"):
             if info.get(key):
@@ -813,6 +839,7 @@ def ensure_acp_manifest() -> None:
         "verb": "chat.completions",
         "rests_on": "Foreign ACP agent loop; agents-relay acp-run spawns it per turn",
         "expected_exit": 0,
+        "source": "env",
     }
     providers_dir.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
