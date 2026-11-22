@@ -97,6 +97,17 @@ def _check_secret(
     ).strip()
     if got and hmac.compare_digest(got.encode("utf-8"), expected.encode("utf-8")):
         return True
+    # Scoped device credentials (agents-relay#40): a paired device token
+    # authorizes the API surface like the master secret but is revocable
+    # per device via DELETE /v1/hub/devices/<id>.
+    if got:
+        try:
+            from .devices import device_id_for_token
+
+            if device_id_for_token(got):
+                return True
+        except Exception:
+            pass
     # A browser client authenticates with an HttpOnly cookie: the token stays
     # out of JS storage and EventSource, which cannot set headers, still works.
     if isinstance(cfg, RelayConfig) and web_enabled(cfg):
@@ -104,6 +115,27 @@ def _check_secret(
         if raw and verify_cookie(cfg, raw):
             return True
     return False
+
+
+def _check_device(handler: BaseHTTPRequestHandler) -> str:
+    """Device-channel auth: Bearer device_token + X-Device-Id (agents-relay#40).
+
+    Returns the authenticated device_id or ''. The relay master secret also
+    passes (operator/admin path)."""
+    auth_header = (handler.headers.get("Authorization") or "").strip()
+    bearer = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else ""
+    if bearer:
+        expected = getattr(handler, "relay_secret", "") or ""
+        if expected and hmac.compare_digest(bearer.encode("utf-8"), expected.encode("utf-8")):
+            return "__admin__"
+        from .channel import device_id_from_headers
+        from .devices import device_id_for_token, verify_device
+
+        did = device_id_from_headers(handler)
+        if did and verify_device(did, bearer):
+            return did
+        return device_id_for_token(bearer)
+    return ""
 
 
 def _extract_payload_text(
@@ -534,13 +566,31 @@ class TurnHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(payload)
                 return
-            token_val = self.relay_secret or getattr(cfg, "web_token", "") or ""
+            # mode=remote mints a scoped device credential — the master
+            # relay_secret is never handed out by pairing (agents-relay#38/#40).
+            try:
+                from .devices import mint_device
+
+                dev = mint_device(
+                    label=self.address_string(),
+                    host_id=entry.get("host_id", ""),
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._write_json(
+                    {"ok": False, "error": f"device mint failed: {exc}"}, 500)
+                return
             self._write_json(
                 {
                     "ok": True,
                     "mode": "remote",
                     "host_id": entry.get("host_id", ""),
-                    "token": token_val,
+                    "device_id": dev["device_id"],
+                    "token": dev["device_token"],
+                    "hub": {
+                        "stream": "/v1/hub/stream",
+                        "send": "/v1/hub/send",
+                        "devices": "/v1/hub/devices",
+                    },
                 },
                 200,
             )
@@ -561,6 +611,19 @@ class TurnHandler(BaseHTTPRequestHandler):
                 return
             _emit_relay_event("remote.changed", {"action": "upsert", "id": row.get("id", "")})
             self._write_json({"ok": True, "remote": row}, 200)
+            return
+        if path == "/v1/hub/send":
+            # Upstream batch from a connected device (agents-relay#40).
+            did = _check_device(self)
+            if not did or did == "__admin__":
+                self.send_error(401, "unauthorized")
+                return
+            body = self._read_json()
+            if body is None:
+                return
+            from .channel import handle_hub_send
+
+            self._write_json(handle_hub_send(self, did, body), 200)
             return
 
         if path == "/v1/workspaces":
@@ -1776,6 +1839,35 @@ class TurnHandler(BaseHTTPRequestHandler):
 
             self._write_json({"ok": True, "remotes": list_public(self._cfg())}, 200)
             return
+        if path == "/v1/hub/stream":
+            # Per-device SSE channel (agents-relay#40): device_token auth.
+            did = _check_device(self)
+            if not did or did == "__admin__":
+                self.send_error(401, "unauthorized")
+                return
+            try:
+                since = int(query_params.get("since") or 0)
+            except ValueError:
+                since = 0
+            from .channel import handle_hub_stream
+
+            hb = float(getattr(self.server, "events_heartbeat_sec", 25.0))
+            handle_hub_stream(self, did, since=max(0, since), heartbeat_sec=hb)
+            return
+        if path == "/v1/hub/devices":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            from .channel import hub
+            from .devices import list_public
+
+            connected = set(hub().connected_devices())
+            rows = [
+                {**row, "connected": row["id"] in connected}
+                for row in list_public()
+            ]
+            self._write_json({"ok": True, "devices": rows}, 200)
+            return
         if path == "/v1/discover":
             if not _check_secret(self, self.relay_secret, query_params):
                 self.send_error(401, "unauthorized")
@@ -1985,6 +2077,20 @@ class TurnHandler(BaseHTTPRequestHandler):
                 return
             _emit_relay_event("remote.changed", {"action": "delete", "id": parts[3]})
             self._write_json({"ok": True, "remote": parts[3]}, 200)
+            return
+        # DELETE /v1/hub/devices/<id> — revoke a paired device (agents-relay#40).
+        if (len(parts) == 5 and parts[1] == "v1"
+                and parts[2] == "hub" and parts[3] == "devices" and parts[4]):
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            from .devices import revoke_device
+
+            if not revoke_device(parts[4]):
+                self.send_error(404, "unknown device")
+                return
+            _emit_relay_event("device.changed", {"action": "revoke", "id": parts[4]})
+            self._write_json({"ok": True, "device": parts[4]}, 200)
             return
         # DELETE /v1/remote/<id>/<upstream-path> — proxied mount.
         if path.startswith("/v1/remote/"):

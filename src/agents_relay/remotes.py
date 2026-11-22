@@ -130,6 +130,8 @@ def load_remotes(config: RelayConfig) -> dict:
             out[rid] = {
                 "base_url": str(meta.get("base_url") or ""),
                 "label": str(meta.get("label") or ""),
+                "via": str(meta.get("via") or "relay"),
+                "device_id": str(meta.get("device_id") or ""),
                 "secret": _read_secret(str(rid)),
             }
         return out
@@ -143,6 +145,8 @@ def load_remotes(config: RelayConfig) -> dict:
         out[rid] = {
             "base_url": str(meta.get("base_url") or ""),
             "label": str(meta.get("label") or ""),
+            "via": str(meta.get("via") or "relay"),
+            "device_id": str(meta.get("device_id") or ""),
             "secret": secret,
         }
     return out
@@ -153,6 +157,8 @@ def _store(remotes: dict) -> None:
         rid: {
             "base_url": str(info.get("base_url") or ""),
             "label": str(info.get("label") or ""),
+            "via": str(info.get("via") or "relay"),
+            "device_id": str(info.get("device_id") or ""),
         }
         for rid, info in remotes.items()
         if isinstance(info, dict)
@@ -167,20 +173,43 @@ def list_public(config: RelayConfig) -> list[dict]:
             "id": rid,
             "base_url": r.get("base_url") or "",
             "label": r.get("label") or "",
+            "via": r.get("via") or "relay",
+            "device_id": r.get("device_id") or "",
             "has_secret": bool(r.get("secret")),
         })
     return rows
 
 
+def _host_key(url: str) -> str:
+    """Normalized scheme://host[:port] — dedupe key for remotes (#144)."""
+    try:
+        p = urllib.parse.urlparse(url.strip().rstrip("/"))
+    except ValueError:
+        return ""
+    if not p.hostname:
+        return ""
+    port = f":{p.port}" if p.port else ""
+    return f"{p.scheme}://{p.hostname.lower()}{port}"
+
+
 def upsert_remote(config: RelayConfig, body: dict) -> tuple[dict | None, str]:
     rid = str(body.get("id") or "").strip()
     base_url = str(body.get("base_url") or "")
+    via = str(body.get("via") or "relay").strip()
+    device_id = str(body.get("device_id") or "").strip()
     if not rid or not valid_id(rid):
         return None, f"invalid remote id: {rid!r}"
-    try:
-        base_url = validate_remote_base_url(base_url)
-    except ValueError as exc:
-        return None, str(exc)
+    if via not in ("relay", "channel"):
+        return None, f"invalid via: {via!r}"
+    if via == "channel":
+        if not device_id:
+            return None, "via=channel requires device_id"
+        base_url = base_url.strip().rstrip("/")  # informational only
+    else:
+        try:
+            base_url = validate_remote_base_url(base_url)
+        except ValueError as exc:
+            return None, str(exc)
     migrating = not _path().is_file()
     remotes = load_remotes(config)
     if migrating:
@@ -189,6 +218,14 @@ def upsert_remote(config: RelayConfig, body: dict) -> tuple[dict | None, str]:
                 other_secret = str(info.get("secret") or "").strip()
                 if other_secret and not _read_secret(str(other_id)):
                     _write_secret(str(other_id), other_secret)
+    # Host dedupe: a second row for an already-mounted endpoint reuses the
+    # canonical id instead of forking credentials (klanker#144).
+    if via == "relay":
+        new_host = _host_key(base_url)
+        for other_id, info in remotes.items():
+            if other_id != rid and _host_key(str(info.get("base_url") or "")) == new_host:
+                rid = other_id
+                break
     prev = remotes.get(rid) or {}
     new_secret = str(body.get("secret") or "").strip()
     prev_secret = str(prev.get("secret") or "").strip()
@@ -199,12 +236,16 @@ def upsert_remote(config: RelayConfig, body: dict) -> tuple[dict | None, str]:
     remotes[rid] = {
         "base_url": base_url,
         "label": label,
+        "via": via,
+        "device_id": device_id,
     }
     _store(remotes)
     return {
         "id": rid,
         "base_url": base_url,
         "label": label,
+        "via": via,
+        "device_id": device_id,
         "has_secret": bool(secret),
     }, ""
 
@@ -244,12 +285,19 @@ def handle_proxy(handler: BaseHTTPRequestHandler, rid: str, rest: str) -> None:
         handler._write_json({"ok": False, "error": f"unknown remote: {rid}"}, 404)  # type: ignore[attr-defined]
         return
     try:
-        base_url = validate_remote_base_url(str(remote.get("base_url") or ""))
         rest = _normalize_proxy_rest(rest)
     except ValueError as exc:
         handler._write_json({"ok": False, "error": str(exc)}, 400)  # type: ignore[attr-defined]
         return
     qs = _forward_query(handler.path or "")
+    if remote.get("via") == "channel":
+        _proxy_via_channel(handler, remote, rest, qs)
+        return
+    try:
+        base_url = validate_remote_base_url(str(remote.get("base_url") or ""))
+    except ValueError as exc:
+        handler._write_json({"ok": False, "error": str(exc)}, 400)  # type: ignore[attr-defined]
+        return
     url = f"{base_url}{rest}{'?' + qs if qs else ''}"
 
     length = int(handler.headers.get("Content-Length") or "0")
@@ -304,3 +352,62 @@ def handle_proxy(handler: BaseHTTPRequestHandler, rid: str, rest: str) -> None:
         log.info("remote proxy client disconnected (%s %s)", rid, rest)
     finally:
         upstream.close()
+
+
+def _proxy_via_channel(
+    handler: BaseHTTPRequestHandler, remote: dict, rest: str, qs: str
+) -> None:
+    """Forward ``<method> <rest>`` over the device's hub channel (relay#40).
+
+    The request rides an ``http`` RPC to the device, which executes it
+    against its own loopback relay — no inbound reachability required.
+    """
+    from .channel import hub
+
+    device_id = str(remote.get("device_id") or "")
+    if not device_id:
+        handler._write_json({"ok": False, "error": "channel remote missing device_id"}, 400)  # type: ignore[attr-defined]
+        return
+    path = rest + ("?" + qs if qs else "")
+    length = int(handler.headers.get("Content-Length") or "0")
+    data = handler.rfile.read(length) if length else None
+    req: dict = {"method": handler.command, "path": path}
+    if data is not None:
+        req["body"] = data.decode("utf-8", "replace")
+    ctype = handler.headers.get("Content-Type")
+    if ctype and data is not None:
+        req["content_type"] = ctype
+    accept = (handler.headers.get("Accept") or "").strip()
+    if accept:
+        req["accept"] = accept
+
+    frames = hub().rpc_call(device_id, "http", {"req": req}, timeout_sec=600.0)
+    first = next(frames, None)
+    if first is None:
+        handler._write_json({"ok": False, "error": "device returned empty rpc"}, 502)  # type: ignore[attr-defined]
+        return
+    if "error" in first:
+        code = 503 if first["error"] in ("device offline", "device disconnected") else 502
+        handler._write_json({"ok": False, "error": str(first["error"])}, code)  # type: ignore[attr-defined]
+        return
+
+    status = int(first.get("status") or 502)
+    ctype_out = str(first.get("content_type") or "application/octet-stream")
+    handler.send_response(status)
+    handler.send_header("Content-Type", ctype_out)
+    if ctype_out.startswith("text/event-stream"):
+        handler.send_header("Cache-Control", "no-cache")
+        handler.send_header("X-Accel-Buffering", "no")
+        handler.send_header("Connection", "close")
+    handler.end_headers()
+    try:
+        if "body" in first:
+            handler.wfile.write(str(first["body"]).encode("utf-8"))
+        for fr in frames:
+            if "chunk" in fr:
+                handler.wfile.write(str(fr["chunk"]).encode("utf-8"))
+                handler.wfile.flush()
+            elif "error" in fr or fr.get("done"):
+                break
+    except (BrokenPipeError, ConnectionResetError):
+        log.info("channel proxy client disconnected (%s %s)", device_id, rest)

@@ -161,7 +161,11 @@ class TestPairing(unittest.TestCase):
             st1, _, res1 = srv.req("POST", "/v1/pair/redeem", {"token": created["token"]})
             self.assertEqual(st1, 200)
             self.assertEqual(res1["mode"], "remote")
-            self.assertEqual(res1["token"], "expected")
+            # remote redeem mints scoped device credentials — the master
+            # relay_secret is never handed out (agents-relay#38/#40).
+            self.assertTrue(res1["device_id"])
+            self.assertTrue(res1["token"])
+            self.assertNotEqual(res1["token"], "expected")
 
             st2, _, _ = srv.req("POST", "/v1/pair/redeem", {"token": created["token"]})
             self.assertEqual(st2, 401)
