@@ -195,11 +195,20 @@ def _sse_event(payload: dict) -> bytes:
 _OPTIONAL_TURN_KWARGS = ("attachments", "provider", "model", "persona", "project", "workdir", "extra_env")
 
 
-_LOG_SECRET_RE = re.compile(r"([?&](?:token|secret)=)([^&\s]+)", re.IGNORECASE)
+_LOG_SECRET_RE = re.compile(r"([?&](?:token|secret|code|pair)=)([^&\s]+)", re.IGNORECASE)
 
 
 def _redact_log_text(text: str) -> str:
     return _LOG_SECRET_RE.sub(r"\1[REDACTED]", text)
+
+
+def _emit_relay_event(kind: str, payload: dict[str, Any] | None = None, *, workspace: str = "") -> None:
+    try:
+        from .events import emit_event
+
+        emit_event(kind, payload, workspace=workspace)
+    except Exception:
+        pass
 
 
 class TurnHandler(BaseHTTPRequestHandler):
@@ -405,6 +414,87 @@ class TurnHandler(BaseHTTPRequestHandler):
             handle_logout(self)
             return
 
+        if path == "/v1/pair/create":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            body = self._read_json()
+            if body is None:
+                return
+            from .pairing import create_pair
+
+            mode = str(body.get("mode") or "web")
+            ttl = body.get("ttl_sec", 60)
+            host_id = ""
+            try:
+                from agents_workspace import Host
+
+                host = Host.from_env()
+                hid_fn = getattr(host, "host_id", None)
+                if callable(hid_fn):
+                    host_id = str(hid_fn() or "")
+            except Exception:
+                pass
+            cfg = self._cfg()
+            try:
+                res = create_pair(
+                    mode=mode,
+                    ttl_sec=ttl,
+                    host_id=host_id,
+                    base_url=getattr(cfg, "relay_url", "") or "",
+                )
+            except ValueError as exc:
+                self.send_error(400, str(exc))
+                return
+            self._write_json({"ok": True, **res}, 200)
+            return
+
+        if path == "/v1/pair/redeem":
+            body = self._read_json()
+            if body is None:
+                return
+            cred = str(body.get("token") or body.get("code") or "").strip()
+            from .pairing import redeem_pair
+            from .web import _cookie_header, _secure_for, issue_cookie
+
+            status_tag, entry = redeem_pair(cred, client_ip=self.address_string())
+            if status_tag == "rate_limited":
+                self._write_json({"ok": False, "error": "too many attempts"}, 429)
+                return
+            if status_tag != "ok" or entry is None:
+                self._write_json({"ok": False, "error": "invalid or expired pairing code"}, 401)
+                return
+            cfg = self._cfg()
+            if entry["mode"] == "web":
+                if not web_enabled(cfg):
+                    self._write_json({"ok": False, "error": "web surface disabled"}, 404)
+                    return
+                cookie_val = issue_cookie(cfg)
+                payload = json.dumps(
+                    {"ok": True, "mode": "web", "host_id": entry.get("host_id", "")}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header(
+                    "Set-Cookie",
+                    _cookie_header(cfg, cookie_val, secure=_secure_for(self, cfg)),
+                )
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            token_val = self.relay_secret or getattr(cfg, "web_token", "") or ""
+            self._write_json(
+                {
+                    "ok": True,
+                    "mode": "remote",
+                    "host_id": entry.get("host_id", ""),
+                    "token": token_val,
+                },
+                200,
+            )
+            return
+
         if path == "/v1/remotes":
             if not _check_secret(self, self.relay_secret, query_params):
                 self.send_error(401, "unauthorized")
@@ -418,6 +508,7 @@ class TurnHandler(BaseHTTPRequestHandler):
             if row is None:
                 self.send_error(400, err)
                 return
+            _emit_relay_event("remote.changed", {"action": "upsert", "id": row.get("id", "")})
             self._write_json({"ok": True, "remote": row}, 200)
             return
 
@@ -443,6 +534,7 @@ class TurnHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self.send_error(400, str(exc))
                 return
+            _emit_relay_event("workspace.changed", {"action": "create", "workspace": ws.id}, workspace=ws.id)
             self._write_json({"ok": True, "workspace": ws.to_dict()}, 201)
             return
 
@@ -839,6 +931,7 @@ class TurnHandler(BaseHTTPRequestHandler):
                 self.send_error(400, "persona id is required (ids only)")
                 return
             row = create_persona(ws, pid, body)
+            _emit_relay_event("persona.changed", {"action": "create", "persona": pid}, workspace=ws.id)
             self._write_json({"ok": True, "persona": row}, 201)
             return
         if len(parts) == 7 and parts[6] == "sessions":
@@ -853,6 +946,11 @@ class TurnHandler(BaseHTTPRequestHandler):
             except RuntimeError as exc:
                 self.send_error(501, str(exc))
                 return
+            _emit_relay_event(
+                "session.changed",
+                {"action": "create", "persona": persona, "session": str(rec.get("id") or "")},
+                workspace=ws.id,
+            )
             self._write_json({"ok": True, "session": rec}, 201)
             return
         if len(parts) == 7 and parts[6] == "inbox":
@@ -1209,6 +1307,7 @@ class TurnHandler(BaseHTTPRequestHandler):
             except Exception:
                 log.warning("approval telegram prompt failed for %s", ident)
 
+        _emit_relay_event("approval.changed", {"action": "pending", "id": ident}, workspace=tok_ws)
         self._write_json(
             {
                 "ok": True,
@@ -1384,6 +1483,7 @@ class TurnHandler(BaseHTTPRequestHandler):
         if code != 0:
             self.send_error(400 if note == "invalid approval id" else 404, note)
             return
+        _emit_relay_event("approval.changed", {"action": "decide", "id": ident, "allow": allow}, workspace=ws_ref)
         self._write_json({"ok": True, "id": ident, "status": note}, 200)
 
     def _handle_stream(self, body: dict) -> None:
@@ -1471,6 +1571,19 @@ class TurnHandler(BaseHTTPRequestHandler):
         cfg = self._cfg()
         if path == "/v1/auth/status":
             handle_status(self)
+            return
+        if path == "/v1/events":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            ws_filter = str(query_params.get("workspace") or "").strip()
+            if ws_filter and not valid_id(ws_filter):
+                self.send_error(400, f"invalid workspace id: {ws_filter!r}")
+                return
+            from .events import handle_events_sse
+
+            hb = float(getattr(self.server, "events_heartbeat_sec", 25.0))
+            handle_events_sse(self, workspace=ws_filter, heartbeat_sec=hb)
             return
         if path == "/v1/workspaces":
             if not _check_secret(self, self.relay_secret, query_params):
@@ -1693,6 +1806,7 @@ class TurnHandler(BaseHTTPRequestHandler):
             if not delete_remote(self._cfg(), parts[3]):
                 self.send_error(404, "unknown remote")
                 return
+            _emit_relay_event("remote.changed", {"action": "delete", "id": parts[3]})
             self._write_json({"ok": True, "remote": parts[3]}, 200)
             return
         # DELETE /v1/remote/<id>/<upstream-path> — proxied mount.
@@ -1729,6 +1843,7 @@ class TurnHandler(BaseHTTPRequestHandler):
                 code = 409 if "selected workspace" in msg else 400
                 self.send_error(code, msg)
                 return
+            _emit_relay_event("workspace.changed", {"action": "delete", "workspace": ws_id}, workspace=ws_id)
             self._write_json({"ok": True, "workspace": ws_id,
                               "archived": str(out)}, 200)
             return
@@ -1757,6 +1872,7 @@ class TurnHandler(BaseHTTPRequestHandler):
             if out is None:
                 self.send_error(404, "unknown persona")
                 return
+            _emit_relay_event("persona.changed", {"action": "delete", "persona": pid}, workspace=ws.id)
             self._write_json({"ok": True, "persona": pid,
                               "archived": str(out)}, 200)
             return
@@ -1789,6 +1905,11 @@ class TurnHandler(BaseHTTPRequestHandler):
             if not removed:
                 self.send_error(404, "unknown session")
                 return
+            _emit_relay_event(
+                "session.changed",
+                {"action": "delete", "persona": persona, "session": sid},
+                workspace=ws.id,
+            )
             self._write_json({"ok": True, "session": sid}, 200)
             return
         self.send_error(404)
@@ -1802,7 +1923,35 @@ def _bound_relay_url(server: ThreadingHTTPServer) -> str:
     return f"http://{connect_host}:{port}"
 
 
+class _RelayHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def shutdown(self) -> None:
+        try:
+            from .events import shutdown_all
+
+            shutdown_all()
+        except Exception:
+            pass
+        super().shutdown()
+
+    def server_close(self) -> None:
+        try:
+            from .events import shutdown_all
+
+            shutdown_all()
+        except Exception:
+            pass
+        super().server_close()
+
+
 def serve_http(config: RelayConfig, *, on_turn: Callable[..., LoopTurnResult] | None = None) -> ThreadingHTTPServer:
+    try:
+        from .events import reset_bus
+
+        reset_bus()
+    except Exception:
+        pass
     attrs: dict = {
         "relay_secret": config.relay_secret,
         "config": config,
@@ -1818,7 +1967,7 @@ def serve_http(config: RelayConfig, *, on_turn: Callable[..., LoopTurnResult] | 
     except Exception:
         pass
     handler = type("ConfiguredRelayHandler", (TurnHandler,), attrs)
-    server = ThreadingHTTPServer((config.relay_host, config.relay_port), handler)
+    server = _RelayHTTPServer((config.relay_host, config.relay_port), handler)
     bound_url = _bound_relay_url(server)
     effective_cfg = config if config.relay_url else replace(config, relay_url=bound_url)
     handler.config = effective_cfg
