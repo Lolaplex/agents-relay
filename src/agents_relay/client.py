@@ -31,6 +31,54 @@ def _resolve_loopback_secret() -> str:
     return ""
 
 
+def _remote_secret_key(rid: str) -> str:
+    import re
+
+    clean = re.sub(r"[^A-Za-z0-9_.-]+", "_", rid.strip()).upper()
+    return f"REMOTE_{clean}_TOKEN"
+
+
+def _remote_id_for_url(base_url: str) -> str:
+    """Find a registered remote whose ``base_url`` matches ``base_url``."""
+    try:
+        from agents_workspace import Host
+    except ImportError:
+        return ""
+    path = Host.from_env().clients / "remotes.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    remotes = data.get("remotes") if isinstance(data, dict) else None
+    if not isinstance(remotes, dict):
+        return ""
+    want = base_url.rstrip("/")
+    for rid, meta in remotes.items():
+        if not isinstance(meta, dict):
+            continue
+        for key in ("base_url", "url"):
+            if str(meta.get(key) or "").rstrip("/") == want:
+                return str(rid)
+    return ""
+
+
+def _resolve_remote_secret(remote_id: str, base_url: str) -> str:
+    """Resolve ``REMOTE_<ID>_TOKEN`` from the Host Vault for a remote."""
+    rid = remote_id.strip() or _remote_id_for_url(base_url)
+    if not rid:
+        return ""
+    try:
+        from agents_workspace import resolve_secret
+    except ImportError:
+        return ""
+    try:
+        return str(
+            resolve_secret(_remote_secret_key(rid), scope="host") or ""
+        ).strip()
+    except Exception:
+        return ""
+
+
 @dataclass
 class GatewayClient:
     base_url: str = "http://127.0.0.1:8787"
@@ -43,13 +91,18 @@ class GatewayClient:
     persona: str = ""
     project: str = ""
     workspace: str = ""
+    workdir: str = ""
+    remote_id: str = ""
     prefs_path: Path | None = None
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
         tok = (self.secret or "").strip()
-        if not tok and _is_loopback_url(self.base_url):
-            tok = _resolve_loopback_secret()
+        if not tok:
+            if _is_loopback_url(self.base_url):
+                tok = _resolve_loopback_secret()
+            else:
+                tok = _resolve_remote_secret(self.remote_id, self.base_url)
         if tok:
             headers["Authorization"] = f"Bearer {tok}"
         return headers
@@ -75,6 +128,7 @@ class GatewayClient:
                     "persona": self.persona,
                     "project": self.project,
                     "workspace": self.workspace,
+                    "workdir": self.workdir,
                 },
                 indent=2,
             ),
@@ -91,7 +145,7 @@ class GatewayClient:
         for field in ("base_url", "channel", "user"):
             if field not in explicit_set and data.get(field):
                 setattr(self, field, str(data[field]))
-        for field in ("provider", "persona", "project", "workspace"):
+        for field in ("provider", "persona", "project", "workspace", "workdir"):
             if field not in explicit_set and not getattr(self, field) and data.get(field):
                 setattr(self, field, str(data[field]))
 
@@ -115,6 +169,8 @@ class GatewayClient:
             body["project"] = self.project
         if self.workspace:
             body["workspace"] = self.workspace
+        if self.workdir:
+            body["workdir"] = self.workdir
         return body
 
     def turn(self, text: str, *, new_session: bool = False) -> dict[str, Any]:
@@ -156,3 +212,12 @@ class GatewayClient:
         req = urllib.request.Request(url, method="GET")
         with urllib.request.urlopen(req, timeout=10) as resp:
             return json.loads(resp.read().decode("utf-8"))
+
+    def workspaces(self) -> list[dict[str, Any]]:
+        """GET /v1/workspaces rows (enriched; may be empty on old relays)."""
+        url = f"{self.base_url.rstrip('/')}/v1/workspaces"
+        req = urllib.request.Request(url, headers=self._headers(), method="GET")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        rows = data.get("workspaces") if isinstance(data, dict) else None
+        return rows if isinstance(rows, list) else []

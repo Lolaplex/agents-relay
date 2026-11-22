@@ -280,7 +280,10 @@ class TurnHandler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+        self.send_header(
+            "Access-Control-Allow-Methods",
+            "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+        )
         req_headers = (self.headers.get("Access-Control-Request-Headers") or "").strip()
         self.send_header(
             "Access-Control-Allow-Headers",
@@ -1476,9 +1479,9 @@ class TurnHandler(BaseHTTPRequestHandler):
             if not _check_secret(self, self.relay_secret, query_params):
                 self.send_error(401, "unauthorized")
                 return
-            from .workspaces import list_workspaces
+            from .workspaces import list_workspaces, workspace_row
 
-            rows = [ws.to_dict() for ws in list_workspaces()]
+            rows = [workspace_row(ws) for ws in list_workspaces()]
             self._write_json({"ok": True, "workspaces": rows}, 200)
             return
         if path == "/v1/personas":
@@ -1660,7 +1663,20 @@ class TurnHandler(BaseHTTPRequestHandler):
                     return
             body: dict[str, Any] = {"ok": True}
             if path == "/health":
+                body["service"] = "agents-relay"
                 body["version"] = __version__
+                try:
+                    body["port"] = int(self.server.server_address[1])
+                except (AttributeError, IndexError, TypeError, ValueError):
+                    pass
+                # host_id proves a live serve belongs to this <host>; never
+                # expose host filesystem paths here (public probe).
+                try:
+                    from agents_workspace import Host
+
+                    body["host_id"] = Host.from_env().host_id()
+                except Exception:
+                    pass
                 klanker_version = getattr(self, "klanker_version", "") or getattr(
                     self._cfg(), "klanker_version", "")
                 if klanker_version:
@@ -1676,6 +1692,36 @@ class TurnHandler(BaseHTTPRequestHandler):
             proj = query_params.get("project", "")
             result = list_peers(project=proj, config=self._cfg())
             self._write_json(result, 200 if result.get("ok", True) else 502)
+            return
+        self.send_error(404)
+
+    def do_PATCH(self) -> None:
+        path, query_params = _parse_query(self.path)
+        parts = path.split("/")
+        # PATCH /v1/workspaces/<id> — per-workspace separation settings.
+        if (len(parts) == 4 and parts[1] == "v1"
+                and parts[2] == "workspaces" and parts[3]):
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            ws_id = parts[3]
+            if not valid_id(ws_id):
+                self.send_error(400, f"invalid workspace id: {ws_id!r}")
+                return
+            body = self._read_json()
+            if body is None:
+                return
+            from .workspaces import patch_workspace
+
+            try:
+                row = patch_workspace(ws_id, body)
+            except KeyError:
+                self.send_error(404, "unknown workspace")
+                return
+            except ValueError as exc:
+                self.send_error(400, str(exc))
+                return
+            self._write_json({"ok": True, "workspace": row}, 200)
             return
         self.send_error(404)
 

@@ -274,12 +274,16 @@ def notify_approval_pending(config, request: dict[str, Any], ws_ref: str = "") -
     """Best-effort push when an approval goes pending. Never raises."""
     try:
         eff_ws = str(ws_ref or request.get("workspace") or "").strip()
+        summary = str(request.get("summary") or request.get("command") or "")[:160]
         send_push_all(
             config,
             {
                 "type": "approval",
                 "id": str(request.get("id") or request.get("ident") or ""),
-                "summary": str(request.get("summary") or request.get("command") or "")[:160],
+                "summary": summary,
+                # sw.js drops pushes without title/body — always include.
+                "title": "Klanker needs approval",
+                "body": summary,
             },
             ws_ref=eff_ws,
         )

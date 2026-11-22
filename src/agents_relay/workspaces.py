@@ -54,6 +54,62 @@ def select_workspace() -> Workspace:
     return Host.from_env().select_workspace(env=dict(os.environ))
 
 
+def workspace_row(ws: Workspace) -> dict:
+    """Serialized workspace: base fields + per-workspace separation config."""
+    from agents_workspace import read_workspace_config, workspace_config
+
+    row = ws.to_dict()
+    meta = workspace_config(ws)
+    cfg = read_workspace_config(ws)
+    approval = cfg.get("approval") if isinstance(cfg.get("approval"), dict) else {}
+    configured_workdir = str(meta.get("workdir") or "").strip()
+    if configured_workdir:
+        row["workdir"] = configured_workdir
+    row["workdir_lock"] = bool(meta.get("workdir_lock"))
+    row["browser_profile"] = str(meta.get("browser_profile") or "")
+    row["approval_mode"] = str(approval.get("mode") or "")
+    return row
+
+
+_PATCH_FIELDS = frozenset(
+    {"label", "workdir", "workdir_lock", "browser_profile", "approval_mode"}
+)
+
+
+def patch_workspace(ws_id: str, payload: dict) -> dict:
+    """Apply a validated per-workspace config patch; returns the new row.
+
+    Raises ``KeyError`` for unknown workspaces and ``ValueError`` for
+    unknown fields, invalid workdirs, or invalid approval modes.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be a JSON object")
+    unknown = sorted(str(k) for k in payload if k not in _PATCH_FIELDS)
+    if unknown:
+        raise ValueError(f"unknown workspace fields: {', '.join(unknown)}")
+    from agents_workspace import update_workspace_config
+
+    host = Host.from_env()
+    if not host.workspace_exists(ws_id):
+        raise KeyError(ws_id)
+    kwargs: dict = {}
+    if "label" in payload:
+        kwargs["label"] = str(payload["label"] or "")
+    if "workdir" in payload:
+        kwargs["workdir"] = payload["workdir"]
+    if "workdir_lock" in payload:
+        kwargs["workdir_lock"] = bool(payload["workdir_lock"])
+    if "browser_profile" in payload:
+        kwargs["browser_profile"] = payload["browser_profile"]
+    ws = host.update_workspace(ws_id, **kwargs)
+    if "approval_mode" in payload:
+        mode = payload["approval_mode"]
+        update_workspace_config(
+            ws, {"approval": {"mode": mode if mode not in ("", None) else None}}
+        )
+    return workspace_row(host.workspace(ws_id))
+
+
 def list_personas(ws: Workspace) -> list[dict]:
     """Persona manifests under ``<ws>/personas/<id>/persona.json``."""
     root = Path(ws.personas)

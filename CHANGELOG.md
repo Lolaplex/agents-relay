@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Symmetric `RELAY_SECRET`/`RELAY_WEB_TOKEN` auth, `host_id` on `GET /health` (no host_dir leak), `LOOP_PROVIDER` default `openai.default`, `KLANKER_TELEGRAM_OPEN` → `AGENTS_RELAY_ALLOW_ANYONE` compat (#29).
+- `PATCH /v1/workspaces/<id>` (label/workdir/workdir_lock/browser_profile/approval_mode), `PATCH` in CORS Allow-Methods, enriched `GET /v1/workspaces`, per-workspace `workdir`/`workdir_lock` turn env (#32).
+- `GatewayClient` workdir forwarding + `workspaces()` helper; remote proxy hardening: no `cancel.set()` on TCP drop, 600s SSE proxy timeout on stream routes, `posixpath.normpath` + `/v1/*`|`/health` path allowlist + http/https base_url validation, push `title`+`body`, `cookie_warning` on `/v1/auth/status`, `remote_id` vault token auto-resolution (#30).
+
+### Added
 - `GET /v1/workspaces/<ws>/personas/<p>/sessions` rows now carry a `title` derived from the session's first user message (one pass over the trace store), so sidebars can label chats without a per-session history fetch.
 - `acp.<name>` providers are first-class: `serve` drops `<host>/providers/acp.<name>.json` (`kind: acp-agent`) whenever `AGENTS_ACP_CMD` is set, so `/v1/providers`, `/v1/model`, and `runner.model` pick validation treat the foreign agent like any manifest provider. The rows are enriched with the agent's own model/mode config options — probed via a throwaway `initialize`+`session/new`, cached in `<state>/acp_models/<name>.json` for 24 h, re-probed on `GET /v1/model?refresh=1`. Turns with `provider=acp.*` spawn `acp-run` instead of `LOOP_CMD` (precedence: flag > workspace pick > env), and `--model` reaches the agent as `session/set_config_option` `configId=model`. `AGENTS_ACP_CMD_<NAME>` overrides `AGENTS_ACP_CMD` per provider; `AGENTS_ACP_NAME` pins the provider name (otherwise derived from the command basename).
 - `acp-serve` advertises an `llm_api_key` authMethod: the client's `authenticate` call stores the key as `LLM_API_KEY` in the host `secrets.json`. `session/prompt` resolves the selected provider up front and answers with a configuration hint when url/model/key are missing instead of letting the spawned loop fail invisibly.

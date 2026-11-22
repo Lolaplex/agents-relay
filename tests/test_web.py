@@ -532,3 +532,106 @@ class TestPush(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTcpDropAndAuthStatus(unittest.TestCase):
+    """agents-relay#30: TCP drop keeps turn alive; cookie_warning on status."""
+
+    def test_broken_pipe_does_not_cancel_turn(self):
+        from agents_relay import web as web_mod
+        from agents_relay.turn import StreamEvent
+
+        captured: dict = {}
+
+        real_new_run_entry = web_mod._new_run_entry
+
+        def spy_new_run_entry():
+            entry = real_new_run_entry()
+            captured["cancel"] = entry["cancel"]
+            return entry
+
+        def fake_stream(params, config, cancel=None):
+            yield StreamEvent(type="delta", text="hi")
+
+        class FakeWFile:
+            def write(self, data):
+                raise BrokenPipeError("client gone")
+
+            def flush(self):
+                raise BrokenPipeError("client gone")
+
+        class FakeHandler:
+            def __init__(self):
+                self.wfile = FakeWFile()
+                self.headers = {}
+                self._c = _cfg()
+
+            def _cfg(self):
+                return self._c
+
+            def _write_json(self, body, status):
+                captured["error"] = (body, status)
+
+            def send_response(self, code):
+                pass
+
+            def send_header(self, k, v):
+                pass
+
+            def end_headers(self):
+                pass
+
+        with patch.object(web_mod, "iter_loop_stream_live", fake_stream), \
+                patch.object(web_mod, "_new_run_entry", spy_new_run_entry):
+            web_mod.handle_chat_stream(FakeHandler(), {"text": "hi", "run": "r1"})
+        self.assertIn("cancel", captured)
+        self.assertFalse(captured["cancel"].is_set())
+        self.assertEqual(active_runs(), [])
+
+    def _status(self, headers: dict) -> dict:
+        srv = _Server(_cfg())
+        self.addCleanup(srv.close)
+        conn = HTTPConnection(srv.host, srv.port, timeout=10)
+        conn.request("GET", "/v1/auth/status", headers=headers)
+        resp = conn.getresponse()
+        data = json.loads(resp.read().decode())
+        conn.close()
+        return data
+
+    def test_cookie_warning_plain_http_non_loopback(self):
+        data = self._status({"Host": "100.64.1.2:8787"})
+        self.assertTrue(data["secure_cookie"])
+        self.assertIn("tailscale", data["cookie_warning"])
+
+    def test_no_cookie_warning_forwarded_https(self):
+        data = self._status(
+            {"Host": "100.64.1.2:8787", "X-Forwarded-Proto": "https"})
+        self.assertTrue(data["secure_cookie"])
+        self.assertEqual(data["cookie_warning"], "")
+
+    def test_no_cookie_warning_loopback(self):
+        data = self._status({"Host": "127.0.0.1:8787"})
+        self.assertFalse(data["secure_cookie"])
+        self.assertEqual(data["cookie_warning"], "")
+
+
+class TestApprovalPushPayload(unittest.TestCase):
+    def test_notify_approval_pending_has_title_and_body(self):
+        from agents_relay import push as push_mod
+
+        sent: dict = {}
+
+        def fake_send(config, payload, ws_ref=""):
+            sent["payload"] = payload
+            sent["ws_ref"] = ws_ref
+            return 1
+
+        with patch.object(push_mod, "send_push_all", fake_send):
+            push_mod.notify_approval_pending(
+                _cfg(), {"id": "a1", "summary": "rm -rf /tmp/x"}, ws_ref="demo")
+        payload = sent["payload"]
+        self.assertEqual(payload["title"], "Klanker needs approval")
+        self.assertEqual(payload["body"], "rm -rf /tmp/x")
+        self.assertEqual(payload["summary"], "rm -rf /tmp/x")
+        self.assertEqual(payload["type"], "approval")
+        self.assertEqual(sent["ws_ref"], "demo")

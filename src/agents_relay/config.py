@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import os
+import warnings
 
-from agents_workspace import resolve_secret
+from agents_workspace import resolve_relay_token, resolve_secret
 from agents_workspace.compat import read_alias
 import shlex
 from dataclasses import dataclass
@@ -56,6 +57,45 @@ def _flag(val: str) -> bool:
     return _clean(val).lower() in {"1", "true", "yes", "on"}
 
 
+def _allow_anyone() -> bool:
+    if _flag(os.environ.get("AGENTS_RELAY_ALLOW_ANYONE", "")):
+        return True
+    if _flag(os.environ.get("KLANKER_TELEGRAM_OPEN", "")):
+        warnings.warn(
+            "KLANKER_TELEGRAM_OPEN is deprecated; use AGENTS_RELAY_ALLOW_ANYONE",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        return True
+    return False
+
+
+def _auth_tokens() -> tuple[str, str]:
+    """Symmetric ``(relay_secret, web_token)`` resolution.
+
+    Setting only ``RELAY_WEB_TOKEN`` still authorizes Bearer callers and
+    setting only ``RELAY_SECRET`` still enables web cookie login; legacy
+    ``GATEWAY_SECRET`` covers both with a deprecation warning.
+    ``RELAY_NO_AUTH=1`` keeps both empty unless explicitly set in env.
+    """
+    if _flag(os.environ.get("RELAY_NO_AUTH", "")):
+        return (
+            _clean(os.environ.get("RELAY_SECRET", "")),
+            _clean(os.environ.get("RELAY_WEB_TOKEN", "")),
+        )
+    # Explicit env always wins over stored vault tokens.
+    primary = _clean(os.environ.get("RELAY_SECRET", ""))
+    web = _clean(os.environ.get("RELAY_WEB_TOKEN", ""))
+    legacy = _clean(read_alias(None, "RELAY_SECRET", "GATEWAY_SECRET"))
+    if primary or web or legacy:
+        return (primary or web or legacy, web or primary or legacy)
+    try:
+        stored = _clean(resolve_relay_token())
+    except Exception:
+        stored = ""
+    return (stored, stored)
+
+
 def _secret(key: str) -> str:
     """ws/host secrets.json > env. Falls back to env alone when the
     workspace resolver cannot run (config load must not depend on it)."""
@@ -105,10 +145,12 @@ class RelayConfig:
         loop_cmd = tuple(_split_loop_cmd(raw_loop))
         if not loop_cmd:
             loop_cmd = ("python", "-m", "runner.loop")
+        relay_secret, web_token = _auth_tokens()
         return cls(
             loop_cmd=loop_cmd,
-            loop_provider=_clean(os.environ.get("LOOP_PROVIDER", "echo")) or "echo",
-            relay_secret=_clean(_secret("RELAY_SECRET") or read_alias(None, "RELAY_SECRET", "GATEWAY_SECRET")),
+            loop_provider=_clean(os.environ.get("LOOP_PROVIDER", "openai.default"))
+            or "openai.default",
+            relay_secret=relay_secret,
             telegram_bot_token=_clean(_secret("TELEGRAM_BOT_TOKEN")),
             telegram_allowed_chat_ids=_int_list(os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", "")),
             relay_host=_clean(read_alias(None, "RELAY_HOST", "GATEWAY_HOST")) or "127.0.0.1",
@@ -118,14 +160,14 @@ class RelayConfig:
             board_url=_clean(os.environ.get("BOARD_URL", "")).rstrip("/"),
             board_project=_clean(os.environ.get("BOARD_PROJECT", "")),
             board_key_slug=_clean(os.environ.get("BOARD_KEY_SLUG", "gateway")),
-            allow_anyone=_flag(os.environ.get("AGENTS_RELAY_ALLOW_ANYONE", "")),
+            allow_anyone=_allow_anyone(),
             state_dir=_clean(read_alias(None, "AGENTS_RELAY_DIR", "AGENTS_RELAY_STATE")),
             max_jobs=max(1, _int(os.environ.get("AGENTS_RELAY_MAX_JOBS", "8"), 8)),
             max_jobs_per_chat=max(1, _int(os.environ.get("AGENTS_RELAY_MAX_JOBS_PER_CHAT", "3"), 3)),
             approver=_clean(os.environ.get("AGENTS_RELAY_APPROVER", "")),
             attach_dir=_clean(os.environ.get("AGENTS_RELAY_ATTACH_DIR", "")),
             vision=_clean(os.environ.get("AGENTS_RELAY_VISION", "")).lower(),
-            web_token=_clean(_secret("RELAY_WEB_TOKEN")),
+            web_token=web_token,
             web_user=_clean(os.environ.get("RELAY_WEB_USER", "web")) or "web",
             static_dir=_clean(read_alias(None, "AGENTS_RELAY_WEB_DIR", "RELAY_STATIC_DIR")),
             web_secure=_flag(os.environ.get("RELAY_WEB_SECURE", "1")),
