@@ -692,7 +692,7 @@ class TurnHandler(BaseHTTPRequestHandler):
             if body is None:
                 return
             try:
-                ws_ref = str(body.get("workspace") or "").strip()
+                ws_ref = str(body.get("workspace") or query_params.get("workspace") or "").strip()
                 ws = resolve_workspace_id(ws_ref) if ws_ref else None
             except ValueError as exc:
                 self.send_error(400, str(exc))
