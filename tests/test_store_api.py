@@ -68,6 +68,17 @@ def _req(srv: _Srv, method: str, path: str, body: dict | None = None, *, auth: b
     return status, data
 
 
+def _patch_agents_keys_spec():
+    orig = importlib.util.find_spec
+
+    def _find(name: str, package: str | None = None):
+        if name == "agents_keys":
+            return types.SimpleNamespace(origin="fake")
+        return orig(name, package)
+
+    return patch("importlib.util.find_spec", side_effect=_find)
+
+
 class TestStoreApi(unittest.TestCase):
     def tearDown(self) -> None:
         events.shutdown_all()
@@ -364,6 +375,7 @@ class TestStoreApi(unittest.TestCase):
                     run=lambda *_a, **_kw: types.SimpleNamespace(returncode=0, stdout="did:key:z6MkAlice\n")
                 )
                 with (
+                    _patch_agents_keys_spec(),
                     patch.object(store_api, "_load_store_modules", return_value=(fake_db, fake_surface, ValueError)),
                     patch.object(store_api, "subprocess", fake_sub),
                 ):
@@ -390,7 +402,10 @@ class TestStoreApi(unittest.TestCase):
                     calls.append(list(cmd))
                     return types.SimpleNamespace(returncode=0, stdout=next(responses))
 
-                with patch.object(store_api, "subprocess", types.SimpleNamespace(run=_fake_run)):
+                with (
+                    _patch_agents_keys_spec(),
+                    patch.object(store_api, "subprocess", types.SimpleNamespace(run=_fake_run)),
+                ):
                     did0 = store_api.resolve_store_actor(ws, persona="alice")
                     self.assertEqual(did0, expected_host)
                     self.assertEqual(calls, [])
@@ -432,11 +447,14 @@ class TestStoreApi(unittest.TestCase):
                 host.create("alpha", "Alpha")
                 host.keys.mkdir(parents=True, exist_ok=True)
                 (host.keys / "researcher.ed25519").write_bytes(b"r" * 64)
-                with patch.object(
-                    store_api,
-                    "subprocess",
-                    types.SimpleNamespace(
-                        run=lambda *_a, **_kw: types.SimpleNamespace(returncode=0, stdout="did:key:z6MkResearcher\n")
+                with (
+                    _patch_agents_keys_spec(),
+                    patch.object(
+                        store_api,
+                        "subprocess",
+                        types.SimpleNamespace(
+                            run=lambda *_a, **_kw: types.SimpleNamespace(returncode=0, stdout="did:key:z6MkResearcher\n")
+                        ),
                     ),
                 ):
                     _argv, out_env, _ws = relay_turn._container_rewrite(
