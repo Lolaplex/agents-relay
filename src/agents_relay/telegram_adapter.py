@@ -207,6 +207,14 @@ def edit_message(
         raise
 
 
+def delete_message(token: str, chat_id: int, message_id: int) -> dict:
+    body = {"chat_id": chat_id, "message_id": message_id}
+    try:
+        return _post_json(_api_url(token, "deleteMessage"), body)
+    except Exception:
+        return {}
+
+
 def deliver_html(
     token: str,
     chat_id: int,
@@ -626,7 +634,11 @@ def handle_inbound_text(
         )
 
     anim_done.set()
-    deliver_html(token, chat_id, reply_html, thinking_id=thinking_id if isinstance(thinking_id, int) else None)
+    # The reply must be a fresh message: edits never raise a push notification
+    # and a failed edit would strand the "thinking" bubble in the chat.
+    if isinstance(thinking_id, int):
+        delete_message(token, chat_id, thinking_id)
+    deliver_html(token, chat_id, reply_html)
     if voice_reply and config.tts and config.groq_api_key:
         try:
             from .voice import TTS_MODEL, TTS_VOICE, synthesize_speech

@@ -25,13 +25,12 @@ _ISOLATED_TMP = tempfile.TemporaryDirectory()
 
 def setUpModule():
     tmp = _ISOLATED_TMP.name
-    os.environ["AGENTS_WORKSPACES_DIR"] = os.path.join(tmp, "workspaces")
+    os.environ["AGENTS_HOST_DIR"] = os.path.join(tmp, "host")
     os.environ["AGENTS_TRACES_DIR"] = os.path.join(tmp, "traces")
-    os.environ["AGENTS_HOME"] = os.path.join(tmp, "home")
 
 
 def tearDownModule():
-    for key in ("AGENTS_WORKSPACES_DIR", "AGENTS_TRACES_DIR", "AGENTS_HOME"):
+    for key in ("AGENTS_HOST_DIR", "AGENTS_TRACES_DIR"):
         os.environ.pop(key, None)
     _ISOLATED_TMP.cleanup()
 
@@ -241,7 +240,7 @@ class TestHttpTurn(unittest.TestCase):
             server.shutdown()
             server_thread.join(timeout=2)
 
-    def test_process_update_edits_message(self):
+    def test_process_update_replaces_thinking_with_reply(self):
         from agents_relay.telegram_adapter import process_update
         from agents_relay.loop_client import LoopTurnResult
 
@@ -263,7 +262,8 @@ class TestHttpTurn(unittest.TestCase):
             }
         }
         with patch("agents_relay.telegram_adapter.send_message", return_value={"result": {"message_id": 99}}) as mock_send:
-            with patch("agents_relay.telegram_adapter.edit_message") as mock_edit:
+            with patch("agents_relay.telegram_adapter.edit_message"), \
+                    patch("agents_relay.telegram_adapter.delete_message") as mock_delete:
                 def fake_turn(*args, **kwargs):
                     if "on_status" in kwargs and kwargs["on_status"]:
                         kwargs["on_status"]("running mcp.terminal...")
@@ -277,9 +277,8 @@ class TestHttpTurn(unittest.TestCase):
                     )
 
                 process_update(fake_update, config=cfg, on_turn=fake_turn)
-                mock_send.assert_called_once()
-                self.assertGreaterEqual(mock_edit.call_count, 1)
-                self.assertIn("Echo: test message", mock_edit.call_args[0][3])
+                mock_delete.assert_called_once_with("fake_bot_token", 12345, 99)
+                self.assertIn("Echo: test message", mock_send.call_args[0][2])
 
 
 
@@ -718,7 +717,7 @@ class TestInject(unittest.TestCase):
         self.assertEqual(inj_kw["chat_id"], 12345)
         self.assertEqual(inj_kw["text"], "hello from inject")
 
-    def test_inject_edits_thinking_then_final(self):
+    def test_inject_deletes_thinking_then_final(self):
         from agents_relay.loop_client import LoopTurnResult
         from agents_relay.telegram_adapter import inject_text
 
@@ -742,7 +741,8 @@ class TestInject(unittest.TestCase):
             "agents_relay.telegram_adapter.send_message",
             return_value={"result": {"message_id": 77}},
         ) as mock_send:
-            with patch("agents_relay.telegram_adapter.edit_message") as mock_edit:
+            with patch("agents_relay.telegram_adapter.edit_message"), \
+                    patch("agents_relay.telegram_adapter.delete_message") as mock_delete:
                 result = inject_text(
                     chat_id=12345, text="was steht diese woche an?", config=cfg, on_turn=fake_turn
                 )
@@ -750,9 +750,8 @@ class TestInject(unittest.TestCase):
         self.assertEqual(result.reply, "Calendar empty.")
         self.assertEqual(seen[0]["channel"], "telegram")
         self.assertEqual(seen[0]["user"], "12345")
-        mock_send.assert_called_once()
-        self.assertGreaterEqual(mock_edit.call_count, 1)
-        self.assertIn("Calendar empty.", mock_edit.call_args[0][3])
+        mock_delete.assert_called_once_with("fake_bot_token", 12345, 77)
+        self.assertIn("Calendar empty.", mock_send.call_args[0][2])
 
     def test_inject_denylist(self):
         from agents_relay.telegram_adapter import inject_text
@@ -1444,7 +1443,6 @@ class TestMemberRoleAuthz(unittest.TestCase):
             os.environ,
             {
                 "AGENTS_HOST_DIR": str(root / "host"),
-                "AGENTS_WORKSPACES_DIR": str(root / "host" / "workspaces"),
                 "AGENTS_WORKSPACE": "demo",
             },
         )
