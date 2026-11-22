@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import queue
 import threading
 import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler
 from typing import Any
+
+log = logging.getLogger("agents_relay.events")
 
 
 @dataclass
@@ -72,6 +75,12 @@ class EventBus:
             except queue.Full:
                 try:
                     sub.queue.get_nowait()
+                    log.warning(
+                        "sse subscriber queue full; dropped oldest event (id=%s kind=%s ws=%s)",
+                        evt["id"],
+                        kind,
+                        ws_clean,
+                    )
                 except queue.Empty:
                     pass
                 try:

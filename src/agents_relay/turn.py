@@ -147,14 +147,23 @@ def _resolve_provider_and_model(
     return provider or config.loop_provider, model
 
 
-def _provider_from_argv(argv: list[str] | tuple[str, ...]) -> str:
+def _flag_from_argv(argv: list[str] | tuple[str, ...], flag: str) -> str:
     items = list(argv)
+    prefix = f"{flag}="
     for idx, item in enumerate(items):
-        if item == "--provider" and idx + 1 < len(items):
+        if item == flag and idx + 1 < len(items):
             return str(items[idx + 1]).strip()
-        if item.startswith("--provider="):
-            return item.split("=", 1)[1].strip()
+        if item.startswith(prefix):
+            return item[len(prefix) :].strip()
     return ""
+
+
+def _provider_from_argv(argv: list[str] | tuple[str, ...]) -> str:
+    return _flag_from_argv(argv, "--provider")
+
+
+def _persona_from_argv(argv: list[str] | tuple[str, ...]) -> str:
+    return _flag_from_argv(argv, "--persona")
 
 
 def _provider_key_env(provider: str, ws: "Workspace | None" = None) -> str:
@@ -312,6 +321,15 @@ def _container_rewrite(
         ws = resolve_workspace_id(workspace)
     except Exception:
         return argv, env, None
+    if env is not None and not env.get("AGENTS_ACTOR_DID"):
+        try:
+            from .store_api import resolve_store_actor
+
+            actor_did = resolve_store_actor(ws, persona=_persona_from_argv(argv))
+            if actor_did:
+                env["AGENTS_ACTOR_DID"] = actor_did
+        except Exception:
+            pass
     try:
         from agents_workspace.runtime import isolation_of, to_container_argv, to_container_env
     except ImportError:

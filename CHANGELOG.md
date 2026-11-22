@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `handle_store_append` now binds `actor` strictly from the trusted caller `persona` context (ignoring attacker-supplied `body["persona"]`), `resolve_store_actor` skips `agents-keys did` subprocess overhead when `<host>/keys/<slug>.ed25519` is absent and invalidates `_DID_CACHE` on key file `(st_mtime_ns, st_size)` changes, `turn._container_rewrite` populates `AGENTS_ACTOR_DID` upfront for child turns, and `EventBus.emit` logs a warning when a slow subscriber's full queue drops the oldest event.
+
 ### Added
 - Symmetric `RELAY_SECRET`/`RELAY_WEB_TOKEN` auth, `host_id` on `GET /health` (no host_dir leak), `LOOP_PROVIDER` default `openai.default`, `KLANKER_TELEGRAM_OPEN` → `AGENTS_RELAY_ALLOW_ANYONE` compat (#29).
 - `PATCH /v1/workspaces/<id>` (label/workdir/workdir_lock/browser_profile/approval_mode), `PATCH` in CORS Allow-Methods, enriched `GET /v1/workspaces`, per-workspace `workdir`/`workdir_lock` turn env (#32).
