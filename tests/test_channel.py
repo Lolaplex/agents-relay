@@ -295,6 +295,57 @@ class TestChannelWire(unittest.TestCase):
         self.assertEqual(st, 200)
         self.assertTrue(body["ok"])
 
+    def test_lease_acquire_contend_release(self):
+        res_a = self._redeem_device()
+        res_b = self._redeem_device()
+        auth_a = {"Authorization": f"Bearer {res_a['token']}"}
+        auth_b = {"Authorization": f"Bearer {res_b['token']}"}
+        st, g = self.srv.req(
+            "POST", "/v1/hub/lease",
+            {"action": "acquire", "ws": "w1", "session": "s1", "run_id": "r1"},
+            headers=auth_a)
+        self.assertEqual(st, 200)
+        self.assertTrue(g["granted"])
+        fence = g["fence"]
+        # second device contends -> denied, holder named
+        st, d = self.srv.req(
+            "POST", "/v1/hub/lease",
+            {"action": "acquire", "ws": "w1", "session": "s1", "run_id": "r2"},
+            headers=auth_b)
+        self.assertEqual(st, 200)
+        self.assertFalse(d["granted"])
+        # holder renews
+        st, r = self.srv.req(
+            "POST", "/v1/hub/lease",
+            {"action": "renew", "ws": "w1", "session": "s1", "fence": fence},
+            headers=auth_a)
+        self.assertTrue(r["granted"])
+        # admin snapshot names the holder; device token denied
+        st, snap = self.srv.req(
+            "GET", "/v1/hub/leases",
+            headers={"Authorization": "Bearer expected"})
+        self.assertEqual(st, 200)
+        self.assertEqual(snap["leases"][0]["session"], "s1")
+        st, _ = self.srv.req("GET", "/v1/hub/leases", headers=auth_b)
+        self.assertEqual(st, 401)
+        # release frees the slot for the contender
+        self.srv.req(
+            "POST", "/v1/hub/lease",
+            {"action": "release", "ws": "w1", "session": "s1", "fence": fence},
+            headers=auth_a)
+        st, g2 = self.srv.req(
+            "POST", "/v1/hub/lease",
+            {"action": "acquire", "ws": "w1", "session": "s1"},
+            headers=auth_b)
+        self.assertTrue(g2["granted"])
+
+    def test_lease_requires_device_token(self):
+        st, _ = self.srv.req(
+            "POST", "/v1/hub/lease",
+            {"action": "acquire", "ws": "w", "session": "s"},
+            headers={"Authorization": "Bearer expected"})
+        self.assertEqual(st, 401)
+
 
 class TestChannelE2E(unittest.TestCase):
     """Full path: pair -> ChannelClient stream -> hub rpc_call over the wire."""
