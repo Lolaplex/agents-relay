@@ -898,9 +898,12 @@ class TestInject(unittest.TestCase):
                     })
                     conn.request(
                         "POST",
-                        "/v1/inject?secret=expected&prefix=Ops+Alert",
+                        "/v1/inject?prefix=Ops+Alert",
                         body=webhook_body,
-                        headers={"Content-Type": "application/json"},
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": "Bearer expected",
+                        },
                     )
                     resp = conn.getresponse()
                     self.assertEqual(resp.status, 200)
@@ -1467,6 +1470,87 @@ class TestMemberRoleAuthz(unittest.TestCase):
 
         self.assertFalse(chat_allowed(999, self._cfg(allowed=())))
         self.assertTrue(chat_allowed(999, self._cfg(allowed=(999,))))
+
+
+class TestWave1SecurityHardening(unittest.TestCase):
+    def test_v1_rejects_query_param_secret_and_token(self):
+        cfg = _test_config()
+        srv = serve_http(cfg)
+        host, port = srv.server_address  # type: ignore[misc]
+        th = threading.Thread(target=srv.serve_forever, daemon=True)
+        th.start()
+        try:
+            for method, path, body in (
+                ("GET", "/v1/workspaces?token=expected", None),
+                ("GET", "/v1/workspaces?secret=expected", None),
+                ("POST", "/v1/inject?secret=expected", json.dumps({"message": "hi"})),
+            ):
+                conn = HTTPConnection(host, port, timeout=5)
+                hdrs = {"Content-Type": "application/json"} if body else {}
+                conn.request(method, path, body=body, headers=hdrs)
+                resp = conn.getresponse()
+                resp.read()
+                self.assertEqual(resp.status, 401, (method, path))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            th.join(timeout=2)
+
+    def test_redact_log_text_hides_query_secrets(self):
+        from agents_relay.http_adapter import _redact_log_text
+
+        self.assertEqual(
+            _redact_log_text("GET /?token=supersecret&x=1 HTTP/1.1"),
+            "GET /?token=[REDACTED]&x=1 HTTP/1.1",
+        )
+        self.assertEqual(
+            _redact_log_text("POST /v1/turn?a=1&secret=topsecret HTTP/1.1"),
+            "POST /v1/turn?a=1&secret=[REDACTED] HTTP/1.1",
+        )
+
+    def test_gateway_client_prefs_and_loopback_bearer(self):
+        from agents_relay.client import GatewayClient
+        from agents_workspace import Host, write_secret
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            prefs = root / "prefs.json"
+            prefs.write_text(
+                json.dumps(
+                    {
+                        "base_url": "http://127.0.0.1:9999",
+                        "secret": "legacy-plaintext-secret",
+                        "workspace": "stale-ws",
+                        "provider": "echo",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            client = GatewayClient(
+                base_url="http://127.0.0.1:8787",
+                workspace="cli-ws",
+                prefs_path=prefs,
+            )
+            client.load_prefs(explicit={"base_url", "workspace"})
+            self.assertEqual(client.secret, "")
+            self.assertEqual(client.base_url, "http://127.0.0.1:8787")
+            self.assertEqual(client.workspace, "cli-ws")
+            self.assertEqual(client.provider, "echo")
+
+            client.secret = "ephemeral-secret"
+            client._save_prefs()
+            saved = json.loads(prefs.read_text(encoding="utf-8"))
+            self.assertNotIn("secret", saved)
+
+            host_dir = root / "host"
+            Host.open(host_dir).create("demo")
+            write_secret("RELAY_WEB_TOKEN", "vault-web-tok", host=Host.open(host_dir), scope="host")
+            with patch.dict(os.environ, {"AGENTS_HOST_DIR": str(host_dir)}, clear=False):
+                auto = GatewayClient(base_url="http://127.0.0.1:8787")
+                hdrs = auto._headers()
+                self.assertEqual(hdrs.get("Authorization"), "Bearer vault-web-tok")
+                remote = GatewayClient(base_url="https://remote.example")
+                self.assertNotIn("Authorization", remote._headers())
 
 
 if __name__ == "__main__":
