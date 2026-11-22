@@ -422,6 +422,23 @@ class TestChannelE2E(unittest.TestCase):
         self.assertIsNone(link.queue.get_nowait())  # sentinel, not a hang
         self.assertFalse(hub.is_connected("d1"))
 
+    def test_op_ack_handlers_replace_default_fanout(self):
+        """Sync layer owns upstream ops; acks route to it verbatim."""
+        hub = channel.hub()
+        got_op, got_ack = [], []
+        hub.set_op_handler(lambda did, p: got_op.append((did, p)))
+        hub.set_ack_handler(lambda did, p: got_ack.append((did, p)))
+        try:
+            hub.handle_upstream("dX", [
+                {"kind": "op", "payload": {"ws": "w1", "envelopes": []}},
+                {"kind": "ack", "payload": {"ws": "w1", "cursor": 9}},
+            ])
+        finally:
+            hub.set_op_handler(None)
+            hub.set_ack_handler(None)
+        self.assertEqual(got_op, [("dX", {"ws": "w1", "envelopes": []})])
+        self.assertEqual(got_ack, [("dX", {"ws": "w1", "cursor": 9})])
+
     def test_e2e_presence_list(self):
         did = self._connect_client()
         self._wait_connected(did)

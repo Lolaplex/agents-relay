@@ -281,6 +281,9 @@ class ChannelClient:
         self._outbox: "queue.Queue[dict]" = queue.Queue(maxsize=512)
         self._stop = threading.Event()
         self._seq_dirty = 0
+        self.on_op = None    # fn(payload) — wired by the sync layer
+        self.on_ack = None   # fn(payload) — wired by the sync layer
+        self.on_hello = None  # fn(payload) — reconnect catch-up trigger
 
     def _persist_seq(self, force: bool = False) -> None:
         """Flush the resume cursor so a restart replays only the tail."""
@@ -409,9 +412,18 @@ class ChannelClient:
                         self._persist_seq()
                     if kind == "rpc-req":
                         self._dispatch_rpc(msg)
+                    elif kind == "hello":
+                        if self.on_hello is not None:
+                            self.on_hello(msg.get("payload") or {})
+                    elif kind == "op":
+                        if self.on_op is not None:
+                            self.on_op(msg.get("payload") or {})
+                    elif kind == "ack":
+                        if self.on_ack is not None:
+                            self.on_ack(msg.get("payload") or {})
                     elif kind == "resync":
                         self.last_seq = 0  # full resync handled by op-log layer
-                    # hello/presence/op/ack are consumed by the sync layer later
+                    # hello/presence are informational only
                 self._persist_seq(force=True)
                 backoff = _RECONNECT_MIN
             except (urllib.error.URLError, OSError, TimeoutError) as exc:
@@ -425,12 +437,22 @@ class ChannelClient:
         self._stop.set()
 
 
+CLIENT_HOOKS: list = []
+
+
+def on_client(fn) -> None:
+    """fn(client) fires for every booted hub link — klanker wires sync here."""
+    CLIENT_HOOKS.append(fn)
+
+
 def run_hub_channels(config: RelayConfig | None = None) -> list[ChannelClient]:
     """Boot all stored hub links — called by `klanker serve` when hub.enabled."""
     clients = []
     for hub_id in _load_hubs():
         try:
             c = ChannelClient(hub_id, config=config)
+            for hook in CLIENT_HOOKS:
+                hook(c)
             threading.Thread(target=c.run_forever, daemon=True).start()
             clients.append(c)
             log.info("hub channel started: %s -> %s", hub_id, c.hub_url)

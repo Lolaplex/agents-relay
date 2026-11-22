@@ -91,6 +91,8 @@ class ChannelHub:
         self._channels: dict[str, _Channel] = {}
         self._pending: dict[str, "queue.Queue[dict[str, Any]]"] = {}
         self._gen: dict[str, int] = {}
+        self._op_handler = None
+        self._ack_handler = None
 
     # -- link lifecycle -------------------------------------------------
 
@@ -164,6 +166,14 @@ class ChannelHub:
 
     # -- upstream ---------------------------------------------------------
 
+    def set_op_handler(self, fn) -> None:
+        """fn(device_id, op_payload) replaces default fan-out for upstream ops."""
+        self._op_handler = fn
+
+    def set_ack_handler(self, fn) -> None:
+        """fn(device_id, ack_payload) receives upstream op-acks."""
+        self._ack_handler = fn
+
     def handle_upstream(self, device_id: str, msgs: list[dict[str, Any]]) -> dict[str, Any]:
         """Device POSTed envelopes: route rpc-res to pending calls, ack ops,
         forward ops to other devices (allowlist-filtered upstream)."""
@@ -182,8 +192,14 @@ class ChannelHub:
                         pass
             elif kind == "op":
                 acked += 1
-                self.broadcast("op", payload, skip={device_id})
-            elif kind in ("ack", "presence"):
+                if self._op_handler is not None:
+                    self._op_handler(device_id, payload)
+                else:
+                    self.broadcast("op", payload, skip={device_id})
+            elif kind == "ack":
+                if self._ack_handler is not None:
+                    self._ack_handler(device_id, payload)
+            elif kind == "presence":
                 pass
         return {"acked": acked}
 
