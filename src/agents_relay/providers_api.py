@@ -192,16 +192,35 @@ def probe_provider(config: Any, name: str) -> dict[str, Any]:
         from .acp import acp_agent_cmd, acp_agent_info
 
         if not acp_agent_cmd(name):
-            return {"status": "error", "detail": "no agent command configured"}
+            return {
+                "status": "error",
+                "detail": "no agent command — edit the row to set one (e.g. 'devin acp')",
+            }
         info = acp_agent_info(config, name, refresh=True)
         models = info.get("models") or []
+        if info.get("auth_required") and not models:
+            suffix = name.split(".", 1)[1].upper() if "." in name else ""
+            return {
+                "status": "auth",
+                "detail": (
+                    f"agent requires auth — set AGENTS_ACP_API_KEY_{suffix} "
+                    "or AGENTS_ACP_API_KEY in host env/vault, or run the "
+                    "agent's own login on the host"
+                ),
+                "auth_methods": info.get("auth_methods") or [],
+                "models": [],
+            }
         if info.get("error") and not models:
-            return {"status": "error", "detail": str(info["error"]), "models": []}
+            detail = str(info["error"])
+            if "not on PATH" in detail or "WinError 2" in detail:
+                detail = f"{detail} — fix the command via edit"
+            return {"status": "error", "detail": detail, "models": []}
         return {
             "status": "ok",
             "detail": f"{len(models)} model(s)" if models else "agent reachable",
             "models": models,
             "modes": info.get("modes") or [],
+            "auth_methods": info.get("auth_methods") or [],
         }
     if kind in ("echo", "scripted"):
         return {"status": "ok", "detail": f"{kind} provider"}

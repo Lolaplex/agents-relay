@@ -571,6 +571,25 @@ def _acp_env(workdir: str = "") -> dict[str, str] | None:
     return out
 
 
+def _resolve_spawn_argv(argv: list[str]) -> list[str]:
+    """Windows: npm-style ``*.cmd``/``*.bat`` shims need cmd.exe to run.
+
+    CreateProcess (shell=False) only executes PE binaries — ``devin`` ships
+    ``devin.cmd`` → WinError 2 without this wrap.
+    """
+    if os.name != "nt" or not argv:
+        return argv
+    import shutil
+
+    exe = shutil.which(argv[0])
+    if not exe:
+        raise FileNotFoundError(f"agent command not on PATH: {argv[0]}")
+    argv = [exe] + argv[1:]
+    if exe.lower().endswith((".cmd", ".bat")):
+        return ["cmd.exe", "/c"] + argv
+    return argv
+
+
 class _AgentConn:
     """Spawn an ACP agent child; send requests, consume responses/updates."""
 
@@ -580,11 +599,12 @@ class _AgentConn:
         cwd: str | None = None,
         env: dict[str, str] | None = None,
     ) -> None:
+        argv = _resolve_spawn_argv(argv)
         self.proc = subprocess.Popen(
             argv,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
@@ -592,6 +612,8 @@ class _AgentConn:
             cwd=cwd,
             env=env,
         )
+        self._stderr_lines: list[str] = []
+        threading.Thread(target=self._drain_stderr, daemon=True).start()
         assert self.proc.stdin is not None and self.proc.stdout is not None
         self.writer = _Writer(self.proc.stdin)
         self._id = itertools.count(1)
@@ -600,6 +622,17 @@ class _AgentConn:
         self.on_update: Callable[[dict[str, Any]], None] | None = None
         self._reader = threading.Thread(target=self._pump, daemon=True)
         self._reader.start()
+
+    def _drain_stderr(self) -> None:
+        try:
+            for line in self.proc.stderr or []:
+                self._stderr_lines.append(line.rstrip())
+                del self._stderr_lines[:-20]
+        except Exception:
+            pass
+
+    def stderr_tail(self) -> str:
+        return "; ".join(self._stderr_lines[-3:])
 
     def _pump(self) -> None:
         for msg in _read_messages(self.proc.stdout):
@@ -695,6 +728,33 @@ def acp_agent_cmd(provider: str = "") -> str:
     return os.environ.get("AGENTS_ACP_CMD", "").strip()
 
 
+def acp_api_key(provider: str = "") -> str:
+    """API key for ``authenticate``: per-name env/vault over shared.
+
+    ``AGENTS_ACP_API_KEY_<NAME>`` > ``AGENTS_ACP_API_KEY`` > host vault
+    (same env names via resolve_secret)."""
+    suffix = provider.split(".", 1)[1] if provider.startswith("acp.") else ""
+    names = (
+        [f"AGENTS_ACP_API_KEY_{suffix.upper()}", "AGENTS_ACP_API_KEY"]
+        if suffix
+        else ["AGENTS_ACP_API_KEY"]
+    )
+    for env_name in names:
+        val = os.environ.get(env_name, "").strip()
+        if val:
+            return val
+    for env_name in names:
+        try:
+            from agents_workspace import resolve_secret
+
+            val = str(resolve_secret(env_name) or "").strip()
+            if val:
+                return val
+        except Exception:
+            break
+    return ""
+
+
 def acp_provider_name() -> str:
     """``acp.<name>`` — explicit AGENTS_ACP_NAME, else first argv basename."""
     name = os.environ.get("AGENTS_ACP_NAME", "").strip()
@@ -707,12 +767,20 @@ def acp_provider_name() -> str:
     return f"acp.{name}"
 
 
-def probe_acp_agent(agent_argv: list[str], timeout: float = 20) -> dict[str, Any]:
-    """Spawn the agent briefly; collect its model/mode config options."""
-    out: dict[str, Any] = {"model": "", "models": [], "mode": "", "modes": []}
+def probe_acp_agent(
+    agent_argv: list[str], timeout: float = 20, provider: str = ""
+) -> dict[str, Any]:
+    """Spawn the agent briefly; collect its model/mode config options.
+
+    Surfaces ``auth_methods``/``auth_required``/``error`` so the UI can
+    show the real connect path instead of a silently empty model list."""
+    out: dict[str, Any] = {
+        "model": "", "models": [], "mode": "", "modes": [],
+        "auth_methods": [], "auth_required": False,
+    }
     conn = _AgentConn(agent_argv, env=_acp_env())
     try:
-        conn.request(
+        init = conn.request(
             "initialize",
             {
                 "protocolVersion": PROTOCOL_VERSION,
@@ -721,9 +789,36 @@ def probe_acp_agent(agent_argv: list[str], timeout: float = 20) -> dict[str, Any
             },
             timeout=timeout,
         )
+        if "error" in init:
+            out["error"] = str(init["error"])
+            return out
+        auth_methods = (init.get("result") or {}).get("authMethods") or []
+        out["auth_methods"] = [
+            str(m.get("id") or "") for m in auth_methods if m.get("id")
+        ]
+        api_key = acp_api_key(provider)
+        if auth_methods and api_key:
+            res = conn.request(
+                "authenticate",
+                {
+                    "methodId": str(auth_methods[0].get("id")),
+                    "meta": {"api_key": api_key},
+                },
+                timeout=timeout,
+            )
+            if "error" in res:
+                out["error"] = f"authenticate: {res['error']}"
+                out["auth_required"] = True
+                return out
         res = conn.request(
             "session/new", {"cwd": os.getcwd(), "mcpServers": []}, timeout=timeout
         )
+        if "error" in res:
+            err = str(res["error"])
+            out["error"] = err
+            if auth_methods or "auth" in err.lower():
+                out["auth_required"] = True
+            return out
         for opt in (res.get("result") or {}).get("configOptions") or []:
             oid = str(opt.get("id") or "")
             if oid not in out:
@@ -765,16 +860,26 @@ def acp_agent_info(
     import shlex
 
     try:
-        data = probe_acp_agent(shlex.split(cmd, posix=(os.name != "nt")))
+        data = probe_acp_agent(
+            shlex.split(cmd, posix=(os.name != "nt")), provider=provider
+        )
         data["ts"] = time.time()
         path.parent.mkdir(parents=True, exist_ok=True)
         write_json_atomic(path, data)
         return data
     except Exception as exc:
+        # Cache the failure briefly too — an unreachable agent would
+        # otherwise re-spawn on every probe request.
+        err = {"error": str(exc), "model": "", "models": [], "ts": time.time()}
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_json_atomic(path, err)
+        except Exception:
+            pass
         if cached:
             cached["error"] = str(exc)
             return cached
-        return {"error": str(exc), "model": "", "models": []}
+        return err
 
 
 def acp_provider_rows(config: RelayConfig, refresh: bool = False) -> list[dict[str, Any]]:
@@ -810,7 +915,8 @@ def acp_provider_rows(config: RelayConfig, refresh: bool = False) -> list[dict[s
             info = acp_agent_info(config, name, refresh=True)
         else:
             info = read_json(acp_models_cache_path(name, config)) or {}
-        for key in ("model", "models", "mode", "modes", "error"):
+        for key in ("model", "models", "mode", "modes", "error",
+                    "auth_methods", "auth_required"):
             if info.get(key):
                 row[key] = info[key]
         rows.append(row)
@@ -860,6 +966,7 @@ def run_acp_turn(
     config: RelayConfig,
     deliver: str = "stream",
     model: str = "",
+    provider: str = "",
 ) -> int:
     """One loop-shaped turn against a foreign ACP agent.
 
@@ -882,7 +989,7 @@ def run_acp_turn(
             },
         )
         auth_methods = (init.get("result") or {}).get("authMethods") or []
-        api_key = os.environ.get("AGENTS_ACP_API_KEY", "").strip()
+        api_key = acp_api_key(provider)
         if auth_methods and api_key:
             res = conn.request(
                 "authenticate",
@@ -894,7 +1001,12 @@ def run_acp_turn(
         # No key: proceed anyway — the agent may already be authenticated
         # out-of-band (`devin auth login` creds, SSH, etc.). If not, the
         # session request below fails loudly instead of a speculative
-        # refusal here.
+        # refusal here. Point at the key path when the agent wants auth.
+        if auth_methods and not api_key:
+            sys.stderr.write(
+                f"acp agent requests auth ({', '.join(str(m.get('id')) for m in auth_methods)}) — "
+                "set AGENTS_ACP_API_KEY or the per-provider variant in env/host vault\n"
+            )
         acp_sid = str(stored.get("acpSessionId") or "")
         loaded = False
         if acp_sid:
@@ -994,4 +1106,5 @@ def acp_loop_main(args: Any, config: RelayConfig) -> int:
         config=config,
         deliver="buffered" if getattr(args, "deliver", "stream") == "buffered" else "stream",
         model=str(getattr(args, "model", "") or "").strip(),
+        provider=provider,
     )
