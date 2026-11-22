@@ -823,11 +823,14 @@ class TurnHandler(BaseHTTPRequestHandler):
             session = str(body.get("session") or query_params.get("session") or "").strip()
             try:
                 if body.get("clear"):
-                    out = clear(workspace=ws)
                     if session:
+                        # Clear only the session override; the ws pick stays
+                        # the last-used seed for new chats.
                         from .providers_api import clear_session_pick
 
-                        clear_session_pick(session)
+                        out = clear_session_pick(session)
+                    else:
+                        out = clear(workspace=ws)
                 else:
                     provider = str(body.get("provider") or "").strip()
                     if not provider:

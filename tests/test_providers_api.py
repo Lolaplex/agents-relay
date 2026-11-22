@@ -196,13 +196,16 @@ class TestSessionPicksAndFavorites(unittest.TestCase):
             (Path(self.tmp.name) / "clients" / "sessions.json").read_text("utf-8")
         )
         self.assertEqual(picks["ses_a"]["provider"], "echo")
-        # Clear drops the session pick but keeps the ws pick.
+        # Clear with a session drops only the session override — the ws
+        # last-used pick is untouched and shines through again.
         status, data = self.srv.request(
             "POST", "/v1/model", {"clear": True, "session": "ses_a"}
         )
         self.assertEqual(status, 200)
         status, data = self.srv.request("GET", "/v1/model?workspace=qa&session=ses_a")
-        self.assertEqual(data["model"], "")
+        self.assertEqual(data["model"], "m1")
+        status, data = self.srv.request("GET", "/v1/model?workspace=qa")
+        self.assertEqual(data["provider"], "echo")
 
     def test_session_pick_reaches_turn_resolution(self):
         from agents_relay.providers_api import set_session_pick
