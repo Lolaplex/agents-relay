@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `POST /v1/model` accepts `workspace` from the query string as well as the JSON body, matching `GET /v1/model`.
+- Turn provider fallback prefers a self-configured provider manifest (non-empty `url`) over the `openai.default` stub when `LOOP_PROVIDER` is unset and exactly one configured provider exists; explicit picks are never rewritten.
 - `handle_store_append` now binds `actor` strictly from the trusted caller `persona` context (ignoring attacker-supplied `body["persona"]`), `resolve_store_actor` skips `agents-keys did` subprocess overhead when `<host>/keys/<slug>.ed25519` is absent and invalidates `_DID_CACHE` on key file `(st_mtime_ns, st_size)` changes, `turn._container_rewrite` populates `AGENTS_ACTOR_DID` upfront for child turns, and `EventBus.emit` logs a warning when a slow subscriber's full queue drops the oldest event.
 
 ### Added

@@ -98,6 +98,20 @@ class TestModelEndpoint(unittest.TestCase):
         )
         self.assertEqual(status, 400)
 
+    def test_post_model_accepts_workspace_query_param(self):
+        status, data = self.srv.request(
+            "POST", "/v1/model?workspace=qa", {"provider": "echo"}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(data["provider"], "echo")
+        status, data = self.srv.request("GET", "/v1/model?workspace=qa")
+        self.assertEqual(data["provider"], "echo")
+        # The pick must not leak into another workspace's config.
+        other = self.host.create("other", env=os.environ)
+        status, data = self.srv.request("GET", f"/v1/model?workspace={other.id}")
+        self.assertEqual(status, 200, f"unexpected response: {data}")
+        self.assertEqual(data["provider"], "")
+
     def test_model_requires_auth(self):
         conn = HTTPConnection(self.srv.host, self.srv.port, timeout=10)
         conn.request("GET", "/v1/model")
@@ -152,6 +166,68 @@ class TestTelegramModelCommand(unittest.TestCase):
                 _set_chat_pref(42, "model", "echo:fresh", cfg)
                 self.assertEqual(_chat_model(42, cfg), ("echo", "fresh"))
                 self.assertTrue((host_dir / "clients" / "telegram.json").is_file())
+
+
+class TestPreferConfiguredDefault(unittest.TestCase):
+    """_prefer_configured_default prefers a configured provider over the openai.default stub."""
+
+    def _write_provider(self, folder: Path, name: str, **fields) -> None:
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / f"{name}.json").write_text(
+            json.dumps({
+                "name": name,
+                "kind": "openai_compat",
+                "verb": "chat.completions",
+                "cadence": "on_request",
+                "rests_on": "test fixture",
+                **fields,
+            }),
+            encoding="utf-8",
+        )
+
+    def test_single_configured_provider_wins_over_stub(self):
+        from agents_relay.turn import _prefer_configured_default
+
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / "providers"
+            self._write_provider(folder, "openrouter.local", url="https://openrouter.ai/api/v1")
+            with patch.dict(os.environ, {"AGENTS_PROVIDERS_DIR": str(folder)}, clear=False):
+                self.assertEqual(
+                    _prefer_configured_default("openai.default"), "openrouter.local"
+                )
+
+    def test_ambiguous_providers_keep_stub(self):
+        from agents_relay.turn import _prefer_configured_default
+
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / "providers"
+            self._write_provider(folder, "one.local", url="https://one.example")
+            self._write_provider(folder, "two.local", url="https://two.example")
+            with patch.dict(os.environ, {"AGENTS_PROVIDERS_DIR": str(folder)}, clear=False):
+                self.assertEqual(
+                    _prefer_configured_default("openai.default"), "openai.default"
+                )
+
+    def test_no_configured_provider_keeps_stub(self):
+        from agents_relay.turn import _prefer_configured_default
+
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / "providers"
+            self._write_provider(folder, "needsurl.local")  # no url field
+            with patch.dict(
+                os.environ,
+                {"AGENTS_PROVIDERS_DIR": str(folder), "AGENTS_HOST_DIR": str(Path(tmp) / "host")},
+                clear=False,
+            ):
+                self.assertEqual(
+                    _prefer_configured_default("openai.default"), "openai.default"
+                )
+
+    def test_explicit_provider_untouched(self):
+        from agents_relay.turn import _prefer_configured_default
+
+        self.assertEqual(_prefer_configured_default("echo"), "echo")
+        self.assertEqual(_prefer_configured_default("openrouter.local"), "openrouter.local")
 
 
 if __name__ == "__main__":
