@@ -91,6 +91,7 @@ class GatewayClient:
     persona: str = ""
     project: str = ""
     workspace: str = ""
+    workdir: str = ""
     remote_id: str = ""
     prefs_path: Path | None = None
 
@@ -127,6 +128,7 @@ class GatewayClient:
                     "persona": self.persona,
                     "project": self.project,
                     "workspace": self.workspace,
+                    "workdir": self.workdir,
                 },
                 indent=2,
             ),
@@ -143,7 +145,7 @@ class GatewayClient:
         for field in ("base_url", "channel", "user"):
             if field not in explicit_set and data.get(field):
                 setattr(self, field, str(data[field]))
-        for field in ("provider", "persona", "project", "workspace"):
+        for field in ("provider", "persona", "project", "workspace", "workdir"):
             if field not in explicit_set and not getattr(self, field) and data.get(field):
                 setattr(self, field, str(data[field]))
 
@@ -167,6 +169,8 @@ class GatewayClient:
             body["project"] = self.project
         if self.workspace:
             body["workspace"] = self.workspace
+        if self.workdir:
+            body["workdir"] = self.workdir
         return body
 
     def turn(self, text: str, *, new_session: bool = False) -> dict[str, Any]:
@@ -208,3 +212,12 @@ class GatewayClient:
         req = urllib.request.Request(url, method="GET")
         with urllib.request.urlopen(req, timeout=10) as resp:
             return json.loads(resp.read().decode("utf-8"))
+
+    def workspaces(self) -> list[dict[str, Any]]:
+        """GET /v1/workspaces rows (enriched; may be empty on old relays)."""
+        url = f"{self.base_url.rstrip('/')}/v1/workspaces"
+        req = urllib.request.Request(url, headers=self._headers(), method="GET")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        rows = data.get("workspaces") if isinstance(data, dict) else None
+        return rows if isinstance(rows, list) else []
