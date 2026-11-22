@@ -214,11 +214,22 @@ def cookie_from_header(header: str, name: str = COOKIE_NAME) -> str:
     return ""
 
 
+_LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1", "")
+
+
+def _forwarded_proto(handler: BaseHTTPRequestHandler) -> str:
+    raw = handler.headers.get("X-Forwarded-Proto") or ""
+    return raw.split(",")[0].strip().lower()
+
+
 def _secure_for(handler: BaseHTTPRequestHandler, config: RelayConfig) -> bool:
     if not config.web_secure:
         return False
+    xfp = _forwarded_proto(handler)
+    if xfp:
+        return xfp == "https"
     host = (handler.headers.get("Host") or "").split(":")[0].strip().lower()
-    return host not in ("localhost", "127.0.0.1", "::1", "")
+    return host not in _LOOPBACK_HOSTS
 
 
 def _cookie_header(config: RelayConfig, value: str, *, secure: bool) -> str:
@@ -296,8 +307,28 @@ def handle_status(handler: BaseHTTPRequestHandler) -> None:
     config = handler._cfg()  # type: ignore[attr-defined]
     raw = cookie_from_header(handler.headers.get("Cookie") or "")
     user = verify_cookie(config, raw) if web_enabled(config) else None
+    is_secure = _secure_for(handler, config)
+    host = (handler.headers.get("Host") or "").split(":")[0].strip().lower()
+    plain_http_non_loopback = (
+        _forwarded_proto(handler) != "https" and host not in _LOOPBACK_HOSTS
+    )
+    cookie_warning = ""
+    if is_secure and plain_http_non_loopback:
+        cookie_warning = (
+            "Relay issues Secure cookies but this request reached it over "
+            "plain HTTP on a non-loopback host; browsers drop the cookie "
+            "and login loops. Expose the relay over HTTPS (for example "
+            "`tailscale serve`) or restart with RELAY_WEB_SECURE=0."
+        )
     handler._write_json(  # type: ignore[attr-defined]
-        {"ok": True, "authenticated": bool(user), "user": user or "", "enabled": web_enabled(config)},
+        {
+            "ok": True,
+            "authenticated": bool(user),
+            "user": user or "",
+            "enabled": web_enabled(config),
+            "secure_cookie": is_secure,
+            "cookie_warning": cookie_warning,
+        },
         200,
     )
 
@@ -484,7 +515,8 @@ def handle_chat_stream(handler: BaseHTTPRequestHandler, body: dict) -> None:
             handler.wfile.write(_sse(payload))
             handler.wfile.flush()
     except (BrokenPipeError, ConnectionResetError):
-        cancel.set()
+        # A dropped TCP socket detaches the SSE writer only; the
+        # server-side turn keeps running. Only POST /v1/chat/stop cancels.
         log.info("web stream client disconnected (run %s)", run)
     except Exception as exc:
         log.exception("web stream failed")

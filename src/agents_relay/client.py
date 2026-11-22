@@ -31,6 +31,54 @@ def _resolve_loopback_secret() -> str:
     return ""
 
 
+def _remote_secret_key(rid: str) -> str:
+    import re
+
+    clean = re.sub(r"[^A-Za-z0-9_.-]+", "_", rid.strip()).upper()
+    return f"REMOTE_{clean}_TOKEN"
+
+
+def _remote_id_for_url(base_url: str) -> str:
+    """Find a registered remote whose ``base_url`` matches ``base_url``."""
+    try:
+        from agents_workspace import Host
+    except ImportError:
+        return ""
+    path = Host.from_env().clients / "remotes.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    remotes = data.get("remotes") if isinstance(data, dict) else None
+    if not isinstance(remotes, dict):
+        return ""
+    want = base_url.rstrip("/")
+    for rid, meta in remotes.items():
+        if not isinstance(meta, dict):
+            continue
+        for key in ("base_url", "url"):
+            if str(meta.get(key) or "").rstrip("/") == want:
+                return str(rid)
+    return ""
+
+
+def _resolve_remote_secret(remote_id: str, base_url: str) -> str:
+    """Resolve ``REMOTE_<ID>_TOKEN`` from the Host Vault for a remote."""
+    rid = remote_id.strip() or _remote_id_for_url(base_url)
+    if not rid:
+        return ""
+    try:
+        from agents_workspace import resolve_secret
+    except ImportError:
+        return ""
+    try:
+        return str(
+            resolve_secret(_remote_secret_key(rid), scope="host") or ""
+        ).strip()
+    except Exception:
+        return ""
+
+
 @dataclass
 class GatewayClient:
     base_url: str = "http://127.0.0.1:8787"
@@ -43,13 +91,17 @@ class GatewayClient:
     persona: str = ""
     project: str = ""
     workspace: str = ""
+    remote_id: str = ""
     prefs_path: Path | None = None
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
         tok = (self.secret or "").strip()
-        if not tok and _is_loopback_url(self.base_url):
-            tok = _resolve_loopback_secret()
+        if not tok:
+            if _is_loopback_url(self.base_url):
+                tok = _resolve_loopback_secret()
+            else:
+                tok = _resolve_remote_secret(self.remote_id, self.base_url)
         if tok:
             headers["Authorization"] = f"Bearer {tok}"
         return headers

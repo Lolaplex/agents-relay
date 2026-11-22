@@ -11,6 +11,7 @@ relay injects the Bearer. A 1-release fallback reads legacy
 from __future__ import annotations
 
 import logging
+import posixpath
 import re
 import urllib.error
 import urllib.parse
@@ -29,7 +30,41 @@ log = logging.getLogger(__name__)
 
 # Query keys never forwarded upstream — they carry OUR relay's secret.
 _STRIP_QS = {"secret", "token"}
-_STREAM_PATH = "/v1/chat/stream"
+_STREAM_PATHS = ("/v1/chat/stream", "/v1/runs/stream", "/v1/stream")
+
+
+def validate_remote_base_url(url: str) -> str:
+    """Validate a remote ``base_url``: http(s) scheme, host, no creds.
+
+    Returns the normalized URL (trailing slash stripped); raises
+    ``ValueError`` on anything else — SSRF/path-escape guard shared by
+    ``upsert_remote`` and ``handle_proxy``.
+    """
+    raw = (url or "").strip().rstrip("/")
+    if not raw:
+        raise ValueError("base_url must be an http(s) origin")
+    parsed = urllib.parse.urlparse(raw)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("base_url must be an http(s) origin")
+    if parsed.username or parsed.password:
+        raise ValueError("base_url must not embed credentials")
+    return raw
+
+
+def _normalize_proxy_rest(rest: str) -> str:
+    """Normalize the upstream path; only ``/v1/*`` and ``/health`` pass.
+
+    Uses ``posixpath.normpath`` (never ``os.path.normpath`` — backslashes
+    would sneak through on Windows) and rejects escapes BEFORE the
+    allowlist check.
+    """
+    raw = rest if rest.startswith("/") else "/" + rest
+    if "\x00" in raw or "\\" in raw:
+        raise ValueError("invalid proxy path")
+    norm = posixpath.normpath(raw)
+    if norm != "/health" and not norm.startswith("/v1/"):
+        raise ValueError(f"proxy path not allowed: {norm}")
+    return norm
 
 
 def _path() -> Path:
@@ -139,11 +174,13 @@ def list_public(config: RelayConfig) -> list[dict]:
 
 def upsert_remote(config: RelayConfig, body: dict) -> tuple[dict | None, str]:
     rid = str(body.get("id") or "").strip()
-    base_url = str(body.get("base_url") or "").strip().rstrip("/")
+    base_url = str(body.get("base_url") or "")
     if not rid or not valid_id(rid):
         return None, f"invalid remote id: {rid!r}"
-    if not base_url.startswith(("http://", "https://")):
-        return None, "base_url must be an http(s) origin"
+    try:
+        base_url = validate_remote_base_url(base_url)
+    except ValueError as exc:
+        return None, str(exc)
     migrating = not _path().is_file()
     remotes = load_remotes(config)
     if migrating:
@@ -206,9 +243,12 @@ def handle_proxy(handler: BaseHTTPRequestHandler, rid: str, rest: str) -> None:
     if remote is None:
         handler._write_json({"ok": False, "error": f"unknown remote: {rid}"}, 404)  # type: ignore[attr-defined]
         return
-    base_url = str(remote.get("base_url") or "").rstrip("/")
-    if not rest.startswith("/"):
-        rest = "/" + rest
+    try:
+        base_url = validate_remote_base_url(str(remote.get("base_url") or ""))
+        rest = _normalize_proxy_rest(rest)
+    except ValueError as exc:
+        handler._write_json({"ok": False, "error": str(exc)}, 400)  # type: ignore[attr-defined]
+        return
     qs = _forward_query(handler.path or "")
     url = f"{base_url}{rest}{'?' + qs if qs else ''}"
 
@@ -221,8 +261,15 @@ def handle_proxy(handler: BaseHTTPRequestHandler, rid: str, rest: str) -> None:
     ctype = handler.headers.get("Content-Type")
     if ctype and data is not None:
         req.add_header("Content-Type", ctype)
+    accept = (handler.headers.get("Accept") or "").strip()
+    if accept:
+        req.add_header("Accept", accept)
 
-    timeout = 600 if rest.startswith(_STREAM_PATH) else 30
+    timeout = (
+        600
+        if any(rest.startswith(p) for p in _STREAM_PATHS)
+        else 30
+    )
     try:
         upstream = urllib.request.urlopen(req, timeout=timeout)
     except urllib.error.HTTPError as exc:
