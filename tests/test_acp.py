@@ -368,7 +368,9 @@ class TestAcpProviderWiring(unittest.TestCase):
             self._env_save("AGENTS_RELAY_DIR")
             os.environ["AGENTS_RELAY_DIR"] = tmp
             with patch.object(acp, "acp_agent_info", return_value=fake):
-                rows = acp.acp_provider_rows(RelayConfig.from_env())
+                # Plain listing reads the probe cache only (no spawn) —
+                # refresh=1 is the path that calls acp_agent_info.
+                rows = acp.acp_provider_rows(RelayConfig.from_env(), refresh=True)
             self.assertEqual(len(rows), 1)
             row = rows[0]
             self.assertEqual(row["name"], "acp.devin")

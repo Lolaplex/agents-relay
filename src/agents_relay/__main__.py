@@ -181,6 +181,10 @@ def _help_json() -> dict:
                 "description": "Drive a foreign ACP agent (AGENTS_ACP_CMD) with a runner.loop-shaped CLI; usable as LOOP_CMD",
                 "flags": ["--message", "--session", "--workdir", "--deliver", "--new-session"],
             },
+            "channel": {
+                "description": "Pair this device to a hub and run the persistent channel (agents-relay#40)",
+                "subcommands": ["connect", "disconnect", "list", "run"],
+            },
             "client": {
                 "description": "Smoke-test relay turn/stream/health",
                 "subcommands": ["turn", "health"],
@@ -238,6 +242,17 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         acp_run_p.add_argument(ignored, nargs="?", const="", default="")
     acp_run_p.add_argument("--attach", action="append", default=[])
+    chan_p = sub.add_parser("channel", help="Hub channel: pair this device to a hub")
+    chan_sub = chan_p.add_subparsers(dest="channel_cmd")
+    cc = chan_sub.add_parser("connect", help="Redeem a pair code on a hub and store the link")
+    cc.add_argument("hub_url", help="Hub relay origin, e.g. https://klanker.example")
+    cc.add_argument("credential", help="Pair code/token from the hub")
+    cc.add_argument("--label", default="", help="Device label shown on the hub")
+    cd = chan_sub.add_parser("disconnect", help="Remove a stored hub link")
+    cd.add_argument("hub_id")
+    chan_sub.add_parser("list", help="List stored hub links")
+    cr = chan_sub.add_parser("run", help="Run stored hub channels in the foreground")
+    cr.add_argument("--hub", default="", help="Only this hub id")
     client_p = sub.add_parser("client", help="Relay client smoke tests")
     client_sub = client_p.add_subparsers(dest="client_cmd")
     turn_p = client_sub.add_parser("turn", help="POST /v1/turn")
@@ -251,6 +266,63 @@ def build_parser() -> argparse.ArgumentParser:
     health_p = client_sub.add_parser("health", help="GET /health")
     health_p.add_argument("--url", default="http://127.0.0.1:8787")
     return parser
+
+
+def _channel_main(args: argparse.Namespace) -> int:
+    from .channel_client import (
+        ChannelClient,
+        _load_hubs,
+        connect_hub,
+        disconnect_hub,
+    )
+
+    cmd = getattr(args, "channel_cmd", "") or ""
+    if cmd == "connect":
+        try:
+            row = connect_hub(args.hub_url, args.credential, label=args.label)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        out = {k: v for k, v in row.items()}
+        print(json.dumps({"ok": True, **out}, indent=2, ensure_ascii=False))
+        return 0
+    if cmd == "disconnect":
+        if not disconnect_hub(args.hub_id):
+            print(f"Error: unknown hub: {args.hub_id!r}", file=sys.stderr)
+            return 1
+        print(json.dumps({"ok": True, "hub": args.hub_id}))
+        return 0
+    if cmd == "list":
+        rows = _load_hubs()
+        print(json.dumps({"ok": True, "hubs": rows}, indent=2, ensure_ascii=False))
+        return 0
+    if cmd == "run":
+        ids = [args.hub] if args.hub else list(_load_hubs())
+        if not ids:
+            print("Error: no stored hub links — run `channel connect` first",
+                  file=sys.stderr)
+            return 2
+        config = RelayConfig.from_env()
+        clients = []
+        for hub_id in ids:
+            try:
+                c = ChannelClient(hub_id, config=config)
+            except Exception as exc:  # noqa: BLE001
+                print(f"Error: hub {hub_id!r}: {exc}", file=sys.stderr)
+                return 1
+            clients.append(c)
+            threading.Thread(target=c.run_forever, daemon=True).start()
+            print(f"channel up: {hub_id} -> {c.hub_url}", file=sys.stderr)
+        try:
+            while True:
+                threading.Event().wait(3600)
+        except KeyboardInterrupt:
+            for c in clients:
+                c.stop()
+        return 0
+    print("Error: channel subcommand required (connect|disconnect|list|run)",
+          file=sys.stderr)
+    return 2
 
 
 def _client_main(args: argparse.Namespace) -> int:
@@ -300,6 +372,8 @@ def main(argv: list[str] | None = None) -> int:
         return acp_loop_main(args, RelayConfig.from_env())
     if args.command == "client":
         return _client_main(args)
+    if args.command == "channel":
+        return _channel_main(args)
     if args.command == "send":
         return _cmd_send(args)
     if args.command == "inject":
@@ -321,6 +395,15 @@ def main(argv: list[str] | None = None) -> int:
     tg_stop = None
     if not args.no_telegram and config.telegram_bot_token:
         tg_thread, tg_stop = start_telegram_thread(config)
+
+    # Outbound persistent channels to paired hubs (agents-relay#40).
+    hub_clients: list = []
+    try:
+        from .channel_client import run_hub_channels
+
+        hub_clients = run_hub_channels(config)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("hub channel boot failed: %s", exc)
 
     stopping = threading.Event()
 
@@ -347,6 +430,8 @@ def main(argv: list[str] | None = None) -> int:
         _shutdown()
     finally:
         server.server_close()
+        for c in hub_clients:
+            c.stop()
         if tg_thread is not None:
             tg_thread.join(timeout=2)
     return 0
