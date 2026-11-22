@@ -388,6 +388,40 @@ class TestChannelE2E(unittest.TestCase):
             headers={"Authorization": "Bearer expected"})
         self.assertEqual(st, 200, body)
 
+    def test_e2e_http_rpc_denies_admin_paths(self):
+        """CRITICAL: the device runs http rpc under its master secret —
+        admin surfaces must be unreachable through the channel."""
+        did = self._connect_client()
+        self._wait_connected(did)
+        for method, path in (
+            ("POST", "/v1/pair/create"),
+            ("GET", "/v1/hub/devices"),
+            ("DELETE", "/v1/hub/devices/x"),
+            ("POST", "/v1/remotes"),
+            ("GET", "/v1/discover"),
+            ("POST", "/v1/providers"),
+            ("DELETE", "/v1/providers/x"),
+            ("POST", "/v1/settings"),
+        ):
+            frames = list(channel.hub().rpc_call(
+                did, "http", {"req": {"method": method, "path": path}},
+                timeout_sec=5))
+            self.assertTrue(frames[-1].get("done"), f"{method} {path}")
+            self.assertEqual(frames[-1].get("status"), 403, f"{method} {path}")
+            self.assertIn("denied", str(frames[-1].get("error") or ""))
+        # but an ordinary call still passes
+        frames = list(channel.hub().rpc_call(
+            did, "http", {"req": {"method": "GET", "path": "/health"}},
+            timeout_sec=5))
+        self.assertEqual(frames[-1].get("status"), 200)
+
+    def test_disconnect_releases_stream(self):
+        hub = channel.hub()
+        link = hub.connect("d1")
+        hub.disconnect("d1")
+        self.assertIsNone(link.queue.get_nowait())  # sentinel, not a hang
+        self.assertFalse(hub.is_connected("d1"))
+
     def test_e2e_presence_list(self):
         did = self._connect_client()
         self._wait_connected(did)

@@ -52,6 +52,7 @@ def load_devices() -> dict:
         out[did] = {
             "label": str(meta.get("label") or ""),
             "host_id": str(meta.get("host_id") or ""),
+            "role": str(meta.get("role") or "host"),
             "created_at": meta.get("created_at") or 0,
             "last_seen": meta.get("last_seen") or 0,
             "allowlist": list(meta.get("allowlist") or []),
@@ -64,12 +65,20 @@ def _store(rows: dict) -> None:
 
 
 def mint_device(device_id: str = "", *, label: str = "", host_id: str = "",
+                role: str = "host",
                 allowlist: list[str] | None = None) -> dict:
     """Mint a device row + vault token. Re-minting the same id rotates the
-    token (re-pair flow) and keeps label/allowlist unless overridden."""
+    token (re-pair flow) and keeps label/role/allowlist unless overridden.
+
+    role: 'host' = compute node (channel + ws ops); 'client' = operator UI
+    (chat + own approvals). Admin surfaces stay device-denied regardless —
+    see _check_secret(allow_device=False) routes and the channel http-RPC
+    denylist."""
     did = (device_id or "").strip() or secrets.token_hex(6)
     if not valid_id(did):
         raise ValueError(f"invalid device id: {did!r}")
+    if role not in ("host", "client"):
+        raise ValueError(f"invalid device role: {role!r}")
     rows = load_devices()
     prev = rows.get(did) or {}
     token = secrets.token_urlsafe(24)
@@ -77,13 +86,15 @@ def mint_device(device_id: str = "", *, label: str = "", host_id: str = "",
     rows[did] = {
         "label": label or prev.get("label") or did,
         "host_id": host_id or prev.get("host_id") or "",
+        "role": role or prev.get("role") or "host",
         "created_at": prev.get("created_at") or int(time.time()),
         "last_seen": 0,
         "allowlist": allowlist if allowlist is not None else prev.get("allowlist", []),
     }
     _store(rows)
     return {"device_id": did, "device_token": token,
-            "label": rows[did]["label"], "created_at": rows[did]["created_at"]}
+            "label": rows[did]["label"], "role": rows[did]["role"],
+            "created_at": rows[did]["created_at"]}
 
 
 def verify_device(device_id: str, token: str) -> bool:
@@ -134,6 +145,7 @@ def revoke_device(device_id: str) -> bool:
 def list_public() -> list[dict]:
     return [
         {"id": did, "label": m["label"], "host_id": m["host_id"],
+         "role": m["role"],
          "created_at": m["created_at"], "last_seen": m["last_seen"],
          "has_token": bool(_read_secret(did))}
         for did, m in sorted(load_devices().items())

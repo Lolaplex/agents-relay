@@ -145,6 +145,28 @@ def _rpc_status(params: dict, cfg: RelayConfig) -> Iterator[dict]:
 
 _STREAM_PATHS = ("/v1/chat/stream", "/v1/runs/stream", "/v1/stream", "/v1/events")
 
+# Target-side denylist for the generic http RPC: this device executes the
+# request against its own loopback WITH ITS MASTER SECRET, so admin and
+# credential-bearing surfaces are never reachable through the channel —
+# regardless of who asked the hub to proxy. Anything under these prefixes
+# could mint credentials, manage devices, or rewrite policy.
+_RPC_DENY_ALWAYS = (
+    "/v1/pair", "/v1/hub", "/v1/remotes", "/v1/discover",
+    "/v1/clients", "/v1/secrets", "/v1/vault",
+)
+_RPC_DENY_WRITE = (
+    "/v1/providers", "/v1/settings", "/v1/workspaces",
+)
+
+
+def _rpc_denied(method: str, path: str) -> bool:
+    if any(path.startswith(p) for p in _RPC_DENY_ALWAYS):
+        return True
+    if method not in ("GET", "HEAD") and any(
+            path.startswith(p) for p in _RPC_DENY_WRITE):
+        return True
+    return False
+
 
 def _rpc_http(params: dict, cfg: RelayConfig) -> Iterator[dict]:
     """Universal upstream proxy: run the request against our own loopback
@@ -161,6 +183,10 @@ def _rpc_http(params: dict, cfg: RelayConfig) -> Iterator[dict]:
         yield {"error": str(exc)}
         return
     method = str(req.get("method") or "GET").upper()
+    if _rpc_denied(method, path):
+        yield {"error": f"channel http rpc denied: {method} {path}",
+               "status": 403, "done": True}
+        return
     data: bytes | None = None
     if req.get("body_b64"):
         import base64

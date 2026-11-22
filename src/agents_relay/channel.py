@@ -119,6 +119,10 @@ class ChannelHub:
             if generation and link.generation != generation:
                 return  # a newer stream already replaced us
             del self._links[device_id]
+            try:
+                link.queue.put_nowait(None)  # release the SSE generator
+            except queue.Full:
+                pass
 
     def link(self, device_id: str) -> DeviceLink | None:
         with self._lock:
