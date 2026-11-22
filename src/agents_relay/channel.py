@@ -242,11 +242,21 @@ def handle_hub_stream(handler: BaseHTTPRequestHandler, device_id: str,
     mgr = hub()
     link = mgr.connect(device_id)
     try:
-        from .devices import touch_device
+        from .devices import list_public, touch_device
 
         touch_device(device_id)
-    except Exception:
-        pass
+        # Auto-register a channel remote row so /v1/remote/dev-<id> routes
+        # over this channel without manual UI wiring.
+        from .remotes import upsert_remote
+
+        label = next(
+            (r["label"] for r in list_public() if r["id"] == device_id), "")
+        upsert_remote(handler._cfg(), {  # type: ignore[attr-defined]
+            "id": f"dev-{device_id}", "via": "channel",
+            "device_id": device_id, "label": label or device_id,
+        })
+    except Exception:  # noqa: BLE001 - registration never blocks the stream
+        log.exception("channel remote auto-register failed")
     try:
         handler.send_response(200)
         handler.send_header("Content-Type", "text/event-stream; charset=utf-8")

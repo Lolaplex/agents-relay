@@ -2089,6 +2089,12 @@ class TurnHandler(BaseHTTPRequestHandler):
             if not revoke_device(parts[4]):
                 self.send_error(404, "unknown device")
                 return
+            try:
+                from .remotes import delete_remote
+
+                delete_remote(self._cfg(), f"dev-{parts[4]}")
+            except Exception:
+                pass
             _emit_relay_event("device.changed", {"action": "revoke", "id": parts[4]})
             self._write_json({"ok": True, "device": parts[4]}, 200)
             return

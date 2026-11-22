@@ -352,6 +352,23 @@ class TestChannelE2E(unittest.TestCase):
         self.assertTrue(frames[-1].get("done"))
         self.assertEqual(frames[-1].get("status"), 200)
 
+    def test_e2e_auto_remote_and_channel_proxy(self):
+        did = self._connect_client()
+        self._wait_connected(did)
+        # connect auto-registers a via=channel remote row
+        st, body = self.srv.req(
+            "GET", "/v1/remotes",
+            headers={"Authorization": "Bearer expected"})
+        self.assertEqual(st, 200)
+        row = next(r for r in body["remotes"] if r["id"] == f"dev-{did}")
+        self.assertEqual(row["via"], "channel")
+        self.assertEqual(row["device_id"], did)
+        # the whole remote proxy path rides the channel — no inbound port
+        st, body = self.srv.req(
+            "GET", f"/v1/remote/dev-{did}/health",
+            headers={"Authorization": "Bearer expected"})
+        self.assertEqual(st, 200, body)
+
     def test_e2e_presence_list(self):
         did = self._connect_client()
         self._wait_connected(did)
