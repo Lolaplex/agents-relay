@@ -254,7 +254,14 @@ def handle_proxy(handler: BaseHTTPRequestHandler, rid: str, rest: str) -> None:
 
     length = int(handler.headers.get("Content-Length") or "0")
     data = handler.rfile.read(length) if length else None
-    req = urllib.request.Request(url, data=data, method=handler.command)
+    from . import __version__
+
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method=handler.command,
+        headers={"User-Agent": f"agents-relay/{__version__}"},
+    )
     secret = str(remote.get("secret") or "").strip()
     if secret:
         req.add_header("Authorization", f"Bearer {secret}")
