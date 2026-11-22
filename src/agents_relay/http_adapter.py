@@ -597,6 +597,32 @@ class TurnHandler(BaseHTTPRequestHandler):
             return
 
         parts = path.split("/")
+        # POST /v1/workspaces/<ws>/store/append
+        if (len(parts) == 6 and parts[1] == "v1"
+                and parts[2] == "workspaces" and parts[4] == "store"
+                and parts[5] == "append"):
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            ws_ref = parts[3]
+            if not valid_id(ws_ref):
+                self.send_error(400, f"invalid workspace id: {ws_ref!r}")
+                return
+            from .workspaces import get_workspace
+            from .store_api import handle_store_append
+
+            try:
+                ws = get_workspace(ws_ref)
+            except KeyError:
+                self.send_error(404, "unknown workspace")
+                return
+            body = self._read_json()
+            if body is None:
+                return
+            status_code, payload = handle_store_append(ws, body)
+            self._write_json(payload, status_code)
+            return
+
         # /v1/workspaces/<ws>/personas[/<p>[/sessions[/<s>]]]
         if (len(parts) >= 5 and parts[1] == "v1"
                 and parts[2] == "workspaces" and parts[4] == "personas"):
@@ -1706,6 +1732,14 @@ class TurnHandler(BaseHTTPRequestHandler):
 
             self._write_json({"ok": True, "peers": discover_peers()}, 200)
             return
+        if path == "/v1/capabilities":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            from .store_api import relay_capabilities
+
+            self._write_json({"ok": True, **relay_capabilities()}, 200)
+            return
         # GET /v1/remote/<id>/<upstream-path> — authenticated remote mount.
         if path.startswith("/v1/remote/"):
             if not _check_secret(self, self.relay_secret, query_params):
@@ -1747,6 +1781,50 @@ class TurnHandler(BaseHTTPRequestHandler):
 
             self._write_json(
                 {"ok": True, "workspace": ws.id, **team_inbox(ws)}, 200)
+            return
+        # GET /v1/workspaces/<ws>/store/items
+        if (len(parts) == 6 and parts[1] == "v1"
+                and parts[2] == "workspaces" and parts[4] == "store"
+                and parts[5] == "items"):
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            ws_ref = parts[3]
+            if not valid_id(ws_ref):
+                self.send_error(400, f"invalid workspace id: {ws_ref!r}")
+                return
+            from .workspaces import get_workspace
+            from .store_api import handle_store_items
+
+            try:
+                ws = get_workspace(ws_ref)
+            except KeyError:
+                self.send_error(404, "unknown workspace")
+                return
+            status_code, payload = handle_store_items(ws, query_params)
+            self._write_json(payload, status_code)
+            return
+        # GET /v1/workspaces/<ws>/store/pane/<entity_id>
+        if (len(parts) == 7 and parts[1] == "v1"
+                and parts[2] == "workspaces" and parts[4] == "store"
+                and parts[5] == "pane"):
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            ws_ref = parts[3]
+            if not valid_id(ws_ref):
+                self.send_error(400, f"invalid workspace id: {ws_ref!r}")
+                return
+            from .workspaces import get_workspace
+            from .store_api import handle_store_pane
+
+            try:
+                ws = get_workspace(ws_ref)
+            except KeyError:
+                self.send_error(404, "unknown workspace")
+                return
+            status_code, payload = handle_store_pane(ws, parts[6], query_params)
+            self._write_json(payload, status_code)
             return
         # GET /v1/workspaces/<ws>/personas/<p>/inbox
         if (len(parts) == 7 and parts[1] == "v1"
@@ -1834,6 +1912,7 @@ class TurnHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self.send_error(400, str(exc))
                 return
+            _emit_relay_event("workspace.changed", {"action": "patch", "workspace": ws_id}, workspace=ws_id)
             self._write_json({"ok": True, "workspace": row}, 200)
             return
         self.send_error(404)
