@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import os
+import subprocess
 import tempfile
 import threading
 import types
 import unittest
 from http.client import HTTPConnection
+from pathlib import Path
 from unittest.mock import patch
 
 from agents_relay import events, store_api
@@ -333,6 +336,117 @@ class TestStoreApi(unittest.TestCase):
                     stream.close()
                 finally:
                     srv.close()
+
+    def test_store_append_ignores_body_persona_spoof(self):
+        class _FakeConn:
+            def execute(self, *_a, **_kw):
+                return None
+
+            def close(self):
+                return None
+
+        seen_actors: list[str] = []
+        fake_db = types.SimpleNamespace(connect=lambda _p: _FakeConn())
+        fake_surface = types.SimpleNamespace(
+            default_registry=lambda: None,
+            append=lambda _d, _p, actor, *, conn, reg=None: seen_actors.append(actor) or "ent-1",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            env = {k: v for k, v in os.environ.items() if k != "AGENTS_ACTOR_DID"}
+            env["AGENTS_HOST_DIR"] = td
+            with patch.dict(os.environ, env, clear=True):
+                host = Host.from_env()
+                ws = host.create("alpha", "Alpha")
+                expected_host = f"host:{host.host_id()}"
+                host.keys.mkdir(parents=True, exist_ok=True)
+                (host.keys / "alice.ed25519").write_bytes(b"k1" * 32)
+                fake_sub = types.SimpleNamespace(
+                    run=lambda *_a, **_kw: types.SimpleNamespace(returncode=0, stdout="did:key:z6MkAlice\n")
+                )
+                with (
+                    patch.object(store_api, "_load_store_modules", return_value=(fake_db, fake_surface, ValueError)),
+                    patch.object(store_api, "subprocess", fake_sub),
+                ):
+                    st, res = store_api.handle_store_append(
+                        ws,
+                        {"domain": "records", "persona": "alice", "payload": {"kind": "note", "body": "hi"}},
+                    )
+                self.assertEqual(st, 200)
+                self.assertEqual(seen_actors, [expected_host])
+                self.assertEqual(res["actor"], expected_host)
+
+    def test_resolve_store_actor_fast_path_and_rotation_invalidation(self):
+        with tempfile.TemporaryDirectory() as td:
+            env = {k: v for k, v in os.environ.items() if k != "AGENTS_ACTOR_DID"}
+            env["AGENTS_HOST_DIR"] = td
+            with patch.dict(os.environ, env, clear=True):
+                host = Host.from_env()
+                ws = host.create("alpha", "Alpha")
+                expected_host = f"host:{host.host_id()}"
+                calls: list[list[str]] = []
+                responses = iter(["did:key:z6MkFirst\n", "did:key:z6MkRotated\n"])
+
+                def _fake_run(cmd, **_kw):
+                    calls.append(list(cmd))
+                    return types.SimpleNamespace(returncode=0, stdout=next(responses))
+
+                with patch.object(store_api, "subprocess", types.SimpleNamespace(run=_fake_run)):
+                    did0 = store_api.resolve_store_actor(ws, persona="alice")
+                    self.assertEqual(did0, expected_host)
+                    self.assertEqual(calls, [])
+
+                    host.keys.mkdir(parents=True, exist_ok=True)
+                    key_path = Path(host.keys) / "alice.ed25519"
+                    key_path.write_bytes(b"a" * 64)
+                    self.assertEqual(store_api.resolve_store_actor(ws, persona="alice"), "did:key:z6MkFirst")
+                    self.assertEqual(store_api.resolve_store_actor(ws, persona="alice"), "did:key:z6MkFirst")
+                    self.assertEqual(len(calls), 1)
+
+                    key_path.write_bytes(b"b" * 65)
+                    self.assertEqual(store_api.resolve_store_actor(ws, persona="alice"), "did:key:z6MkRotated")
+                    self.assertEqual(len(calls), 2)
+
+    def test_event_bus_logs_warning_when_queue_drops_oldest(self):
+        bus = events.EventBus(max_queue=1)
+        sub = bus.subscribe()
+        try:
+            with self.assertLogs("agents_relay.events", level=logging.WARNING) as cm:
+                bus.emit("store.changed", {"id": "1"})
+                bus.emit("store.changed", {"id": "2"})
+            self.assertTrue(any("dropped oldest event" in line for line in cm.output))
+            kept = sub.queue.get_nowait()
+            self.assertIsNotNone(kept)
+            assert kept is not None
+            self.assertEqual(kept["payload"]["id"], "2")
+        finally:
+            bus.unsubscribe(sub)
+
+    def test_container_rewrite_populates_actor_did_for_turn_persona(self):
+        from agents_relay import turn as relay_turn
+
+        with tempfile.TemporaryDirectory() as td:
+            env = {k: v for k, v in os.environ.items() if k != "AGENTS_ACTOR_DID"}
+            env["AGENTS_HOST_DIR"] = td
+            with patch.dict(os.environ, env, clear=True):
+                host = Host.from_env()
+                host.create("alpha", "Alpha")
+                host.keys.mkdir(parents=True, exist_ok=True)
+                (host.keys / "researcher.ed25519").write_bytes(b"r" * 64)
+                with patch.object(
+                    store_api,
+                    "subprocess",
+                    types.SimpleNamespace(
+                        run=lambda *_a, **_kw: types.SimpleNamespace(returncode=0, stdout="did:key:z6MkResearcher\n")
+                    ),
+                ):
+                    _argv, out_env, _ws = relay_turn._container_rewrite(
+                        ["python", "-m", "runner.loop", "--persona", "researcher"],
+                        "alpha",
+                        "",
+                    )
+                self.assertIsNotNone(out_env)
+                assert out_env is not None
+                self.assertEqual(out_env.get("AGENTS_ACTOR_DID"), "did:key:z6MkResearcher")
 
 
 if __name__ == "__main__":

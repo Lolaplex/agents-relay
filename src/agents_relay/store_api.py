@@ -13,7 +13,7 @@ from .events import emit_event
 
 _SAFE_KINDS = frozenset({"event", "task", "note", "decision"})
 _SAFE_SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-_DID_CACHE: dict[tuple[str, str], str] = {}
+_DID_CACHE: dict[tuple[str, str], tuple[tuple[int, int] | None, str]] = {}
 _DEFAULT_MIME = {
     "markdown": "text/markdown; charset=utf-8",
     "ical": "text/calendar; charset=utf-8",
@@ -35,12 +35,26 @@ def _truthy_env(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _key_signature(ws: Any, slug: str) -> tuple[bool, tuple[int, int] | None]:
+    """Return ``(has_keys_dir, (mtime_ns, size) | None)`` for cache validation."""
+    keys_dir = getattr(ws.host, "keys", None)
+    if keys_dir is None:
+        return False, None
+    key_file = Path(keys_dir) / f"{slug}.ed25519"
+    try:
+        st = key_file.stat()
+    except OSError:
+        return True, None
+    return True, (st.st_mtime_ns, st.st_size)
+
+
 def resolve_store_actor(ws: Any, *, persona: str = "") -> str:
     """Resolve trusted server-side actor DID for store mutations.
 
     Reads ``AGENTS_ACTOR_DID`` first, then ``agents-keys did <slug>`` for the
-    active persona and ``"host"`` (never touching ``.ed25519`` secret files),
-    falling back to ``host:<host_id>``. Caller JSON ``actor`` is never trusted.
+    trusted caller ``persona`` and ``"host"`` (never reading ``.ed25519`` key
+    material, only statting ``<host>/keys/<slug>.ed25519`` for presence and
+    rotation invalidation), falling back to ``host:<host_id>``.
     """
     explicit = os.environ.get("AGENTS_ACTOR_DID", "").strip()
     if explicit:
@@ -56,10 +70,14 @@ def resolve_store_actor(ws: Any, *, persona: str = "") -> str:
         candidates.append("host")
         for slug in candidates:
             cache_key = (host_dir, slug)
-            if cache_key in _DID_CACHE:
-                cached = _DID_CACHE[cache_key]
-                if cached:
-                    return cached
+            has_keys_dir, sig = _key_signature(ws, slug)
+            if has_keys_dir and sig is None:
+                _DID_CACHE.pop(cache_key, None)
+                continue
+            cached = _DID_CACHE.get(cache_key)
+            if cached is not None and cached[0] == sig:
+                if cached[1]:
+                    return cached[1]
                 continue
             did_val = ""
             try:
@@ -76,7 +94,7 @@ def resolve_store_actor(ws: Any, *, persona: str = "") -> str:
                         did_val = first
             except Exception:
                 did_val = ""
-            _DID_CACHE[cache_key] = did_val
+            _DID_CACHE[cache_key] = (sig, did_val)
             if did_val:
                 return did_val
 
@@ -190,7 +208,7 @@ def handle_store_append(
         return 400, {"ok": False, "error": "payload must be an object"}
 
     clean_payload = {k: v for k, v in raw_payload.items() if k != "actor"}
-    actor = resolve_store_actor(ws, persona=persona or str(body.get("persona") or "").strip())
+    actor = resolve_store_actor(ws, persona=persona)
 
     conn = _open_store(db_mod, ws)
     try:
