@@ -189,17 +189,19 @@ def _session_store(ws: Workspace):
     return SessionStore(ws)
 
 
-def list_sessions(ws: Workspace, persona: str = "", user: str = "") -> list[dict]:
+def list_sessions(ws: Workspace, persona: str = "", user: str = "",
+                  include_empty: bool = False,
+                  empty_grace_sec: int = 900) -> list[dict]:
     rows = [r.to_dict() for r in _session_store(ws).list(persona=persona, user=user)]
     want = {str(r.get("id") or "") for r in rows} - {""}
     if not want:
         return rows
     # One pass over the trace store: first user message per session becomes
     # the sidebar title, so clients need no per-session history fetch.
+    titles: dict[str, str] = {}
+    scan_ok = False
     try:
         from agents_traces.store import TraceStore
-
-        titles: dict[str, str] = {}
         for e in TraceStore(ws.traces).iter_events():
             sid = e.session
             if sid not in want or sid in titles or e.type != "message":
@@ -216,8 +218,31 @@ def list_sessions(ws: Workspace, persona: str = "", user: str = "") -> list[dict
             title = titles.get(str(r.get("id") or ""))
             if title:
                 r["title"] = title
+        scan_ok = True
     except Exception:
         pass
+    if scan_ok and not include_empty:
+        # resolve() mints a record per probe/delegate/test turn; a stale
+        # record with no user message, and any delegate-channel worker
+        # turn, is sidebar noise. Fresh records stay visible so a session
+        # created via the API shows up before its first message.
+        now = datetime.now(timezone.utc)
+        kept = []
+        for r in rows:
+            if str(r.get("channel") or "") == "delegate":
+                continue
+            if str(r.get("id") or "") in titles:
+                kept.append(r)
+                continue
+            stamp = str(r.get("last_active") or r.get("created_at") or "")
+            try:
+                age = (now - datetime.fromisoformat(
+                    stamp.replace("Z", "+00:00"))).total_seconds()
+            except ValueError:
+                age = empty_grace_sec + 1
+            if age <= empty_grace_sec:
+                kept.append(r)
+        rows = kept
     return rows
 
 
