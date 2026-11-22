@@ -202,6 +202,54 @@ def _redact_log_text(text: str) -> str:
     return _LOG_SECRET_RE.sub(r"\1[REDACTED]", text)
 
 
+def _is_private_host(host: str) -> bool:
+    """Loopback/LAN host check: direct requests to these are plain HTTP."""
+    h = host.strip()
+    if h.startswith("["):
+        h = h[1 : h.index("]")] if "]" in h else h
+    elif h.count(":") == 1:
+        h = h.rsplit(":", 1)[0]
+    h = h.lower()
+    if h in ("localhost", "::1") or h.endswith((".local", ".lan", ".internal")):
+        return True
+    parts = h.split(".")
+    if len(parts) == 4 and all(p.isdigit() for p in parts):
+        a, b = int(parts[0]), int(parts[1])
+        return (
+            a in (10, 127)
+            or (a == 172 and 16 <= b <= 31)
+            or (a == 192 and b == 168)
+            or (a == 169 and b == 254)
+        )
+    return False
+
+
+def _request_base_url(handler, cfg) -> str:
+    """Absolute base for self-links (pair URLs).
+
+    Order: explicit ``AGENTS_RELAY_URL`` > proxy headers > request ``Host``
+    > auto-bound URL. ``serve_http`` backfills ``relay_url`` with the bound
+    socket address (often loopback) — that value is a fallback, not a
+    user choice, so a real request Host beats it. Scheme falls back to
+    http on loopback/private hosts and https elsewhere.
+    """
+    configured = str(getattr(cfg, "relay_url", "") or "").strip().rstrip("/")
+    auto_bound = str(getattr(getattr(handler, "server", None), "relay_url", "") or "").strip().rstrip("/")
+    if configured and configured != auto_bound:
+        return configured
+    proto = (handler.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
+    host = (
+        handler.headers.get("X-Forwarded-Host")
+        or handler.headers.get("Host")
+        or ""
+    ).split(",")[0].strip()
+    if host:
+        if proto not in ("http", "https"):
+            proto = "http" if _is_private_host(host) else "https"
+        return f"{proto}://{host}"
+    return configured
+
+
 def _emit_relay_event(kind: str, payload: dict[str, Any] | None = None, *, workspace: str = "") -> None:
     try:
         from .events import emit_event
@@ -444,7 +492,7 @@ class TurnHandler(BaseHTTPRequestHandler):
                     mode=mode,
                     ttl_sec=ttl,
                     host_id=host_id,
-                    base_url=getattr(cfg, "relay_url", "") or "",
+                    base_url=_request_base_url(self, cfg),
                 )
             except ValueError as exc:
                 self.send_error(400, str(exc))
