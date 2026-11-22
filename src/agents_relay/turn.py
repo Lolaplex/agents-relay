@@ -380,9 +380,16 @@ def workspace_env(
         "provider_key_env": key_env,
         "extra_allow": tuple(allow),
     }
+    base = dict(os.environ)
     if workdir.strip():
         kwargs["workdir"] = workdir
-    return ws.env(**kwargs)
+    else:
+        # The relay daemon's ambient AGENTS_WORKDIR/LOCK (e.g. pinned by its
+        # entry workspace) must not leak into another workspace's turn —
+        # workspace.json's own workdir/workdir_lock applies instead.
+        base.pop("AGENTS_WORKDIR", None)
+        base.pop("AGENTS_WORKDIR_LOCK", None)
+    return ws.env(base, **kwargs)
 
 
 def _resolve_relay_url(config: RelayConfig | None = None) -> str:

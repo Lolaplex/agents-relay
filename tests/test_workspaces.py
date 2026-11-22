@@ -847,3 +847,152 @@ class StateDirTests(unittest.TestCase):
         self.assertEqual(
             resolve_state_dir(cfg), Path("C:/tmp/custom-relay-state")
         )
+
+
+class TestPatchWorkspace(unittest.TestCase):
+    """agents-relay#32: PATCH /v1/workspaces/<id> + enriched GET rows."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.env = patch.dict(
+            os.environ,
+            {"AGENTS_WORKSPACES_DIR": self.dir.name},
+            clear=False,
+        )
+        self.env.start()
+        self.srv = _Server(_cfg())
+
+    def tearDown(self):
+        self.srv.close()
+        self.env.stop()
+        self.dir.cleanup()
+
+    def test_patch_updates_and_get_reflects(self):
+        create_workspace("demo")
+        proj = Path(self.dir.name) / "projA"
+        proj.mkdir()
+        resp = self.srv.request(
+            "PATCH", "/v1/workspaces/demo",
+            {
+                "label": "Demo Renamed",
+                "workdir": str(proj),
+                "workdir_lock": True,
+                "browser_profile": "work",
+                "approval_mode": "strict",
+            },
+        )
+        self.assertEqual(resp.status, 200, resp.read())
+        resp = self.srv.request("GET", "/v1/workspaces")
+        data = json.loads(resp.read().decode())
+        row = next(r for r in data["workspaces"] if r["id"] == "demo")
+        self.assertEqual(row["label"], "Demo Renamed")
+        self.assertEqual(row["workdir"], str(proj.resolve()))
+        self.assertTrue(row["workdir_lock"])
+        self.assertEqual(row["browser_profile"], "work")
+        self.assertEqual(row["approval_mode"], "strict")
+
+    def test_patch_requires_auth(self):
+        create_workspace("demo")
+        conn = HTTPConnection(self.srv.host, self.srv.port, timeout=10)
+        conn.request(
+            "PATCH", "/v1/workspaces/demo",
+            body=json.dumps({"label": "x"}),
+            headers={"Content-Type": "application/json"},
+        )
+        resp = conn.getresponse()
+        resp.read()
+        self.assertEqual(resp.status, 401)
+
+    def test_patch_unknown_workspace_404(self):
+        resp = self.srv.request(
+            "PATCH", "/v1/workspaces/ghost", {"label": "x"})
+        resp.read()
+        self.assertEqual(resp.status, 404)
+
+    def test_patch_invalid_approval_400(self):
+        create_workspace("demo")
+        resp = self.srv.request(
+            "PATCH", "/v1/workspaces/demo", {"approval_mode": "yolo"})
+        resp.read()
+        self.assertEqual(resp.status, 400)
+
+    def test_patch_secret_workdir_400(self):
+        create_workspace("demo")
+        from agents_workspace import Host
+
+        host = Host.from_env()
+        resp = self.srv.request(
+            "PATCH", "/v1/workspaces/demo",
+            {"workdir": str(host.secrets_dir)})
+        resp.read()
+        self.assertEqual(resp.status, 400)
+
+    def test_patch_unknown_field_400(self):
+        create_workspace("demo")
+        resp = self.srv.request(
+            "PATCH", "/v1/workspaces/demo", {"secret_key": "x"})
+        resp.read()
+        self.assertEqual(resp.status, 400)
+
+    def test_options_advertises_patch(self):
+        conn = HTTPConnection(self.srv.host, self.srv.port, timeout=10)
+        conn.request(
+            "OPTIONS", "/v1/workspaces/demo",
+            headers={"Origin": "http://localhost:3000"},
+        )
+        resp = conn.getresponse()
+        resp.read()
+        cfg = self.srv.server.config if hasattr(self.srv.server, "config") else None
+        # OPTIONS returns 204 only when a CORS origin is allowed; verify
+        # header content whenever the server answered the preflight.
+        if resp.status == 204:
+            self.assertIn(
+                "PATCH", resp.getheader("Access-Control-Allow-Methods") or "")
+        else:
+            self.assertEqual(resp.status, 404)
+
+
+class TestTurnWorkspaceWorkdir(unittest.TestCase):
+    """Turn env inherits workspace.json workdir, not the daemon's ambient."""
+
+    def test_workspace_json_workdir_beats_ambient(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host_dir = Path(tmp) / "host"
+            with patch.dict(
+                os.environ,
+                {
+                    "AGENTS_HOST_DIR": str(host_dir),
+                    "AGENTS_WORKDIR": str(Path(tmp) / "entry-work"),
+                    "AGENTS_WORKDIR_LOCK": "1",
+                },
+                clear=False,
+            ):
+                from agents_workspace import Host
+
+                host = Host.from_env()
+                proj = Path(tmp) / "demo-proj"
+                host.create("demo")
+                host.update_workspace(
+                    "demo", workdir=str(proj), workdir_lock=False)
+                env = workspace_env("demo")
+                self.assertEqual(env["AGENTS_WORKDIR"], str(proj.resolve()))
+                self.assertNotIn("AGENTS_WORKDIR_LOCK", env)
+
+    def test_explicit_workdir_still_wins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host_dir = Path(tmp) / "host"
+            with patch.dict(
+                os.environ,
+                {"AGENTS_HOST_DIR": str(host_dir)},
+                clear=False,
+            ):
+                from agents_workspace import Host
+
+                host = Host.from_env()
+                host.create("demo")
+                host.update_workspace("demo", workdir=str(Path(tmp) / "cfg"))
+                env = workspace_env("demo", str(Path(tmp) / "explicit"))
+                self.assertEqual(
+                    env["AGENTS_WORKDIR"],
+                    str(Path(tmp) / "explicit"),
+                )
