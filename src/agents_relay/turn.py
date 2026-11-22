@@ -144,7 +144,36 @@ def _resolve_provider_and_model(
             model = model or str(pick.get("model") or "")
         except Exception:
             pass
-    return provider or config.loop_provider, model
+    if provider:
+        return provider, model
+    return _prefer_configured_default(config.loop_provider), model
+
+
+def _prefer_configured_default(provider: str) -> str:
+    """Prefer a self-configured provider over the unusable ``openai.default`` stub.
+
+    ``openai.default`` ships no ``url`` — it only works when the operator sets
+    ``LLM_BASE_URL``. When nothing explicit was picked and the fallback is that
+    stub while exactly one configured provider (manifest ``url`` set) exists,
+    use it. Zero or ambiguous candidates keep the stub: loud failure beats a
+    surprising silent pick.
+    """
+    if provider.strip().lower() != "openai.default":
+        return provider
+    try:
+        from runner.providers import list_providers
+    except ImportError:
+        return provider
+    candidates = [
+        row.get("name", "")
+        for row in list_providers()
+        if str(row.get("url") or "").strip()
+        and not str(row.get("name") or "").lower().startswith("scripted")
+        and str(row.get("kind") or "") not in ("echo", "acp", "acp-agent")
+    ]
+    if len(candidates) == 1:
+        return candidates[0]
+    return provider
 
 
 def _flag_from_argv(argv: list[str] | tuple[str, ...], flag: str) -> str:
