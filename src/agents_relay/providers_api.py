@@ -98,13 +98,14 @@ def provider_rows(config: Any = None, refresh: bool = False) -> list[dict[str, A
 
 
 def create_provider(body: dict[str, Any]) -> dict[str, Any]:
-    """Write ``<host>/providers/<name>.json``; refuses to shadow env rows."""
+    """Write ``<host>/providers/<name>.json``.
+
+    Shadowing env-sourced rows is the edit path: a file manifest outranks
+    package/env rows at load precedence, and deleting the file restores
+    the env row."""
     name = str(body.get("name") or "").strip()
     if not _NAME.match(name):
         raise ProviderError(400, f"invalid provider name: {name!r}")
-    existing = _find(name)
-    if existing is not None and source_of(existing) != "file":
-        raise ProviderError(409, f"provider {name} is managed by host env")
     kind = str(body.get("kind") or "openai_compat").strip() or "openai_compat"
     manifest: dict[str, Any] = {
         "name": name,
@@ -187,7 +188,7 @@ def probe_provider(config: Any, name: str) -> dict[str, Any]:
     if row is None:
         raise ProviderError(404, f"unknown provider: {name}")
     kind = str(row.get("kind") or "")
-    if kind == "acp-agent":
+    if kind == "acp-agent" or name.startswith("acp."):
         from .acp import acp_agent_cmd, acp_agent_info
 
         if not acp_agent_cmd(name):

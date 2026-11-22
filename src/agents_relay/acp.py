@@ -803,7 +803,13 @@ def acp_provider_rows(config: RelayConfig, refresh: bool = False) -> list[dict[s
             row["error"] = "no agent command configured"
             rows.append(row)
             continue
-        info = acp_agent_info(config, name, refresh=refresh)
+        # Plain listing must not spawn the agent — a slow ``ssh box`` probe
+        # would hang every /v1/providers read. Probing happens on refresh=1
+        # and the dedicated probe endpoint; here we surface the cache only.
+        if refresh:
+            info = acp_agent_info(config, name, refresh=True)
+        else:
+            info = read_json(acp_models_cache_path(name, config)) or {}
         for key in ("model", "models", "mode", "modes", "error"):
             if info.get(key):
                 row[key] = info[key]

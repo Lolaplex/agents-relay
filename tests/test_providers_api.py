@@ -133,13 +133,47 @@ class TestProviderWriteApi(unittest.TestCase):
         )
         self.assertEqual(status, 400)
 
-    def test_env_provider_not_overwritable_or_deletable(self):
+    def test_env_provider_shadowable_but_not_deletable(self):
+        # POST shadows the package row with a file manifest (edit path);
+        # DELETE still refuses — env rows return once the file is gone.
         status, _ = self.srv.request(
-            "POST", "/v1/providers", {"name": "echo", "kind": "echo"}
+            "POST", "/v1/providers", {"name": "echo", "kind": "echo", "url_env": "ECHO_URL_X"}
         )
-        self.assertEqual(status, 409)
+        self.assertEqual(status, 200)
+        status, data = self.srv.request("GET", "/v1/providers")
+        self.assertEqual(self._row(data["providers"], "echo")["source"], "file")
+        status, _ = self.srv.request("DELETE", "/v1/providers/echo")
+        self.assertEqual(status, 200)
+        status, data = self.srv.request("GET", "/v1/providers")
+        self.assertEqual(self._row(data["providers"], "echo")["source"], "env")
         status, _ = self.srv.request("DELETE", "/v1/providers/echo")
         self.assertEqual(status, 409)
+
+    def test_env_acp_row_overridable_by_file_manifest(self):
+        with patch.dict(
+            os.environ, {"AGENTS_ACP_CMD_CURSOR": "cursor agent --acp"}, clear=False
+        ):
+            from agents_relay.acp import ensure_acp_manifest
+
+            ensure_acp_manifest()  # env drop — read-only source=env row
+            status, data = self.srv.request("GET", "/v1/providers")
+            row = self._row(data["providers"], "acp.cursor")
+            self.assertEqual(row["source"], "env")
+            status, _ = self.srv.request(
+                "POST",
+                "/v1/providers",
+                {"name": "acp.cursor", "kind": "acp-agent", "command": "ssh box cursor --acp"},
+            )
+            self.assertEqual(status, 200)
+            from agents_relay.acp import acp_agent_cmd
+
+            self.assertEqual(acp_agent_cmd("acp.cursor"), "ssh box cursor --acp")
+            status, data = self.srv.request("GET", "/v1/providers")
+            self.assertEqual(self._row(data["providers"], "acp.cursor")["source"], "file")
+            # Deleting the override restores the env row.
+            status, _ = self.srv.request("DELETE", "/v1/providers/acp.cursor")
+            self.assertEqual(status, 200)
+            self.assertEqual(acp_agent_cmd("acp.cursor"), "cursor agent --acp")
 
     def test_delete_unknown_404(self):
         status, _ = self.srv.request("DELETE", "/v1/providers/nope.nothing")
