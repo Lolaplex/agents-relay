@@ -96,7 +96,12 @@ class GatewayClient:
     prefs_path: Path | None = None
 
     def _headers(self) -> dict[str, str]:
-        headers = {"Content-Type": "application/json"}
+        from . import __version__
+
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": f"agents-relay/{__version__}",
+        }
         tok = (self.secret or "").strip()
         if not tok:
             if _is_loopback_url(self.base_url):

@@ -317,6 +317,38 @@ class TestProxyHardening(unittest.TestCase):
             r.read()
             self.assertEqual(seen["timeout"], 30)
 
+    def test_proxy_sends_product_user_agent(self):
+        """Cloudflare BIC bans the default Python-urllib UA; send our own."""
+        from agents_relay import remotes as remotes_mod
+
+        seen: dict = {}
+
+        class FakeUpstream:
+            status = 200
+            headers = {"Content-Type": "application/json"}
+            _sent = False
+
+            def read(self, n):
+                if self._sent:
+                    return b""
+                self._sent = True
+                return b"{}"
+
+            def close(self):
+                pass
+
+        def fake_urlopen(req, timeout=None):
+            seen["ua"] = req.get_header("User-agent")
+            return FakeUpstream()
+
+        with patch.object(remotes_mod.urllib.request, "urlopen", fake_urlopen):
+            r = self.relay.request("GET", "/v1/remote/vps/v1/workspaces")
+            r.read()
+            self.assertTrue(
+                str(seen.get("ua") or "").startswith("agents-relay/"),
+                f"unexpected UA: {seen.get('ua')!r}",
+            )
+
     def test_accept_header_forwarded(self):
         r = self.relay.request(
             "GET", "/v1/remote/vps/v1/workspaces",
