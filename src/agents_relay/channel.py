@@ -9,16 +9,17 @@ resume, and multiplexes ``op`` frames, ``rpc-req``/``rpc-res`` frames,
 
 v0 scope: transport + presence + RPC plane. ``op`` payloads are opaque
 blobs (op-log schema is the agents-store/agents-sync track); they are
-forwarded to the other connected devices the workspace allowlist covers.
+broadcast to every other connected device — allowlist filtering lands
+with the op layer (devices.allowlist field is stored, not yet enforced).
 """
 from __future__ import annotations
 
 import json
 import logging
 import queue
+import secrets
 import threading
 import time
-import urllib.parse
 from collections import deque
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler
@@ -187,9 +188,7 @@ class ChannelHub:
     def rpc_call(self, device_id: str, method: str, params: dict[str, Any],
                  *, timeout_sec: float = RPC_TIMEOUT_SEC) -> Iterator[dict[str, Any]]:
         """Publish rpc-req and yield rpc-res frames until done/error/timeout."""
-        import secrets as _sec
-
-        rpc_id = f"rpc-{_sec.token_hex(8)}"
+        rpc_id = f"rpc-{secrets.token_hex(8)}"
         q: "queue.Queue[dict[str, Any]]" = queue.Queue(maxsize=512)
         self._pending[rpc_id] = q
         try:

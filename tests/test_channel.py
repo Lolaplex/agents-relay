@@ -225,6 +225,25 @@ class TestChannelWire(unittest.TestCase):
         self.assertEqual(st, 200)
         self.assertTrue(body["ok"])
 
+    def test_device_token_cannot_mint_or_manage_credentials(self):
+        res = self._redeem_device()
+        auth = {"Authorization": f"Bearer {res['token']}"}
+        # credential minting/management is master-only — a stolen device
+        # token must not mint further credentials or drop stored ones.
+        st, _ = self.srv.req("POST", "/v1/pair/create", {"mode": "remote"},
+                             headers=auth)
+        self.assertEqual(st, 401)
+        st, _ = self.srv.req("GET", "/v1/hub/devices", headers=auth)
+        self.assertEqual(st, 401)
+        st, _ = self.srv.req("POST", "/v1/remotes",
+                             {"id": "x", "base_url": "https://evil.example",
+                              "secret": "leak"}, headers=auth)
+        self.assertEqual(st, 401)
+        st, _ = self.srv.req("DELETE", "/v1/remotes/dev-ghost", headers=auth)
+        self.assertEqual(st, 401)
+        st, _ = self.srv.req("GET", "/v1/discover", headers=auth)
+        self.assertEqual(st, 401)
+
     def test_hub_stream_requires_device_auth(self):
         st, _ = self.srv.req("GET", "/v1/hub/stream")
         self.assertEqual(st, 401)

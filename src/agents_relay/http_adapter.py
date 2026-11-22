@@ -75,6 +75,8 @@ def _check_secret(
     handler: BaseHTTPRequestHandler,
     expected: str,
     query_params: dict[str, str] | None = None,
+    *,
+    allow_device: bool = True,
 ) -> bool:
     del query_params
     cfg = getattr(handler, "config", None)
@@ -98,9 +100,11 @@ def _check_secret(
     if got and hmac.compare_digest(got.encode("utf-8"), expected.encode("utf-8")):
         return True
     # Scoped device credentials (agents-relay#40): a paired device token
-    # authorizes the API surface like the master secret but is revocable
-    # per device via DELETE /v1/hub/devices/<id>.
-    if got:
+    # authorizes the agent-facing API surface like the master secret but
+    # is revocable per device via DELETE /v1/hub/devices/<id>. It must
+    # never authorize credential minting or credential management — that
+    # would let one stolen token mint unlimited further credentials.
+    if got and allow_device:
         try:
             from .devices import device_id_for_token
 
@@ -498,7 +502,10 @@ class TurnHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/v1/pair/create":
-            if not _check_secret(self, self.relay_secret, query_params):
+            # Credential minting is master-secret only — a device token
+            # must never mint further credentials (agents-relay#40).
+            if not _check_secret(self, self.relay_secret, query_params,
+                                 allow_device=False):
                 self.send_error(401, "unauthorized")
                 return
             body = self._read_json()
@@ -597,7 +604,10 @@ class TurnHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/v1/remotes":
-            if not _check_secret(self, self.relay_secret, query_params):
+            # Vault writes are admin-only — device tokens may read mounts
+            # but never inject or drop stored credentials.
+            if not _check_secret(self, self.relay_secret, query_params,
+                                 allow_device=False):
                 self.send_error(401, "unauthorized")
                 return
             body = self._read_json()
@@ -1855,7 +1865,8 @@ class TurnHandler(BaseHTTPRequestHandler):
             handle_hub_stream(self, did, since=max(0, since), heartbeat_sec=hb)
             return
         if path == "/v1/hub/devices":
-            if not _check_secret(self, self.relay_secret, query_params):
+            if not _check_secret(self, self.relay_secret, query_params,
+                                 allow_device=False):
                 self.send_error(401, "unauthorized")
                 return
             from .channel import hub
@@ -1869,7 +1880,8 @@ class TurnHandler(BaseHTTPRequestHandler):
             self._write_json({"ok": True, "devices": rows}, 200)
             return
         if path == "/v1/discover":
-            if not _check_secret(self, self.relay_secret, query_params):
+            if not _check_secret(self, self.relay_secret, query_params,
+                                 allow_device=False):
                 self.send_error(401, "unauthorized")
                 return
             from .discovery import discover_peers
@@ -2067,7 +2079,8 @@ class TurnHandler(BaseHTTPRequestHandler):
         # DELETE /v1/remotes/<id> — drop a remote mount (never its secret elsewhere).
         if (len(parts) == 4 and parts[1] == "v1"
                 and parts[2] == "remotes" and parts[3]):
-            if not _check_secret(self, self.relay_secret, query_params):
+            if not _check_secret(self, self.relay_secret, query_params,
+                                 allow_device=False):
                 self.send_error(401, "unauthorized")
                 return
             from .remotes import delete_remote
@@ -2081,7 +2094,8 @@ class TurnHandler(BaseHTTPRequestHandler):
         # DELETE /v1/hub/devices/<id> — revoke a paired device (agents-relay#40).
         if (len(parts) == 5 and parts[1] == "v1"
                 and parts[2] == "hub" and parts[3] == "devices" and parts[4]):
-            if not _check_secret(self, self.relay_secret, query_params):
+            if not _check_secret(self, self.relay_secret, query_params,
+                                 allow_device=False):
                 self.send_error(401, "unauthorized")
                 return
             from .devices import revoke_device
@@ -2090,6 +2104,9 @@ class TurnHandler(BaseHTTPRequestHandler):
                 self.send_error(404, "unknown device")
                 return
             try:
+                from .channel import hub
+
+                hub().disconnect(parts[4])  # drop any live stream too
                 from .remotes import delete_remote
 
                 delete_remote(self._cfg(), f"dev-{parts[4]}")

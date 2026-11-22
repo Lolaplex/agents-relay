@@ -373,7 +373,9 @@ def _proxy_via_channel(
     data = handler.rfile.read(length) if length else None
     req: dict = {"method": handler.command, "path": path}
     if data is not None:
-        req["body"] = data.decode("utf-8", "replace")
+        import base64
+
+        req["body_b64"] = base64.b64encode(data).decode("ascii")
     ctype = handler.headers.get("Content-Type")
     if ctype and data is not None:
         req["content_type"] = ctype
@@ -401,10 +403,17 @@ def _proxy_via_channel(
         handler.send_header("Connection", "close")
     handler.end_headers()
     try:
-        if "body" in first:
+        import base64
+
+        if "body_b64" in first:
+            handler.wfile.write(base64.b64decode(first["body_b64"]))
+        elif "body" in first:
             handler.wfile.write(str(first["body"]).encode("utf-8"))
         for fr in frames:
-            if "chunk" in fr:
+            if "chunk_b64" in fr:
+                handler.wfile.write(base64.b64decode(fr["chunk_b64"]))
+                handler.wfile.flush()
+            elif "chunk" in fr:
                 handler.wfile.write(str(fr["chunk"]).encode("utf-8"))
                 handler.wfile.flush()
             elif "error" in fr or fr.get("done"):

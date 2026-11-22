@@ -161,8 +161,13 @@ def _rpc_http(params: dict, cfg: RelayConfig) -> Iterator[dict]:
         yield {"error": str(exc)}
         return
     method = str(req.get("method") or "GET").upper()
-    body = req.get("body")
-    data = body.encode("utf-8") if isinstance(body, str) and body else None
+    data: bytes | None = None
+    if req.get("body_b64"):
+        import base64
+
+        data = base64.b64decode(str(req["body_b64"]))
+    elif isinstance(req.get("body"), str) and req["body"]:
+        data = str(req["body"]).encode("utf-8")
     headers = {"User-Agent": "agents-relay/channel-rpc"}
     token = _resolve_loopback_secret()
     if token:
@@ -199,8 +204,10 @@ def _rpc_http(params: dict, cfg: RelayConfig) -> Iterator[dict]:
         yield {"done": True}
         return
     raw = resp.read()
+    import base64
+
     yield {"status": resp.status, "content_type": ctype,
-           "body": raw.decode("utf-8", "replace"), "done": True}
+           "body_b64": base64.b64encode(raw).decode("ascii"), "done": True}
 
 
 def _rpc_turn_stream(params: dict, cfg: RelayConfig) -> Iterator[dict]:
@@ -247,6 +254,21 @@ class ChannelClient:
         self.cfg = config or RelayConfig.from_env()
         self._outbox: "queue.Queue[dict]" = queue.Queue(maxsize=512)
         self._stop = threading.Event()
+        self._seq_dirty = 0
+
+    def _persist_seq(self, force: bool = False) -> None:
+        """Flush the resume cursor so a restart replays only the tail."""
+        self._seq_dirty = 0 if force else self._seq_dirty + 1
+        if not force and self._seq_dirty < 64:
+            return
+        self._seq_dirty = 0
+        try:
+            rows = _load_hubs()
+            if self.hub_id in rows:
+                rows[self.hub_id]["last_seq"] = self.last_seq
+                _store_hubs(rows)
+        except Exception:  # noqa: BLE001 - cursor loss only replays the ring
+            pass
 
     # -- wire -----------------------------------------------------------
 
@@ -293,7 +315,8 @@ class ChannelClient:
                 except queue.Empty:
                     break
             while batch and not self._post_send(batch):
-                time.sleep(2.0)  # keep retrying — messages stay queued
+                if self._stop.wait(2.0):  # keep retrying — messages stay queued
+                    return
 
     # -- rpc dispatch ----------------------------------------------------
 
@@ -323,7 +346,9 @@ class ChannelClient:
     def _read_stream(self) -> Iterator[dict]:
         url = f"{self.hub_url}/v1/hub/stream?since={self.last_seq}"
         req = urllib.request.Request(url, headers=self._headers())
-        resp = urllib.request.urlopen(req, timeout=None)
+        # Read timeout > server heartbeat (25s): a half-open TCP would
+        # otherwise block read1 forever and look "connected" while dead.
+        resp = urllib.request.urlopen(req, timeout=90)
         buf = b""
         while not self._stop.is_set():
             chunk = resp.read1(4096)  # incremental — read() would wait for a full buffer
@@ -355,13 +380,15 @@ class ChannelClient:
                     seq = int(msg.get("seq") or 0)
                     if seq:
                         self.last_seq = seq
+                        self._persist_seq()
                     if kind == "rpc-req":
                         self._dispatch_rpc(msg)
                     elif kind == "resync":
                         self.last_seq = 0  # full resync handled by op-log layer
                     # hello/presence/op/ack are consumed by the sync layer later
+                self._persist_seq(force=True)
                 backoff = _RECONNECT_MIN
-            except (urllib.error.URLError, OSError) as exc:
+            except (urllib.error.URLError, OSError, TimeoutError) as exc:
                 log.warning("channel disconnected: %s", exc)
             if self._stop.is_set():
                 break
