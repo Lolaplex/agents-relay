@@ -134,6 +134,16 @@ def _resolve_provider_and_model(
 ) -> tuple[str, str]:
     provider = params.provider.strip()
     model = params.model.strip()
+    if params.session and (not provider or not model):
+        # Session pick wins over the workspace pick (chat override > ws default).
+        try:
+            from .providers_api import session_pick
+
+            pick = session_pick(params.session)
+            provider = provider or pick["provider"]
+            model = model or pick["model"]
+        except Exception:
+            pass
     if params.workspace and (not provider or not model):
         # Workspace pick fills unset slots (flag > pick > env default).
         try:

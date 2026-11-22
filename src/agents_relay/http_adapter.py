@@ -820,15 +820,30 @@ class TurnHandler(BaseHTTPRequestHandler):
                 return
             from runner.model import ModelError, clear, use
 
+            session = str(body.get("session") or query_params.get("session") or "").strip()
             try:
                 if body.get("clear"):
-                    out = clear(workspace=ws)
+                    if session:
+                        # Clear only the session override; the ws pick stays
+                        # the last-used seed for new chats.
+                        from .providers_api import clear_session_pick
+
+                        out = clear_session_pick(session)
+                    else:
+                        out = clear(workspace=ws)
                 else:
                     provider = str(body.get("provider") or "").strip()
                     if not provider:
                         self.send_error(400, "provider is required")
                         return
-                    out = use(provider, str(body.get("model") or "").strip(), workspace=ws)
+                    model = str(body.get("model") or "").strip()
+                    out = use(provider, model, workspace=ws)
+                    if session:
+                        # Per-session override; the ws pick above stays the
+                        # last-used seed for new chats.
+                        from .providers_api import set_session_pick
+
+                        set_session_pick(session, provider, model)
             except ModelError as exc:
                 self.send_error(400, str(exc))
                 return
@@ -836,6 +851,51 @@ class TurnHandler(BaseHTTPRequestHandler):
                 self.send_error(500, f"model switch failed: {exc}")
                 return
             self._write_json({"ok": True, **out}, 200)
+            return
+
+        if path == "/v1/providers":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            body = self._read_json()
+            if body is None:
+                return
+            from .providers_api import ProviderError, create_provider
+
+            try:
+                row = create_provider(body)
+            except ProviderError as exc:
+                self.send_error(exc.status, exc.message)
+                return
+            except Exception as exc:
+                self.send_error(500, f"provider create failed: {exc}")
+                return
+            _emit_relay_event("provider.changed", {"action": "create", "provider": row["name"]})
+            self._write_json({"ok": True, "provider": row}, 200)
+            return
+
+        if path == "/v1/favorites":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            body = self._read_json()
+            if body is None:
+                return
+            from .providers_api import ProviderError, set_favorites, star_favorite
+
+            try:
+                if isinstance(body.get("favorites"), list):
+                    rows = set_favorites(body["favorites"])
+                else:
+                    rows = star_favorite(
+                        str(body.get("provider") or ""),
+                        str(body.get("model") or ""),
+                        bool(body.get("star")),
+                    )
+            except ProviderError as exc:
+                self.send_error(exc.status, exc.message)
+                return
+            self._write_json({"ok": True, "favorites": rows}, 200)
             return
 
         if path == "/v1/chat/stream":
@@ -1799,19 +1859,38 @@ class TurnHandler(BaseHTTPRequestHandler):
                 self.send_error(401, "unauthorized")
                 return
             try:
-                from runner.providers import list_providers
-                rows = [
-                    {"name": r.get("name"), "kind": r.get("kind"),
-                     "model": r.get("model"), "when": r.get("when")}
-                    for r in list_providers()
-                ]
-                from .acp import acp_provider_rows
-                rows = [r for r in rows if r.get("kind") != "acp-agent"]
-                rows.extend(acp_provider_rows(self._cfg()))
+                from .providers_api import provider_rows
+                rows = provider_rows(self._cfg())
             except Exception as exc:
                 self.send_error(500, f"providers unavailable: {exc}")
                 return
             self._write_json({"ok": True, "providers": rows}, 200)
+            return
+        probe_parts = path.split("/")
+        if (len(probe_parts) == 5 and probe_parts[1] == "v1"
+                and probe_parts[2] == "providers" and probe_parts[4] == "probe"):
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            from .providers_api import ProviderError, probe_provider
+
+            try:
+                out = probe_provider(self._cfg(), probe_parts[3])
+            except ProviderError as exc:
+                self.send_error(exc.status, exc.message)
+                return
+            except Exception as exc:
+                self.send_error(500, f"probe failed: {exc}")
+                return
+            self._write_json({"ok": True, "provider": probe_parts[3], **out}, 200)
+            return
+        if path == "/v1/favorites":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            from .providers_api import get_favorites
+
+            self._write_json({"ok": True, "favorites": get_favorites()}, 200)
             return
         if path == "/v1/model":
             if not _check_secret(self, self.relay_secret, query_params):
@@ -1821,17 +1900,22 @@ class TurnHandler(BaseHTTPRequestHandler):
                 ws_ref = str(query_params.get("workspace") or "").strip()
                 ws = resolve_workspace_id(ws_ref) if ws_ref else None
                 from runner.model import selected
-                from runner.providers import list_providers
-                pick = selected(ws)
-                rows = [
-                    {"name": r.get("name"), "kind": r.get("kind"),
-                     "model": r.get("model"), "when": r.get("when")}
-                    for r in list_providers()
-                ]
-                from .acp import acp_provider_rows
-                rows = [r for r in rows if r.get("kind") != "acp-agent"]
-                rows.extend(acp_provider_rows(
-                    self._cfg(), refresh=str(query_params.get("refresh") or "") == "1"))
+                pick = dict(selected(ws))
+                scope = "workspace"
+                session = str(query_params.get("session") or "").strip()
+                if session:
+                    # Session pick wins over the workspace pick; the workspace
+                    # row stays the fallback for new chats.
+                    from .providers_api import session_pick
+
+                    sp = session_pick(session)
+                    if sp["provider"]:
+                        pick = sp
+                        scope = "session"
+                from .providers_api import provider_rows
+                rows = provider_rows(
+                    self._cfg(),
+                    refresh=str(query_params.get("refresh") or "") == "1")
             except ValueError as exc:
                 self.send_error(400, str(exc))
                 return
@@ -1839,7 +1923,8 @@ class TurnHandler(BaseHTTPRequestHandler):
                 self.send_error(500, f"model unavailable: {exc}")
                 return
             self._write_json({"ok": True, "provider": pick.get("provider") or "",
-                              "model": pick.get("model") or "", "providers": rows}, 200)
+                              "model": pick.get("model") or "", "scope": scope,
+                              "providers": rows}, 200)
             return
         if path == "/v1/remotes":
             if not _check_secret(self, self.relay_secret, query_params):
@@ -2076,6 +2161,25 @@ class TurnHandler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:
         path, query_params = _parse_query(self.path)
         parts = path.split("/")
+        # DELETE /v1/providers/<name> — file-managed manifests only.
+        if (len(parts) == 4 and parts[1] == "v1"
+                and parts[2] == "providers" and parts[3]):
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            from .providers_api import ProviderError, delete_provider
+
+            try:
+                delete_provider(parts[3])
+            except ProviderError as exc:
+                self.send_error(exc.status, exc.message)
+                return
+            except Exception as exc:
+                self.send_error(500, f"provider delete failed: {exc}")
+                return
+            _emit_relay_event("provider.changed", {"action": "delete", "provider": parts[3]})
+            self._write_json({"ok": True, "provider": parts[3]}, 200)
+            return
         # DELETE /v1/remotes/<id> — drop a remote mount (never its secret elsewhere).
         if (len(parts) == 4 and parts[1] == "v1"
                 and parts[2] == "remotes" and parts[3]):
