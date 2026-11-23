@@ -28,7 +28,8 @@ from typing import Any, Iterator
 log = logging.getLogger(__name__)
 
 ENVELOPE_V = 1
-KINDS = frozenset({"hello", "presence", "op", "rpc-req", "rpc-res", "ack", "resync"})
+KINDS = frozenset({"hello", "presence", "op", "rpc-req", "rpc-res", "ack",
+                   "resync", "ws:announce", "ws:revoke"})
 REPLAY_LIMIT = 2000
 RPC_TIMEOUT_SEC = 30.0
 RPC_STREAM_TIMEOUT_SEC = 600.0
@@ -93,6 +94,7 @@ class ChannelHub:
         self._gen: dict[str, int] = {}
         self._op_handler = None
         self._ack_handler = None
+        self._ws_handler = None
 
     # -- link lifecycle -------------------------------------------------
 
@@ -174,6 +176,11 @@ class ChannelHub:
         """fn(device_id, ack_payload) receives upstream op-acks."""
         self._ack_handler = fn
 
+    def set_ws_handler(self, fn) -> None:
+        """fn(device_id, kind, payload) receives ws-share control frames
+        (``ws:announce``/``ws:revoke``, klanker#145)."""
+        self._ws_handler = fn
+
     def handle_upstream(self, device_id: str, msgs: list[dict[str, Any]]) -> dict[str, Any]:
         """Device POSTed envelopes: route rpc-res to pending calls, ack ops,
         forward ops to other devices (allowlist-filtered upstream)."""
@@ -199,6 +206,9 @@ class ChannelHub:
             elif kind == "ack":
                 if self._ack_handler is not None:
                     self._ack_handler(device_id, payload)
+            elif kind in ("ws:announce", "ws:revoke"):
+                if self._ws_handler is not None:
+                    self._ws_handler(device_id, kind, payload)
             elif kind == "presence":
                 pass
         return {"acked": acked}

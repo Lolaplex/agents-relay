@@ -507,6 +507,25 @@ class TestChannelE2E(unittest.TestCase):
         self.assertEqual(got_op, [("dX", {"ws": "w1", "envelopes": []})])
         self.assertEqual(got_ack, [("dX", {"ws": "w1", "cursor": 9})])
 
+    def test_ws_share_frames_route_to_handler(self):
+        """ws:announce/ws:revoke upstream frames reach the ws handler
+        (klanker#145 ws-share control plane)."""
+        hub = channel.hub()
+        got = []
+        hub.set_ws_handler(lambda did, k, p: got.append((did, k, p)))
+        try:
+            hub.handle_upstream("dX", [
+                {"kind": "ws:announce",
+                 "payload": {"ws": "w1", "owner": "dX"}},
+                {"kind": "ws:revoke", "payload": {"ws": "w1"}},
+            ])
+        finally:
+            hub.set_ws_handler(None)
+        self.assertEqual(got, [
+            ("dX", "ws:announce", {"ws": "w1", "owner": "dX"}),
+            ("dX", "ws:revoke", {"ws": "w1"}),
+        ])
+
     def test_e2e_presence_list(self):
         did = self._connect_client()
         self._wait_connected(did)

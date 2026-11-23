@@ -283,6 +283,7 @@ class ChannelClient:
         self._seq_dirty = 0
         self.on_op = None    # fn(payload) — wired by the sync layer
         self.on_ack = None   # fn(payload) — wired by the sync layer
+        self.on_ws = None    # fn(kind, payload) — ws-share control frames
         self.on_hello = None  # fn(payload) — reconnect catch-up trigger
 
     def _persist_seq(self, force: bool = False) -> None:
@@ -421,6 +422,9 @@ class ChannelClient:
                     elif kind == "ack":
                         if self.on_ack is not None:
                             self.on_ack(msg.get("payload") or {})
+                    elif kind in ("ws:announce", "ws:revoke"):
+                        if self.on_ws is not None:
+                            self.on_ws(kind, msg.get("payload") or {})
                     elif kind == "resync":
                         self.last_seq = 0  # full resync handled by op-log layer
                     # hello/presence are informational only
