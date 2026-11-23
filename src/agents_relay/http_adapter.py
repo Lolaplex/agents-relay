@@ -383,6 +383,17 @@ def _is_private_host(host: str) -> bool:
     return False
 
 
+def _trust_proxy() -> bool:
+    """X-Forwarded-* headers are client-supplied — only honor them
+    behind a trusted reverse proxy (RELAY_TRUST_PROXY=1). Otherwise a
+    spoofed header poisons generated pair URLs and cookie security
+    decisions (agents-relay#42)."""
+    import os
+
+    return os.environ.get("RELAY_TRUST_PROXY", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def _request_base_url(handler, cfg) -> str:
     """Absolute base for self-links (pair URLs).
 
@@ -396,12 +407,16 @@ def _request_base_url(handler, cfg) -> str:
     auto_bound = str(getattr(getattr(handler, "server", None), "relay_url", "") or "").strip().rstrip("/")
     if configured and configured != auto_bound:
         return configured
-    proto = (handler.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
-    host = (
-        handler.headers.get("X-Forwarded-Host")
-        or handler.headers.get("Host")
-        or ""
-    ).split(",")[0].strip()
+    if _trust_proxy():
+        proto = (handler.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
+        host = (
+            handler.headers.get("X-Forwarded-Host")
+            or handler.headers.get("Host")
+            or ""
+        ).split(",")[0].strip()
+    else:
+        proto = ""
+        host = (handler.headers.get("Host") or "").split(",")[0].strip()
     if host:
         if proto not in ("http", "https"):
             proto = "http" if _is_private_host(host) else "https"
@@ -673,6 +688,11 @@ class TurnHandler(BaseHTTPRequestHandler):
             from .pairing import create_pair
 
             mode = str(body.get("mode") or "web")
+            if mode == "ws":
+                # ws invites are minted by an owner device through
+                # /v1/ws/invite, never by the admin pair endpoint.
+                self.send_error(400, "mode=ws requires /v1/ws/invite")
+                return
             ttl = body.get("ttl_sec", 60)
             host_id = ""
             try:
@@ -699,10 +719,11 @@ class TurnHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/v1/ws/invite":
-            # ws-share invite mint (klanker#145): a paired device asks the
-            # hub for a single-use code that redeems as device pair AND
-            # ws member grant. The host app's ws_invite_auth decides
-            # ownership — never grant without it.
+            # ws-share invite mint (klanker#145): a paired device or the
+            # hub operator (master secret -> __admin__) asks for a
+            # single-use code that redeems as device pair AND ws member
+            # grant. ws_invite_auth decides ownership — never grant
+            # without it; an unconfigured hook means invites are off.
             device_id = _check_device(self)
             if not device_id:
                 self.send_error(401, "unauthorized")
@@ -711,18 +732,30 @@ class TurnHandler(BaseHTTPRequestHandler):
             if body is None:
                 return
             ws_id = str(body.get("ws") or "").strip()
-            if not ws_id:
-                self.send_error(400, "ws required")
+            if not valid_id(ws_id):
+                self.send_error(400, f"invalid workspace id: {ws_id!r}")
                 return
-            if ws_invite_auth is None or not ws_invite_auth(device_id, ws_id):
+            if ws_grant_hook is None or ws_invite_auth is None:
+                self.send_error(503, "workspace invites not configured")
+                return
+            if not ws_invite_auth(device_id, ws_id):
                 self.send_error(403, "not the workspace owner")
                 return
             from .pairing import create_pair
 
             cfg = self._cfg()
+            host_id = ""
+            try:
+                from agents_workspace import Host
+
+                hid_fn = getattr(Host.from_env(), "host_id", None)
+                if callable(hid_fn):
+                    host_id = str(hid_fn() or "")
+            except Exception:
+                pass
             res = create_pair(
                 mode="ws", ws=ws_id, granted_by=device_id,
-                ttl_sec=body.get("ttl_sec", 60),
+                host_id=host_id, ttl_sec=body.get("ttl_sec", 60),
                 base_url=_request_base_url(self, cfg))
             self._write_json({"ok": True, **res}, 200)
             return
@@ -761,6 +794,62 @@ class TurnHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(payload)
                 return
+            ws_id = str(entry.get("ws") or "")
+            granted_by = str(entry.get("granted_by") or "")
+            label = str(body.get("label") or "").strip()
+            if entry["mode"] == "ws":
+                # Re-verify at redeem time (agents-relay#42): the inviter
+                # may have been revoked or lost ownership since the code
+                # was minted — the invite window is not a grant window.
+                if ws_grant_hook is None or ws_invite_auth is None:
+                    self._write_json(
+                        {"ok": False,
+                         "error": "workspace invites not configured"}, 503)
+                    return
+                from .devices import load_devices
+
+                # __admin__ minted under the master secret — nothing to
+                # re-verify at redeem; a device inviter must still exist
+                # AND still pass the ownership hook.
+                granter_ok = (
+                    granted_by == "__admin__"
+                    or (granted_by in load_devices()
+                        and ws_invite_auth(granted_by, ws_id))
+                )
+                if not granter_ok:
+                    self._write_json(
+                        {"ok": False,
+                         "error": "invite grant no longer valid"}, 403)
+                    return
+                # An already-paired device presenting its credential
+                # gains the ws grant without a second device_id.
+                ctx = self._auth_ctx()
+                if ctx.get("kind") == "device" and ctx.get("device_id"):
+                    did = str(ctx["device_id"])
+                    try:
+                        ws_grant_hook(did, ws_id, granted_by)
+                        from .devices import add_allowlist
+
+                        add_allowlist(did, ws_id)
+                    except Exception as exc:  # noqa: BLE001
+                        self._write_json(
+                            {"ok": False,
+                             "error": f"ws grant failed: {exc}"}, 500)
+                        return
+                    self._write_json(
+                        {"ok": True, "mode": "ws", "ws": ws_id,
+                         "host_id": entry.get("host_id", ""),
+                         "granted_by": granted_by,
+                         "device_id": did, "token": "",
+                         "hub": {
+                             "stream": "/v1/hub/stream",
+                             "send": "/v1/hub/send",
+                             "devices": "/v1/hub/devices",
+                             "lease": "/v1/hub/lease",
+                         }},
+                        200,
+                    )
+                    return
             # mode=remote|ws mints a scoped device credential — the master
             # relay_secret is never handed out by pairing (agents-relay#38/#40).
             try:
@@ -769,24 +858,29 @@ class TurnHandler(BaseHTTPRequestHandler):
                 # mode=ws guests are ws_member-scoped to the granted ws;
                 # mode=remote pairs a compute node (role=host).
                 dev = mint_device(
-                    label=self.address_string(),
+                    label=label or self.address_string(),
                     host_id=entry.get("host_id", ""),
                     role="ws_member" if entry["mode"] == "ws" else "host",
-                    allowlist=[str(entry.get("ws") or "")]
-                              if entry["mode"] == "ws" else None,
+                    allowlist=[ws_id] if entry["mode"] == "ws" else None,
                 )
             except Exception as exc:  # noqa: BLE001
                 self._write_json(
                     {"ok": False, "error": f"device mint failed: {exc}"}, 500)
                 return
-            ws_id = str(entry.get("ws") or "")
             if entry["mode"] == "ws" and ws_id and ws_grant_hook is not None:
                 try:
                     ws_grant_hook(
-                        dev["device_id"], ws_id,
-                        str(entry.get("granted_by") or ""))
+                        dev["device_id"], ws_id, granted_by)
                 except Exception as exc:  # noqa: BLE001
-                    log.warning("ws grant hook failed: %s", exc)
+                    # Roll back the minted device — no leaked credential
+                    # for a grant that never landed (agents-relay#42).
+                    from .devices import revoke_device
+
+                    revoke_device(dev["device_id"])
+                    self._write_json(
+                        {"ok": False,
+                         "error": f"ws grant failed: {exc}"}, 500)
+                    return
             self._write_json(
                 {
                     "ok": True,
@@ -2119,7 +2213,9 @@ class TurnHandler(BaseHTTPRequestHandler):
             from .events import handle_events_sse
 
             hb = float(getattr(self.server, "events_heartbeat_sec", 25.0))
-            handle_events_sse(self, workspace=ws_filter, heartbeat_sec=hb)
+            handle_events_sse(
+                self, workspace=ws_filter, heartbeat_sec=hb,
+                tag=str(self._auth_ctx().get("device_id") or ""))
             return
         if path == "/v1/workspaces":
             if not _check_secret(self, self.relay_secret, query_params):
@@ -2562,6 +2658,16 @@ class TurnHandler(BaseHTTPRequestHandler):
                 from .remotes import delete_remote
 
                 delete_remote(self._cfg(), f"dev-{parts[4]}")
+            except Exception:
+                pass
+            try:
+                # Revocation is total: live leases + tagged SSE streams
+                # die with the credential (agents-relay#42).
+                from .events import disconnect_tag
+                from .leases import hub_leases
+
+                disconnect_tag(parts[4])
+                hub_leases().release_holder(parts[4])
             except Exception:
                 pass
             _emit_relay_event("device.changed", {"action": "revoke", "id": parts[4]})

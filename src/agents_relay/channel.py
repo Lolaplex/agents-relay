@@ -41,6 +41,13 @@ def envelope(kind: str, payload: dict[str, Any], *, ch: str = "", seq: int = 0,
             "id": msg_id, "ts": time.time(), "payload": dict(payload)}
 
 
+# Ephemeral kinds never enter the replay ring (agents-relay#42): a
+# reconnecting device must not re-execute rpc requests; rpc-res is
+# upstream-only, resync is a marker.
+_REPLAYED_KINDS = frozenset({"hello", "presence", "op", "ack",
+                             "ws:announce", "ws:revoke"})
+
+
 @dataclass
 class _Channel:
     """Persistent per-device seq space + replay ring — survives reconnects."""
@@ -58,10 +65,13 @@ class DeviceLink:
     connected_at: float = field(default_factory=time.time)
     generation: int = 0
 
-    def push(self, msg: dict[str, Any]) -> None:
-        self.chan.seq += 1
-        msg = dict(msg, seq=self.chan.seq)
-        self.chan.replay.append((self.chan.seq, msg))
+    def push(self, msg: dict[str, Any], lock: threading.Lock) -> None:
+        """Seq + replay + enqueue under the hub lock (agents-relay#42)."""
+        with lock:
+            self.chan.seq += 1
+            msg = dict(msg, seq=self.chan.seq)
+            if msg.get("kind") in _REPLAYED_KINDS:
+                self.chan.replay.append((self.chan.seq, msg))
         try:
             self.queue.put_nowait(msg)
         except queue.Full:
@@ -90,7 +100,7 @@ class ChannelHub:
         self._lock = threading.Lock()
         self._links: dict[str, DeviceLink] = {}
         self._channels: dict[str, _Channel] = {}
-        self._pending: dict[str, "queue.Queue[dict[str, Any]]"] = {}
+        self._pending: dict[tuple[str, str], "queue.Queue[dict[str, Any]]"] = {}
         self._gen: dict[str, int] = {}
         self._op_handler = None
         self._ack_handler = None
@@ -99,22 +109,56 @@ class ChannelHub:
 
     # -- link lifecycle -------------------------------------------------
 
-    def connect(self, device_id: str) -> DeviceLink:
-        """Attach a new SSE stream for a device; kicks the previous one.
-        The seq space + replay ring persist across generations."""
+    @staticmethod
+    def _poison(q: "queue.Queue") -> None:
+        """Enqueue the close sentinel even when the queue is full — drop
+        the oldest item rather than leak a stream (agents-relay#42)."""
+        try:
+            q.put_nowait(None)
+        except queue.Full:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                q.put_nowait(None)
+            except queue.Full:
+                pass
+
+    def connect(self, device_id: str,
+                since: int = 0) -> tuple[DeviceLink, list[dict], bool]:
+        """Attach a new SSE stream; kick the previous generation.
+
+        Returns (link, replay_msgs, needs_resync) computed inside the
+        lock BEFORE the link is visible to publishers — a frame can be
+        replayed or queued, never both (agents-relay#42). The seq space
+        + replay ring persist across generations.
+        """
         with self._lock:
             gen = self._gen.get(device_id, 0) + 1
             self._gen[device_id] = gen
             old = self._links.get(device_id)
             if old is not None:
-                try:
-                    old.queue.put_nowait(None)  # drop the stale stream
-                except queue.Full:
-                    pass
+                self._poison(old.queue)  # drop the stale stream
             chan = self._channels.setdefault(device_id, _Channel())
             link = DeviceLink(device_id=device_id, chan=chan, generation=gen)
+            oldest = (chan.replay[0][0] - 1) if chan.replay else chan.seq
+            if since > 0 and (since < oldest or since > chan.seq):
+                replay: list[dict] = []
+                resync = True
+            elif since:
+                replay = [m for s, m in chan.replay if s > since]
+                resync = False
+            else:
+                replay = []
+                resync = False
             self._links[device_id] = link
-        return link
+        return link, replay, resync
+
+    def link_for(self, device_id: str, since: int = 0) -> DeviceLink:
+        """Back-compat attach for callers that only want the link —
+        tests and non-SSE producers (agents-relay#42)."""
+        return self.connect(device_id, since=since)[0]
 
     def disconnect(self, device_id: str, generation: int = 0) -> None:
         with self._lock:
@@ -124,10 +168,7 @@ class ChannelHub:
             if generation and link.generation != generation:
                 return  # a newer stream already replaced us
             del self._links[device_id]
-            try:
-                link.queue.put_nowait(None)  # release the SSE generator
-            except queue.Full:
-                pass
+        self._poison(link.queue)  # release the SSE generator
 
     def link(self, device_id: str) -> DeviceLink | None:
         with self._lock:
@@ -149,7 +190,7 @@ class ChannelHub:
         if link is None:
             return -1
         msg = envelope(kind, payload, ch=device_id, msg_id=msg_id)
-        link.push(msg)
+        link.push(msg, self._lock)
         return link.seq
 
     def broadcast(self, kind: str, payload: dict[str, Any],
@@ -162,10 +203,12 @@ class ChannelHub:
     def replay_since(self, link: DeviceLink, since: int) -> list[dict[str, Any]]:
         """Envelopes newer than ``since``. Empty list + ``resync`` marker
         upstream when the cursor fell behind the ring."""
-        return [m for s, m in link.replay if s > since]
+        with self._lock:
+            return [m for s, m in link.replay if s > since]
 
     def oldest_seq(self, link: DeviceLink) -> int:
-        return link.replay[0][0] - 1 if link.replay else link.seq
+        with self._lock:
+            return link.replay[0][0] - 1 if link.replay else link.seq
 
     # -- upstream ---------------------------------------------------------
 
@@ -192,13 +235,21 @@ class ChannelHub:
         """Device POSTed envelopes: route rpc-res to pending calls, ack ops,
         forward ops to other devices (allowlist-filtered upstream)."""
         acked = 0
+        malformed = 0
         for msg in msgs:
             if not isinstance(msg, dict) or msg.get("kind") not in KINDS:
+                malformed += 1
                 continue
             kind = msg["kind"]
-            payload = msg.get("payload") or {}
+            payload = msg.get("payload")
+            if not isinstance(payload, dict):
+                malformed += 1  # never crash a batch on one bad frame
+                continue
             if kind == "rpc-res":
-                q = self._pending.get(str(msg.get("id") or ""))
+                # pending is keyed (target_device, rpc_id): a device can
+                # only answer calls addressed to it (agents-relay#42).
+                q = self._pending.get(
+                    (device_id, str(msg.get("id") or "")))
                 if q is not None:
                     try:
                         q.put_nowait(payload)
@@ -214,11 +265,15 @@ class ChannelHub:
                 if self._ack_handler is not None:
                     self._ack_handler(device_id, payload)
             elif kind in ("ws:announce", "ws:revoke"):
+                if not isinstance(payload.get("ws"), str) or \
+                        not str(payload.get("ws") or "").strip():
+                    malformed += 1
+                    continue
                 if self._ws_handler is not None:
                     self._ws_handler(device_id, kind, payload)
             elif kind == "presence":
                 pass
-        return {"acked": acked}
+        return {"acked": acked, "malformed": malformed}
 
     # -- rpc plane --------------------------------------------------------
 
@@ -227,7 +282,8 @@ class ChannelHub:
         """Publish rpc-req and yield rpc-res frames until done/error/timeout."""
         rpc_id = f"rpc-{secrets.token_hex(8)}"
         q: "queue.Queue[dict[str, Any]]" = queue.Queue(maxsize=512)
-        self._pending[rpc_id] = q
+        with self._lock:
+            self._pending[(device_id, rpc_id)] = q
         try:
             if self.publish(device_id, "rpc-req",
                             {"method": method, "params": params},
@@ -251,7 +307,8 @@ class ChannelHub:
                 if frame.get("done") or frame.get("error"):
                     return
         finally:
-            self._pending.pop(rpc_id, None)
+            with self._lock:
+                self._pending.pop((device_id, rpc_id), None)
 
 
 _HUB = ChannelHub()
@@ -276,7 +333,20 @@ def handle_hub_stream(handler: BaseHTTPRequestHandler, device_id: str,
                       *, since: int = 0, heartbeat_sec: float = 25.0) -> None:
     """Per-device SSE stream: replay `?since=` then live envelopes."""
     mgr = hub()
-    link = mgr.connect(device_id)
+    link, replay, resync = mgr.connect(device_id, since=since)
+    # TOCTOU: a device revoked between auth and link registration must
+    # not end up streaming (agents-relay#42).
+    try:
+        from .devices import load_devices
+
+        if device_id not in load_devices():
+            mgr.disconnect(device_id, generation=link.generation)
+            handler.send_error(401, "unauthorized")
+            return
+    except Exception:  # noqa: BLE001 - lookup failure must not open stream
+        mgr.disconnect(device_id, generation=link.generation)
+        handler.send_error(503, "device registry unavailable")
+        return
     try:
         from .devices import list_public, touch_device
 
@@ -301,12 +371,12 @@ def handle_hub_stream(handler: BaseHTTPRequestHandler, device_id: str,
         handler.end_headers()
         handler.wfile.write(b": connected\n\n")
         handler.wfile.flush()
-        # replay window: cursor older than the ring -> resync marker first
-        if since and since < mgr.oldest_seq(link):
+        # replay snapshot was taken atomically at connect (agents-relay#42)
+        if resync:
             handler.wfile.write(_fmt_sse(envelope("resync", {"since": since})))
             handler.wfile.flush()
-        elif since:
-            for msg in mgr.replay_since(link, since):
+        elif replay:
+            for msg in replay:
                 handler.wfile.write(_fmt_sse(msg))
             handler.wfile.flush()
         handler.wfile.write(_fmt_sse(envelope(

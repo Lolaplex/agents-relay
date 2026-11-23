@@ -299,6 +299,7 @@ class ChannelClient:
         self.cfg = config or RelayConfig.from_env()
         self._outbox: "queue.Queue[dict]" = queue.Queue(maxsize=512)
         self._stop = threading.Event()
+        self.revoked = False  # set on HTTP 401 — permanent, no reconnect
         self._seq_dirty = 0
         self.on_op = None    # fn(payload) — wired by the sync layer
         self.on_ack = None   # fn(payload) — wired by the sync layer
@@ -339,6 +340,17 @@ class ChannelClient:
         try:
             urllib.request.urlopen(req, timeout=15).read()
             return True
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                # Revoked device: retrying can never succeed — stop the
+                # client for good instead of hammering the hub
+                # (agents-relay#42).
+                log.error("hub send 401 — device revoked, stopping channel")
+                self.revoked = True
+                self._stop.set()
+                return False
+            log.warning("hub send failed: %s", exc)
+            return False
         except (urllib.error.URLError, OSError) as exc:
             log.warning("hub send failed: %s", exc)
             return False
@@ -449,6 +461,13 @@ class ChannelClient:
                     # hello/presence are informational only
                 self._persist_seq(force=True)
                 backoff = _RECONNECT_MIN
+            except urllib.error.HTTPError as exc:
+                if exc.code == 401:
+                    log.error("stream 401 — device revoked, stopping channel")
+                    self.revoked = True
+                    self._stop.set()
+                    break
+                log.warning("channel disconnected: %s", exc)
             except (urllib.error.URLError, OSError, TimeoutError) as exc:
                 log.warning("channel disconnected: %s", exc)
             if self._stop.is_set():

@@ -128,6 +128,16 @@ class LeaseBook:
                 del self._slots[key]
             return {"released": True}
 
+    def release_holder(self, holder: str) -> int:
+        """Drop every lease held by ``holder`` — device revocation must
+        not leave dead sessions fencing live ones (agents-relay#42)."""
+        with self._lock:
+            dropped = [k for k, s in self._slots.items()
+                       if s["holder"] == holder]
+            for k in dropped:
+                del self._slots[k]
+        return len(dropped)
+
     def snapshot(self) -> list[dict]:
         with self._lock:
             now = self._clock()

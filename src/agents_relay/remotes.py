@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import posixpath
 import re
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -107,6 +108,9 @@ def _normalize_proxy_rest(rest: str) -> str:
     if norm != "/health" and not norm.startswith("/v1/"):
         raise ValueError(f"proxy path not allowed: {norm}")
     return norm
+
+
+_LOCK = threading.Lock()
 
 
 def _path() -> Path:
@@ -253,35 +257,39 @@ def upsert_remote(config: RelayConfig, body: dict) -> tuple[dict | None, str]:
         except ValueError as exc:
             return None, str(exc)
     migrating = not _path().is_file()
-    remotes = load_remotes(config)
-    if migrating:
-        for other_id, info in remotes.items():
-            if other_id != rid and isinstance(info, dict):
-                other_secret = str(info.get("secret") or "").strip()
-                if other_secret and not _read_secret(str(other_id)):
-                    _write_secret(str(other_id), other_secret)
-    # Host dedupe: a second row for an already-mounted endpoint reuses the
-    # canonical id instead of forking credentials (klanker#144).
-    if via == "relay":
-        new_host = _host_key(base_url)
-        for other_id, info in remotes.items():
-            if other_id != rid and _host_key(str(info.get("base_url") or "")) == new_host:
-                rid = other_id
-                break
-    prev = remotes.get(rid) or {}
-    new_secret = str(body.get("secret") or "").strip()
-    prev_secret = str(prev.get("secret") or "").strip()
-    secret = new_secret or prev_secret
-    if secret and (new_secret or not _read_secret(rid)):
-        _write_secret(rid, secret)
-    label = str(body.get("label") or "").strip()
-    remotes[rid] = {
-        "base_url": base_url,
-        "label": label,
-        "via": via,
-        "device_id": device_id,
-    }
-    _store(remotes)
+    # Whole read-modify-write under the module lock — concurrent
+    # upserts (e.g. channel auto-register + UI save) must not clobber
+    # each other (agents-relay#42).
+    with _LOCK:
+        remotes = load_remotes(config)
+        if migrating:
+            for other_id, info in remotes.items():
+                if other_id != rid and isinstance(info, dict):
+                    other_secret = str(info.get("secret") or "").strip()
+                    if other_secret and not _read_secret(str(other_id)):
+                        _write_secret(str(other_id), other_secret)
+        # Host dedupe: a second row for an already-mounted endpoint reuses
+        # the canonical id instead of forking credentials (klanker#144).
+        if via == "relay":
+            new_host = _host_key(base_url)
+            for other_id, info in remotes.items():
+                if other_id != rid and _host_key(str(info.get("base_url") or "")) == new_host:
+                    rid = other_id
+                    break
+        prev = remotes.get(rid) or {}
+        new_secret = str(body.get("secret") or "").strip()
+        prev_secret = str(prev.get("secret") or "").strip()
+        secret = new_secret or prev_secret
+        if secret and (new_secret or not _read_secret(rid)):
+            _write_secret(rid, secret)
+        label = str(body.get("label") or "").strip()
+        remotes[rid] = {
+            "base_url": base_url,
+            "label": label,
+            "via": via,
+            "device_id": device_id,
+        }
+        _store(remotes)
     return {
         "id": rid,
         "base_url": base_url,
@@ -294,17 +302,18 @@ def upsert_remote(config: RelayConfig, body: dict) -> tuple[dict | None, str]:
 
 def delete_remote(config: RelayConfig, rid: str) -> bool:
     migrating = not _path().is_file()
-    remotes = load_remotes(config)
-    if rid not in remotes:
-        return False
-    if migrating:
-        for other_id, info in remotes.items():
-            if other_id != rid and isinstance(info, dict):
-                other_secret = str(info.get("secret") or "").strip()
-                if other_secret and not _read_secret(str(other_id)):
-                    _write_secret(str(other_id), other_secret)
-    del remotes[rid]
-    _store(remotes)
+    with _LOCK:
+        remotes = load_remotes(config)
+        if rid not in remotes:
+            return False
+        if migrating:
+            for other_id, info in remotes.items():
+                if other_id != rid and isinstance(info, dict):
+                    other_secret = str(info.get("secret") or "").strip()
+                    if other_secret and not _read_secret(str(other_id)):
+                        _write_secret(str(other_id), other_secret)
+        del remotes[rid]
+        _store(remotes)
     _delete_secret(rid)
     return True
 

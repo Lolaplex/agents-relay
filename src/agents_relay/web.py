@@ -218,6 +218,14 @@ _LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1", "")
 
 
 def _forwarded_proto(handler: BaseHTTPRequestHandler) -> str:
+    """X-Forwarded-Proto only counts behind a trusted proxy —
+    RELAY_TRUST_PROXY=1 opts in; otherwise the client can spoof its
+    own scheme (agents-relay#42)."""
+    import os
+
+    if os.environ.get("RELAY_TRUST_PROXY", "").strip().lower() not in (
+            "1", "true", "yes", "on"):
+        return ""
     raw = handler.headers.get("X-Forwarded-Proto") or ""
     return raw.split(",")[0].strip().lower()
 
@@ -245,13 +253,56 @@ def _cookie_header(config: RelayConfig, value: str, *, secure: bool) -> str:
     return "; ".join(parts)
 
 
+_LOGIN_WINDOW_SEC = 60.0
+_LOGIN_MAX_FAILS = 5
+_login_lock = threading.Lock()
+_login_fails: dict[str, list[float]] = {}
+
+
+def _client_ip(handler: BaseHTTPRequestHandler) -> str:
+    try:
+        return str(handler.client_address[0] or "unknown")
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
+def _login_allowed(ip: str) -> bool:
+    """Sliding-window login throttle — a relay reachable over the
+    network must not be a token oracle (agents-relay#42)."""
+    now = time.monotonic()
+    with _login_lock:
+        fails = [t for t in _login_fails.get(ip, [])
+                 if t > now - _LOGIN_WINDOW_SEC]
+        _login_fails[ip] = fails
+        return len(fails) < _LOGIN_MAX_FAILS
+
+
+def _login_failed(ip: str) -> None:
+    now = time.monotonic()
+    with _login_lock:
+        fails = [t for t in _login_fails.get(ip, [])
+                 if t > now - _LOGIN_WINDOW_SEC]
+        fails.append(now)
+        _login_fails[ip] = fails
+
+
+def reset_login_limits() -> None:
+    with _login_lock:
+        _login_fails.clear()
+
+
 def handle_login(handler: BaseHTTPRequestHandler, body: dict) -> None:
     config = handler._cfg()  # type: ignore[attr-defined]
     if not web_enabled(config):
         handler._write_json({"ok": False, "error": "web surface disabled"}, 404)  # type: ignore[attr-defined]
         return
+    ip = _client_ip(handler)
+    if not _login_allowed(ip):
+        handler._write_json({"ok": False, "error": "rate limited"}, 429)  # type: ignore[attr-defined]
+        return
     token = str(body.get("token") or "").strip()
     if not token or not hmac.compare_digest(token, config.web_token):
+        _login_failed(ip)
         handler._write_json({"ok": False, "error": "invalid token"}, 401)  # type: ignore[attr-defined]
         return
     value = issue_cookie(config)

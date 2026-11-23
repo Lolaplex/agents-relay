@@ -251,8 +251,10 @@ class TestPairing(unittest.TestCase):
             srv.close()
 
     def test_pair_url_base_resolution(self):
-        # Proxy headers win over the request Host; a configured relay_url
-        # wins over everything; loopback falls back to http.
+        # Proxy headers win over the request Host — but ONLY behind a
+        # declared trusted proxy (agents-relay#42): without
+        # RELAY_TRUST_PROXY=1 a client-spoofed X-Forwarded-Host must not
+        # poison generated pair URLs.
         srv = _Srv(_cfg())
         try:
             st, _, res = srv.req(
@@ -267,9 +269,25 @@ class TestPairing(unittest.TestCase):
             )
             self.assertEqual(st, 200)
             self.assertTrue(
-                res["pair_url"].startswith("https://relay.example.com/#pair="),
+                res["pair_url"].startswith(f"http://{srv.host}:{srv.port}/#pair="),
                 res["pair_url"],
             )
+            with patch.dict(os.environ, {"RELAY_TRUST_PROXY": "1"}):
+                st, _, res = srv.req(
+                    "POST",
+                    "/v1/pair/create",
+                    {"mode": "web"},
+                    headers={
+                        "Authorization": "Bearer expected",
+                        "X-Forwarded-Proto": "https",
+                        "X-Forwarded-Host": "relay.example.com",
+                    },
+                )
+                self.assertEqual(st, 200)
+                self.assertTrue(
+                    res["pair_url"].startswith("https://relay.example.com/#pair="),
+                    res["pair_url"],
+                )
         finally:
             srv.close()
 
@@ -338,3 +356,154 @@ class TestPairing(unittest.TestCase):
             t.join(timeout=3)
         self.assertEqual(results.count("ok"), 1)
         self.assertEqual(results.count("invalid"), 5)
+
+
+class TestWsInviteHardening(unittest.TestCase):
+    """agents-relay#42: invite/redeem gap proofs — quotas, re-verify,
+    rollback, already-paired reuse."""
+
+    def setUp(self) -> None:
+        import agents_relay.http_adapter as ha
+
+        pairing.clear_pairs()
+        self._ha = ha
+        self.grants: list = []
+        ha.ws_invite_auth = None
+        ha.ws_grant_hook = None
+        self.td = tempfile.TemporaryDirectory()
+        host_dir = Path(self.td.name)
+        (host_dir / "workspaces" / "default").mkdir(parents=True)
+        self.env = patch.dict(os.environ, {"AGENTS_HOST_DIR": str(host_dir)})
+        self.env.start()
+        self.srv = _Srv(_cfg())
+
+    def tearDown(self) -> None:
+        self._ha.ws_invite_auth = None
+        self._ha.ws_grant_hook = None
+        self.srv.close()
+        self.env.stop()
+        self.td.cleanup()
+        pairing.clear_pairs()
+
+    def _pair_device(self, label: str = "") -> dict:
+        st, _, p = self.srv.req(
+            "POST", "/v1/pair/create", {"mode": "remote"},
+            headers={"Authorization": "Bearer expected"})
+        self.assertEqual(st, 200)
+        st, _, r = self.srv.req(
+            "POST", "/v1/pair/redeem",
+            {"token": p["token"], "label": label})
+        self.assertEqual(st, 200)
+        return r
+
+    def test_pair_create_rejects_ws_mode(self):
+        st, _, body = self.srv.req(
+            "POST", "/v1/pair/create", {"mode": "ws"},
+            headers={"Authorization": "Bearer expected"})
+        self.assertEqual(st, 400)
+
+    def test_invite_503_without_hooks_and_400_bad_ws(self):
+        owner = self._pair_device()
+        auth = {"Authorization": f"Bearer {owner['token']}",
+                "X-Device-Id": owner["device_id"]}
+        st, _, _ = self.srv.req(
+            "POST", "/v1/ws/invite", {"ws": "w1"}, headers=auth)
+        self.assertEqual(st, 503)  # no hooks -> invites off, never open
+        st, _, _ = self.srv.req(
+            "POST", "/v1/ws/invite", {"ws": "bad id!!"}, headers=auth)
+        self.assertEqual(st, 400)
+
+    def _invite(self, owner: dict, ws: str = "w1") -> dict:
+        self._ha.ws_invite_auth = lambda did, w: did == owner["device_id"]
+        if self._ha.ws_grant_hook is None:
+            self._ha.ws_grant_hook = lambda d, w, b: self.grants.append(
+                (d, w, b))
+        st, _, inv = self.srv.req(
+            "POST", "/v1/ws/invite", {"ws": ws},
+            headers={"Authorization": f"Bearer {owner['token']}",
+                     "X-Device-Id": owner["device_id"]})
+        self.assertEqual(st, 200)
+        return inv
+
+    def test_redeem_rejected_after_inviter_revoked(self):
+        from agents_relay import devices
+
+        owner = self._pair_device()
+        inv = self._invite(owner)
+        devices.revoke_device(owner["device_id"])
+        st, _, body = self.srv.req(
+            "POST", "/v1/pair/redeem", {"code": inv["code"]})
+        self.assertEqual(st, 403)
+
+    def test_redeem_rejected_when_ownership_lost(self):
+        owner = self._pair_device()
+        inv = self._invite(owner)
+        # owner still exists but is no longer the ws owner
+        self._ha.ws_invite_auth = lambda did, w: False
+        st, _, body = self.srv.req(
+            "POST", "/v1/pair/redeem", {"code": inv["code"]})
+        self.assertEqual(st, 403)
+
+    def test_grant_hook_failure_rolls_back_minted_device(self):
+        from agents_relay import devices
+
+        owner = self._pair_device()
+        inv = self._invite(owner)
+
+        def boom(did, ws, by):
+            raise RuntimeError("store down")
+
+        self._ha.ws_grant_hook = boom
+        st, _, body = self.srv.req(
+            "POST", "/v1/pair/redeem", {"code": inv["code"]})
+        self.assertEqual(st, 500)
+        # nothing may leak: no device row, no vault token
+        survivors = [d for d in devices.load_devices()
+                     if d != owner["device_id"]]
+        self.assertEqual(survivors, [])
+
+    def test_already_paired_device_gains_grant_without_new_id(self):
+        from agents_relay import devices
+
+        owner = self._pair_device()
+        member = self._pair_device()
+        inv = self._invite(owner, ws="w2")
+        self._ha.ws_grant_hook = lambda d, w, b: self.grants.append(
+            (d, w, b))
+        st, _, res = self.srv.req(
+            "POST", "/v1/pair/redeem", {"code": inv["code"]},
+            headers={"Authorization": f"Bearer {member['token']}",
+                     "X-Device-Id": member["device_id"]})
+        self.assertEqual(st, 200)
+        self.assertEqual(res["device_id"], member["device_id"])
+        self.assertEqual(res["token"], "")
+        self.assertEqual(self.grants, [(member["device_id"], "w2",
+                                        owner["device_id"])])
+        self.assertIn("w2", (devices.load_devices()
+                             [member["device_id"]]["allowlist"]))
+
+    def test_label_forwarded_to_minted_device(self):
+        from agents_relay import devices
+
+        owner = self._pair_device()
+        inv = self._invite(owner)
+        self._ha.ws_grant_hook = lambda d, w, b: None
+        st, _, res = self.srv.req(
+            "POST", "/v1/pair/redeem",
+            {"code": inv["code"], "label": "felix-laptop"})
+        self.assertEqual(st, 200)
+        meta = devices.load_devices()[res["device_id"]]
+        self.assertEqual(meta["label"], "felix-laptop")
+
+    def test_ws_quota_separate_from_admin_pairs(self):
+        store = pairing.PairingStore()
+        for _ in range(pairing._MAX_WS_PENDING):
+            store.create_pair(mode="ws", ws="w1")
+        admin = store.create_pair(mode="remote")
+        st, entry = store.redeem_pair(admin["token"], client_ip="10.9.9.9")
+        self.assertEqual(st, "ok")
+        # and the ws cap actually bites on the next ws invite
+        st_ws, entry_ws = store.redeem_pair(
+            store.create_pair(mode="ws", ws="w1")["token"],
+            client_ip="10.9.9.9")
+        self.assertEqual(st_ws, "ok")  # oldest ws evicted, not admin

@@ -17,6 +17,8 @@ log = logging.getLogger("agents_relay.events")
 class Subscriber:
     queue: queue.Queue[dict[str, Any] | None]
     workspace: str = ""
+    tag: str = ""
+    include_global: bool = False
 
 
 class EventBus:
@@ -31,14 +33,41 @@ class EventBus:
         with self._lock:
             self._closed = False
 
-    def subscribe(self, workspace: str = "") -> Subscriber:
-        sub = Subscriber(queue=queue.Queue(maxsize=self._max_queue), workspace=workspace.strip())
+    def subscribe(self, workspace: str = "", *, tag: str = "",
+                  include_global: bool = False) -> Subscriber:
+        sub = Subscriber(
+            queue=queue.Queue(maxsize=self._max_queue),
+            workspace=workspace.strip(), tag=tag.strip(),
+            include_global=include_global)
         with self._lock:
             if self._closed:
                 sub.queue.put_nowait(None)
                 return sub
             self._subs.append(sub)
         return sub
+
+    def disconnect_tag(self, tag: str) -> int:
+        """Poison every subscription carrying ``tag`` — a revoked
+        device's streams die immediately (agents-relay#42)."""
+        victims: list[Subscriber] = []
+        with self._lock:
+            kept: list[Subscriber] = []
+            for sub in self._subs:
+                (victims if sub.tag and sub.tag == tag else kept).append(sub)
+            self._subs = kept
+        for sub in victims:
+            try:
+                sub.queue.put_nowait(None)
+            except queue.Full:
+                try:
+                    sub.queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    sub.queue.put_nowait(None)
+                except queue.Full:
+                    pass
+        return len(victims)
 
     def unsubscribe(self, sub: Subscriber) -> None:
         with self._lock:
@@ -68,7 +97,10 @@ class EventBus:
                 return evt
             subs = list(self._subs)
         for sub in subs:
-            if sub.workspace and ws_clean and sub.workspace != ws_clean:
+            # Workspace-scoped subscribers see only their ws — global
+            # (workspace="") events never leak across without opt-in.
+            if sub.workspace and sub.workspace != ws_clean and not (
+                    not ws_clean and sub.include_global):
                 continue
             try:
                 sub.queue.put_nowait(evt)
@@ -111,12 +143,18 @@ class EventBus:
 _BUS = EventBus()
 
 
-def subscribe(workspace: str = "") -> Subscriber:
-    return _BUS.subscribe(workspace=workspace)
+def subscribe(workspace: str = "", *, tag: str = "",
+              include_global: bool = False) -> Subscriber:
+    return _BUS.subscribe(workspace=workspace, tag=tag,
+                          include_global=include_global)
 
 
 def unsubscribe(sub: Subscriber) -> None:
     _BUS.unsubscribe(sub)
+
+
+def disconnect_tag(tag: str) -> int:
+    return _BUS.disconnect_tag(tag)
 
 
 def emit_event(
@@ -147,9 +185,10 @@ def handle_events_sse(
     handler: BaseHTTPRequestHandler,
     *,
     workspace: str = "",
+    tag: str = "",
     heartbeat_sec: float = 25.0,
 ) -> None:
-    sub = subscribe(workspace=workspace)
+    sub = subscribe(workspace=workspace, tag=tag)
     try:
         handler.send_response(200)
         handler.send_header("Content-Type", "text/event-stream; charset=utf-8")

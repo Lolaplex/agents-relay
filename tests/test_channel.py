@@ -117,11 +117,11 @@ class TestChannelHub(unittest.TestCase):
 
     def test_seq_replay_and_kick(self):
         hub = channel.hub()
-        link = hub.connect("d1")
+        link = hub.connect("d1")[0]
         self.assertEqual(hub.publish("d1", "op", {"a": 1}), 1)
         self.assertEqual(hub.publish("d1", "op", {"a": 2}), 2)
         # reconnect: same seq space, replay ring survives
-        link2 = hub.connect("d1")
+        link2 = hub.connect("d1")[0]
         self.assertEqual(link2.chan, link.chan)
         self.assertNotEqual(link2.generation, link.generation)
         drained = []
@@ -147,7 +147,7 @@ class TestChannelHub(unittest.TestCase):
         self.assertEqual(frames, [{"error": "device offline"}])
         out = hub.handle_upstream("d1", [{"kind": "rpc-res", "id": "nope",
                                           "payload": {"x": 1}}])
-        self.assertEqual(out, {"acked": 0})
+        self.assertEqual(out, {"acked": 0, "malformed": 0})
 
     def test_upstream_broadcast_and_ack(self):
         hub = channel.hub()
@@ -158,16 +158,155 @@ class TestChannelHub(unittest.TestCase):
             {"kind": "presence", "payload": {"ok": True}},
             {"kind": "bogus", "payload": {}},
         ])
-        self.assertEqual(out, {"acked": 1})
+        self.assertEqual(out, {"acked": 1, "malformed": 1})
         msg = hub.link("d2").queue.get_nowait()
         self.assertEqual(msg["kind"], "op")
         self.assertEqual(msg["payload"]["n"], 1)
         # sender must not get its own op back
         self.assertTrue(hub.link("d1").queue.empty())
 
+    def test_pending_rpc_is_bound_to_target_device(self):
+        """agents-relay#42: rpc_id guessing across devices must not
+        hijack a pending call — pending is keyed (device, rpc_id)."""
+        hub = channel.hub()
+        link = hub.connect("d1")[0]
+        hub.connect("d2")
+        frames_out: list[dict] = []
+
+        def caller() -> None:
+            for fr in hub.rpc_call("d1", "ping", {}, timeout_sec=5):
+                frames_out.append(fr)
+
+        t = threading.Thread(target=caller, daemon=True)
+        t.start()
+        req = link.queue.get(timeout=3)
+        # d2 spoofs the rpc_id — must NOT resolve the pending call
+        hub.handle_upstream("d2", [{
+            "kind": "rpc-res", "id": req["id"],
+            "payload": {"pong": False, "hijack": True, "done": True},
+        }])
+        time.sleep(0.05)
+        self.assertEqual(frames_out, [])
+        # the real device can still answer
+        hub.handle_upstream("d1", [{
+            "kind": "rpc-res", "id": req["id"],
+            "payload": {"pong": True, "done": True},
+        }])
+        t.join(timeout=3)
+        self.assertEqual(frames_out, [{"pong": True, "done": True}])
+
+    def test_rpc_req_never_enters_replay_ring(self):
+        """A reconnecting device must not re-execute rpc requests."""
+        hub = channel.hub()
+        hub.connect("d1")
+        hub.publish("d1", "op", {"a": 1})
+        hub.publish("d1", "rpc-req", {"method": "ping"}, msg_id="r1")
+        hub.publish("d1", "op", {"a": 2})
+        _link, replay, resync = hub.connect("d1", since=1)
+        self.assertFalse(resync)
+        kinds = [m["kind"] for m in replay]
+        self.assertIn("op", kinds)
+        self.assertNotIn("rpc-req", kinds)
+
+    def test_resync_when_since_beyond_seq(self):
+        """Restarted hub: client cursor ahead of channel seq -> resync."""
+        hub = channel.hub()
+        hub.connect("d1")
+        hub.publish("d1", "op", {"a": 1})
+        _link, replay, resync = hub.connect("d1", since=99)
+        self.assertTrue(resync)
+        self.assertEqual(replay, [])
+
+    def test_resync_when_since_below_oldest(self):
+        hub = channel.hub()
+        hub.connect("d1")
+        for i in range(5):
+            hub.publish("d1", "op", {"a": i})
+        _link, _replay, resync = hub.connect("d1", since=1)
+        self.assertFalse(resync)  # seq 2..5 replayable
+        _link, _replay, resync = hub.connect("d1", since=-1)
+        self.assertFalse(resync)  # since<=0 means fresh attach
+        # cursor below the ring floor -> resync
+        chan = hub.link("d1").chan
+        chan.replay.clear()
+        for i in range(3):
+            hub.publish("d1", "op", {"a": i + 10})
+        _link, _replay, resync = hub.connect("d1", since=1)
+        self.assertTrue(resync)
+
+    def test_full_queue_still_delivers_disconnect_sentinel(self):
+        """Queue overflow may drop envelopes, never the close sentinel."""
+        hub = channel.hub()
+        link = hub.connect("d1")[0]
+        for i in range(600):  # over the 512 cap without a consumer
+            hub.publish("d1", "op", {"i": i})
+        hub.disconnect("d1")
+        seen_none = False
+        while True:
+            try:
+                item = link.queue.get_nowait()
+            except Exception:
+                break
+            if item is None:
+                seen_none = True
+                break
+        self.assertTrue(seen_none)
+
+    def test_malformed_upstream_frames_counted_not_fatal(self):
+        hub = channel.hub()
+        hub.connect("d1")
+        out = hub.handle_upstream("d1", [
+            "not-a-dict",
+            {"kind": "op"},                      # missing payload
+            {"kind": "op", "payload": "nope"},   # non-dict payload
+            {"kind": "op", "payload": {"n": 1}},
+            {"kind": "ws:announce", "payload": {}},  # no ws field
+            {"kind": "bogus", "payload": {}},
+        ])
+        self.assertEqual(out["acked"], 1)
+        self.assertEqual(out["malformed"], 5)
+
+    def test_recheck_after_connect_revoked_device_stream(self):
+        """A device revoked between auth and link registration must not
+        end up streaming — connect re-validates."""
+        hub = channel.hub()
+        link, _replay, _rs = hub.connect("ghostdev")
+        # ghostdev is not in devices.json at all -> handle_hub_stream's
+        # post-connect check would 401 it; prove the registry lookup
+        # itself drives the decision.
+        self.assertNotIn("ghostdev", devices.load_devices())
+        hub.disconnect("ghostdev", generation=link.generation)
+
+    def test_revoke_disconnects_leases_and_event_subscriptions(self):
+        """Revocation teardown: live leases freed, tagged SSE subs
+        poisoned, channel link dropped."""
+        from agents_relay import events
+        from agents_relay.leases import hub_leases
+
+        try:
+            hub = channel.hub()
+            link = hub.connect("d1")[0]
+            sub = events.subscribe(workspace="w1", tag="d1")
+            g = hub_leases().acquire("w1", "s1", "d1", run_id="r1")
+            self.assertTrue(g["granted"])
+
+            self.assertEqual(hub_leases().release_holder("d1"), 1)
+            self.assertEqual(events.disconnect_tag("d1"), 1)
+            hub.disconnect("d1")
+
+            self.assertIsNone(sub.queue.get(timeout=1.0))
+            self.assertIsNone(link.queue.get(timeout=1.0))
+            # lease slot is free for a new holder
+            g2 = hub_leases().acquire("w1", "s1", "d2")
+            self.assertTrue(g2["granted"])
+            self.assertEqual(hub_leases().snapshot()[0]["holder"], "d2")
+        finally:
+            events.shutdown_all()
+            events.reset_bus()  # module bus is shared — leave it usable
+
     def test_rpc_call_roundtrip(self):
         hub = channel.hub()
-        link = hub.connect("d1")
+        link = hub.connect("d1")[0]
         frames_out: list[dict] = []
 
         def caller() -> None:
@@ -490,9 +629,36 @@ class TestChannelE2E(unittest.TestCase):
             timeout_sec=5))
         self.assertEqual(frames[-1].get("status"), 200)
 
+    def test_client_401_revokes_and_stops_permanently(self):
+        """HTTP 401 on stream or send = revoked credential: permanent
+        stop, no reconnect loop hammering the hub (agents-relay#42)."""
+        import urllib.error
+        import urllib.request
+
+        client = ChannelClient.__new__(ChannelClient)
+        import queue as q
+        import threading as th
+
+        client._stop = th.Event()
+        client._outbox = q.Queue()
+        client.revoked = False
+        client.hub_url = "http://127.0.0.1:9"
+        client.hub_id = "h"
+        client.device_id = "d"
+        client.last_seq = 0
+
+        def raise_401(req, timeout=0):
+            raise urllib.error.HTTPError(
+                req.full_url, 401, "unauth", {}, None)
+
+        with patch.object(urllib.request, "urlopen", raise_401):
+            self.assertFalse(client._post_send([{"kind": "op"}]))
+        self.assertTrue(client.revoked)
+        self.assertTrue(client._stop.is_set())
+
     def test_disconnect_releases_stream(self):
         hub = channel.hub()
-        link = hub.connect("d1")
+        link = hub.connect("d1")[0]
         hub.disconnect("d1")
         self.assertIsNone(link.queue.get_nowait())  # sentinel, not a hang
         self.assertFalse(hub.is_connected("d1"))

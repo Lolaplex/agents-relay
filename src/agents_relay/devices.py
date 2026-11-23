@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 import secrets
+import threading
 import time
 from pathlib import Path
 
@@ -40,28 +41,42 @@ def _write_secret(device_id: str, value: str) -> None:
     write_secret(_secret_key(device_id), value, scope="host")
 
 
+_LOCK = threading.Lock()
+_cache: dict = {"mtime_ns": -1, "rows": {}}
+
+
 def load_devices() -> dict:
+    """devices.json rows — mtime-cached so per-request auth does not
+    re-read the registry from disk (agents-relay#42)."""
+    try:
+        mtime = _path().stat().st_mtime_ns
+    except OSError:
+        mtime = -1
+    if mtime == _cache["mtime_ns"]:
+        return {k: dict(v) for k, v in _cache["rows"].items()}
     data = read_json(_path()) or {}
     rows = data.get("devices")
-    if not isinstance(rows, dict):
-        return {}
     out: dict = {}
-    for did, meta in rows.items():
-        if not isinstance(meta, dict):
-            continue
-        out[did] = {
-            "label": str(meta.get("label") or ""),
-            "host_id": str(meta.get("host_id") or ""),
-            "role": str(meta.get("role") or "host"),
-            "created_at": meta.get("created_at") or 0,
-            "last_seen": meta.get("last_seen") or 0,
-            "allowlist": list(meta.get("allowlist") or []),
-        }
-    return out
+    if isinstance(rows, dict):
+        for did, meta in rows.items():
+            if not isinstance(meta, dict):
+                continue
+            out[did] = {
+                "label": str(meta.get("label") or ""),
+                "host_id": str(meta.get("host_id") or ""),
+                "role": str(meta.get("role") or "host"),
+                "created_at": meta.get("created_at") or 0,
+                "last_seen": meta.get("last_seen") or 0,
+                "allowlist": list(meta.get("allowlist") or []),
+            }
+    _cache["mtime_ns"] = mtime
+    _cache["rows"] = out
+    return {k: dict(v) for k, v in out.items()}
 
 
 def _store(rows: dict) -> None:
     write_json_atomic(_path(), {"devices": rows})
+    _cache["mtime_ns"] = -1  # invalidate
 
 
 def mint_device(device_id: str = "", *, label: str = "", host_id: str = "",
@@ -83,19 +98,20 @@ def mint_device(device_id: str = "", *, label: str = "", host_id: str = "",
         raise ValueError(f"invalid device role: {role!r}")
     if role == "ws_member" and not (allowlist or []):
         raise ValueError("ws_member devices need a non-empty allowlist")
-    rows = load_devices()
-    prev = rows.get(did) or {}
-    token = secrets.token_urlsafe(24)
-    _write_secret(did, token)
-    rows[did] = {
+    with _LOCK:
+        rows = load_devices()
+        prev = rows.get(did) or {}
+        token = secrets.token_urlsafe(24)
+        _write_secret(did, token)
+        rows[did] = {
         "label": label or prev.get("label") or did,
         "host_id": host_id or prev.get("host_id") or "",
         "role": role or prev.get("role") or "host",
         "created_at": prev.get("created_at") or int(time.time()),
         "last_seen": 0,
-        "allowlist": allowlist if allowlist is not None else prev.get("allowlist", []),
-    }
-    _store(rows)
+            "allowlist": allowlist if allowlist is not None else prev.get("allowlist", []),
+        }
+        _store(rows)
     return {"device_id": did, "device_token": token,
             "label": rows[did]["label"], "role": rows[did]["role"],
             "created_at": rows[did]["created_at"]}
@@ -126,19 +142,40 @@ def device_id_for_token(token: str) -> str:
     return ""
 
 
+def add_allowlist(device_id: str, ws_id: str) -> bool:
+    """Extend a device's ws allowlist — an already-paired device
+    redeeming another ws invite gains the grant without re-pairing
+    (agents-relay#42)."""
+    ws = (ws_id or "").strip()
+    if not ws:
+        return False
+    with _LOCK:
+        rows = load_devices()
+        if device_id not in rows:
+            return False
+        al = list(rows[device_id].get("allowlist") or [])
+        if ws not in al:
+            al.append(ws)
+            rows[device_id]["allowlist"] = al
+            _store(rows)
+    return True
+
+
 def touch_device(device_id: str) -> None:
-    rows = load_devices()
-    if device_id in rows:
-        rows[device_id]["last_seen"] = int(time.time())
-        _store(rows)
+    with _LOCK:
+        rows = load_devices()
+        if device_id in rows:
+            rows[device_id]["last_seen"] = int(time.time())
+            _store(rows)
 
 
 def revoke_device(device_id: str) -> bool:
-    rows = load_devices()
-    if device_id not in rows:
-        return False
-    del rows[device_id]
-    _store(rows)
+    with _LOCK:
+        rows = load_devices()
+        if device_id not in rows:
+            return False
+        del rows[device_id]
+        _store(rows)
     try:
         delete_secret(_secret_key(device_id), scope="host")
     except Exception:

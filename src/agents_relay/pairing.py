@@ -16,6 +16,7 @@ _MIN_TTL_SEC = 15
 _MAX_TTL_SEC = 120
 _DEFAULT_TTL_SEC = 60
 _MAX_PENDING = 64
+_MAX_WS_PENDING = 16  # ws invites are rarer than admin pairs — own quota
 _RATE_WINDOW_SEC = 60.0
 _MAX_FAILS_PER_WINDOW = 5
 
@@ -82,6 +83,19 @@ class PairingStore:
             while len(self._entries) >= _MAX_PENDING:
                 oldest = next(iter(self._entries))
                 self._entries.pop(oldest, None)
+            if clean_mode == "ws":
+                # ws invites never displace admin pair codes and are
+                # capped separately — a burst of share links must not
+                # starve operator pairing (agents-relay#42).
+                ws_count = sum(
+                    1 for e in self._entries.values()
+                    if e["mode"] == "ws")
+                while ws_count >= _MAX_WS_PENDING:
+                    oldest = next(
+                        k for k, e in self._entries.items()
+                        if e["mode"] == "ws")
+                    self._entries.pop(oldest, None)
+                    ws_count -= 1
             self._entries[pair_id] = {
                 "token": token,
                 "code": code,
