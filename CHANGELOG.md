@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Hub session run-lock leases (`POST /v1/hub/lease` acquire/renew/release, device-token auth; admin `GET /v1/hub/leases` snapshot): one live run per (ws, session), TTL 45s with ~15s renew, fencing token per grant. Re-acquire by the same (holder, run_id) is idempotent (same fence, TTL extended). The fence high-water mark persists in `<host>/clients/hub_leases.json` (seeded from wall-clock ms when absent) so fences stay monotonic across hub restarts. Malformed or non-positive `fence` on renew/release returns 400.
+
 ### Fixed
 - `POST /v1/pair/create` now mints an absolute `<base>/#pair=<token>` link for BOTH modes (remote previously returned the bare `/v1/pair/redeem` endpoint path — a QR/paste payload that carried no relay address). Base resolution: explicit `AGENTS_RELAY_URL` > `X-Forwarded-Proto`/`X-Forwarded-Host` > request `Host` > auto-bound socket URL; scheme is `http` on loopback/private hosts and `https` elsewhere. Redeem is unchanged — the stored mode decides cookie-vs-token.
 - `POST /v1/model` accepts `workspace` from the query string as well as the JSON body, matching `GET /v1/model`.

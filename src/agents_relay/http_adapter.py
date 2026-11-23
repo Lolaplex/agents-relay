@@ -597,6 +597,7 @@ class TurnHandler(BaseHTTPRequestHandler):
                         "stream": "/v1/hub/stream",
                         "send": "/v1/hub/send",
                         "devices": "/v1/hub/devices",
+                        "lease": "/v1/hub/lease",
                     },
                 },
                 200,
@@ -634,6 +635,50 @@ class TurnHandler(BaseHTTPRequestHandler):
             from .channel import handle_hub_send
 
             self._write_json(handle_hub_send(self, did, body), 200)
+            return
+        if path == "/v1/hub/lease":
+            # Session run-lock lease ops (klanker#136): acquire/renew/release.
+            did = _check_device(self)
+            if not did or did == "__admin__":
+                self.send_error(401, "unauthorized")
+                return
+            body = self._read_json()
+            if body is None:
+                return
+            from .leases import hub_leases
+
+            book = hub_leases()
+            action = str(body.get("action") or "")
+            ws = str(body.get("ws") or "")
+            session = str(body.get("session") or "")
+            if not ws or not session:
+                self.send_error(400, "ws and session required")
+                return
+            fence = 0
+            if action in ("renew", "release"):
+                raw_fence = body.get("fence")
+                if isinstance(raw_fence, bool) or not isinstance(raw_fence, (int, str)):
+                    self.send_error(400, "fence must be an integer")
+                    return
+                try:
+                    fence = int(raw_fence)
+                except ValueError:
+                    self.send_error(400, "fence must be an integer")
+                    return
+                if fence <= 0:
+                    self.send_error(400, "fence must be positive")
+                    return
+            if action == "acquire":
+                out = book.acquire(ws, session, did,
+                                   str(body.get("run_id") or ""))
+            elif action == "renew":
+                out = book.renew(ws, session, did, fence)
+            elif action == "release":
+                out = book.release(ws, session, did, fence)
+            else:
+                self.send_error(400, f"unknown lease action: {action!r}")
+                return
+            self._write_json(out, 200)
             return
 
         if path == "/v1/workspaces":
@@ -1963,6 +2008,16 @@ class TurnHandler(BaseHTTPRequestHandler):
                 for row in list_public()
             ]
             self._write_json({"ok": True, "devices": rows}, 200)
+            return
+        if path == "/v1/hub/leases":
+            if not _check_secret(self, self.relay_secret, query_params,
+                                 allow_device=False):
+                self.send_error(401, "unauthorized")
+                return
+            from .leases import hub_leases
+
+            self._write_json(
+                {"ok": True, "leases": hub_leases().snapshot()}, 200)
             return
         if path == "/v1/discover":
             if not _check_secret(self, self.relay_secret, query_params,

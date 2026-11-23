@@ -7,6 +7,8 @@ import tempfile
 import threading
 import time
 import unittest
+
+from agents_relay.leases import reset_leases
 from http.client import HTTPConnection
 from pathlib import Path
 from unittest.mock import patch
@@ -111,6 +113,7 @@ class TestDevices(unittest.TestCase):
 class TestChannelHub(unittest.TestCase):
     def setUp(self) -> None:
         channel.reset_hub()
+        reset_leases()
 
     def test_seq_replay_and_kick(self):
         hub = channel.hub()
@@ -188,6 +191,7 @@ class TestChannelWire(unittest.TestCase):
 
     def setUp(self) -> None:
         channel.reset_hub()
+        reset_leases()
         self.td = tempfile.TemporaryDirectory()
         host_dir = Path(self.td.name)
         (host_dir / "workspaces" / "default").mkdir(parents=True)
@@ -200,6 +204,7 @@ class TestChannelWire(unittest.TestCase):
         self.env.stop()
         self.td.cleanup()
         channel.reset_hub()
+        reset_leases()
 
     def _redeem_device(self) -> dict:
         st, created = self.srv.req(
@@ -295,12 +300,74 @@ class TestChannelWire(unittest.TestCase):
         self.assertEqual(st, 200)
         self.assertTrue(body["ok"])
 
+    def test_lease_acquire_contend_release(self):
+        res_a = self._redeem_device()
+        res_b = self._redeem_device()
+        auth_a = {"Authorization": f"Bearer {res_a['token']}"}
+        auth_b = {"Authorization": f"Bearer {res_b['token']}"}
+        st, g = self.srv.req(
+            "POST", "/v1/hub/lease",
+            {"action": "acquire", "ws": "w1", "session": "s1", "run_id": "r1"},
+            headers=auth_a)
+        self.assertEqual(st, 200)
+        self.assertTrue(g["granted"])
+        fence = g["fence"]
+        # second device contends -> denied, holder named
+        st, d = self.srv.req(
+            "POST", "/v1/hub/lease",
+            {"action": "acquire", "ws": "w1", "session": "s1", "run_id": "r2"},
+            headers=auth_b)
+        self.assertEqual(st, 200)
+        self.assertFalse(d["granted"])
+        # holder renews
+        st, r = self.srv.req(
+            "POST", "/v1/hub/lease",
+            {"action": "renew", "ws": "w1", "session": "s1", "fence": fence},
+            headers=auth_a)
+        self.assertTrue(r["granted"])
+        # admin snapshot names the holder; device token denied
+        st, snap = self.srv.req(
+            "GET", "/v1/hub/leases",
+            headers={"Authorization": "Bearer expected"})
+        self.assertEqual(st, 200)
+        self.assertEqual(snap["leases"][0]["session"], "s1")
+        st, _ = self.srv.req("GET", "/v1/hub/leases", headers=auth_b)
+        self.assertEqual(st, 401)
+        # release frees the slot for the contender
+        self.srv.req(
+            "POST", "/v1/hub/lease",
+            {"action": "release", "ws": "w1", "session": "s1", "fence": fence},
+            headers=auth_a)
+        st, g2 = self.srv.req(
+            "POST", "/v1/hub/lease",
+            {"action": "acquire", "ws": "w1", "session": "s1"},
+            headers=auth_b)
+        self.assertTrue(g2["granted"])
+
+    def test_lease_bad_fence_is_400(self):
+        res_a = self._redeem_device()
+        auth_a = {"Authorization": f"Bearer {res_a['token']}"}
+        for bad in ("abc", None, 1.5, True, 0, -3, [1]):
+            st, _ = self.srv.req(
+                "POST", "/v1/hub/lease",
+                {"action": "renew", "ws": "w", "session": "s", "fence": bad},
+                headers=auth_a)
+            self.assertEqual(st, 400, bad)
+
+    def test_lease_requires_device_token(self):
+        st, _ = self.srv.req(
+            "POST", "/v1/hub/lease",
+            {"action": "acquire", "ws": "w", "session": "s"},
+            headers={"Authorization": "Bearer expected"})
+        self.assertEqual(st, 401)
+
 
 class TestChannelE2E(unittest.TestCase):
     """Full path: pair -> ChannelClient stream -> hub rpc_call over the wire."""
 
     def setUp(self) -> None:
         channel.reset_hub()
+        reset_leases()
         self.td = tempfile.TemporaryDirectory()
         host_dir = Path(self.td.name)
         (host_dir / "workspaces" / "default").mkdir(parents=True)
@@ -316,6 +383,7 @@ class TestChannelE2E(unittest.TestCase):
         self.env.stop()
         self.td.cleanup()
         channel.reset_hub()
+        reset_leases()
 
     def _connect_client(self) -> str:
         st, created = self.srv.req(
@@ -454,6 +522,7 @@ class TestChannelE2E(unittest.TestCase):
 class TestRemotesChannel(unittest.TestCase):
     def setUp(self) -> None:
         channel.reset_hub()
+        reset_leases()
         self.td = tempfile.TemporaryDirectory()
         host_dir = Path(self.td.name)
         (host_dir / "workspaces" / "default").mkdir(parents=True)
@@ -466,6 +535,7 @@ class TestRemotesChannel(unittest.TestCase):
         self.env.stop()
         self.td.cleanup()
         channel.reset_hub()
+        reset_leases()
 
     def test_upsert_channel_remote_and_offline_proxy(self):
         from agents_relay.remotes import upsert_remote
