@@ -11,7 +11,7 @@ from typing import Any, Callable
 # Excludes visually ambiguous 0/O/1/I characters for manual mobile code entry.
 _CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
 _CODE_LEN = 8
-_MODES = frozenset({"web", "remote"})
+_MODES = frozenset({"web", "remote", "ws"})
 _MIN_TTL_SEC = 15
 _MAX_TTL_SEC = 120
 _DEFAULT_TTL_SEC = 60
@@ -57,10 +57,13 @@ class PairingStore:
         ttl_sec: int = _DEFAULT_TTL_SEC,
         host_id: str = "",
         base_url: str = "",
+        ws: str = "",
+        granted_by: str = "",
     ) -> dict[str, Any]:
         clean_mode = (mode or "web").strip().lower()
         if clean_mode not in _MODES:
-            raise ValueError(f"mode must be 'web' or 'remote', got {mode!r}")
+            raise ValueError(
+                f"mode must be 'web', 'remote' or 'ws', got {mode!r}")
         try:
             ttl = int(ttl_sec)
         except (TypeError, ValueError):
@@ -85,6 +88,8 @@ class PairingStore:
                 "code_norm": code_norm,
                 "mode": clean_mode,
                 "host_id": host_id,
+                "ws": ws,
+                "granted_by": granted_by,
                 "expires_mono": now_mono + ttl,
             }
 
@@ -101,6 +106,8 @@ class PairingStore:
             "expires_in": ttl,
             "expires_at": now_wall + ttl,
             "host_id": host_id,
+            "ws": ws,
+            "granted_by": granted_by,
         }
 
     def redeem_pair(
@@ -139,6 +146,8 @@ class PairingStore:
                 return "ok", {
                     "mode": consumed["mode"],
                     "host_id": consumed["host_id"],
+                    "ws": consumed.get("ws") or "",
+                    "granted_by": consumed.get("granted_by") or "",
                 }
 
             self._fails.setdefault(ip, []).append(now_mono)
@@ -159,8 +168,12 @@ def create_pair(
     ttl_sec: int = _DEFAULT_TTL_SEC,
     host_id: str = "",
     base_url: str = "",
+    ws: str = "",
+    granted_by: str = "",
 ) -> dict[str, Any]:
-    return _STORE.create_pair(mode=mode, ttl_sec=ttl_sec, host_id=host_id, base_url=base_url)
+    return _STORE.create_pair(
+        mode=mode, ttl_sec=ttl_sec, host_id=host_id, base_url=base_url,
+        ws=ws, granted_by=granted_by)
 
 
 def redeem_pair(credential: str, *, client_ip: str = "") -> tuple[str, dict[str, Any] | None]:

@@ -295,6 +295,13 @@ def _emit_relay_event(kind: str, payload: dict[str, Any] | None = None, *, works
         pass
 
 
+# ws-share hooks (klanker#145): the host app (klanker serve) wires these
+# at boot. ws_invite_auth gates invite minting (owner check);
+# ws_grant_hook applies the membership grant on ws-mode redeem.
+ws_invite_auth = None   # fn(device_id, ws_id) -> bool
+ws_grant_hook = None    # fn(device_id, ws_id, granted_by) -> None
+
+
 class TurnHandler(BaseHTTPRequestHandler):
     relay_secret: str = ""
     config: RelayConfig | None = None
@@ -539,6 +546,35 @@ class TurnHandler(BaseHTTPRequestHandler):
             self._write_json({"ok": True, **res}, 200)
             return
 
+        if path == "/v1/ws/invite":
+            # ws-share invite mint (klanker#145): a paired device asks the
+            # hub for a single-use code that redeems as device pair AND
+            # ws member grant. The host app's ws_invite_auth decides
+            # ownership — never grant without it.
+            device_id = _check_device(self)
+            if not device_id:
+                self.send_error(401, "unauthorized")
+                return
+            body = self._read_json()
+            if body is None:
+                return
+            ws_id = str(body.get("ws") or "").strip()
+            if not ws_id:
+                self.send_error(400, "ws required")
+                return
+            if ws_invite_auth is None or not ws_invite_auth(device_id, ws_id):
+                self.send_error(403, "not the workspace owner")
+                return
+            from .pairing import create_pair
+
+            cfg = self._cfg()
+            res = create_pair(
+                mode="ws", ws=ws_id, granted_by=device_id,
+                ttl_sec=body.get("ttl_sec", 60),
+                base_url=_request_base_url(self, cfg))
+            self._write_json({"ok": True, **res}, 200)
+            return
+
         if path == "/v1/pair/redeem":
             body = self._read_json()
             if body is None:
@@ -573,7 +609,7 @@ class TurnHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(payload)
                 return
-            # mode=remote mints a scoped device credential — the master
+            # mode=remote|ws mints a scoped device credential — the master
             # relay_secret is never handed out by pairing (agents-relay#38/#40).
             try:
                 from .devices import mint_device
@@ -586,11 +622,21 @@ class TurnHandler(BaseHTTPRequestHandler):
                 self._write_json(
                     {"ok": False, "error": f"device mint failed: {exc}"}, 500)
                 return
+            ws_id = str(entry.get("ws") or "")
+            if entry["mode"] == "ws" and ws_id and ws_grant_hook is not None:
+                try:
+                    ws_grant_hook(
+                        dev["device_id"], ws_id,
+                        str(entry.get("granted_by") or ""))
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("ws grant hook failed: %s", exc)
             self._write_json(
                 {
                     "ok": True,
-                    "mode": "remote",
+                    "mode": entry["mode"],
                     "host_id": entry.get("host_id", ""),
+                    "ws": ws_id,
+                    "granted_by": entry.get("granted_by", ""),
                     "device_id": dev["device_id"],
                     "token": dev["device_token"],
                     "hub": {

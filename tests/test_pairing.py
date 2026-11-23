@@ -172,6 +172,65 @@ class TestPairing(unittest.TestCase):
         finally:
             srv.close()
 
+    def test_ws_invite_pairs_and_grants(self):
+        """klanker#145: owner device mints ws-scoped invite; redeem pairs
+        the new device AND fires the ws grant hook."""
+        import agents_relay.http_adapter as ha
+
+        grants = []
+        ha.ws_invite_auth = lambda did, ws: did == "ownerDev" and ws == "w1"
+        ha.ws_grant_hook = lambda did, ws, by: grants.append((did, ws, by))
+        srv = _Srv(_cfg())
+        try:
+            # owner pairs first -> device credential
+            st, _, p = srv.req("POST", "/v1/pair/create",
+                               {"mode": "remote"},
+                               headers={"Authorization": "Bearer expected"})
+            _, _, r = srv.req("POST", "/v1/pair/redeem",
+                              {"token": p["token"]})
+            owner_tok, owner_id = r["token"], r["device_id"]
+            assert owner_id
+
+            # forge the expected owner id via the hook's lambda
+            ha.ws_invite_auth = lambda did, ws: did == owner_id
+            st, _, inv = srv.req(
+                "POST", "/v1/ws/invite", {"ws": "w1"},
+                headers={"Authorization": f"Bearer {owner_tok}",
+                         "X-Device-Id": owner_id})
+            self.assertEqual(st, 200)
+            self.assertEqual(inv["ws"], "w1")
+            self.assertIn("/#pair=", inv["pair_url"])
+
+            # a different paired device is authenticated but not owner
+            st, _, p2 = srv.req("POST", "/v1/pair/create",
+                                {"mode": "remote"},
+                                headers={"Authorization": "Bearer expected"})
+            _, _, r2b = srv.req("POST", "/v1/pair/redeem",
+                                {"token": p2["token"]})
+            st, _, _ = srv.req(
+                "POST", "/v1/ws/invite", {"ws": "w1"},
+                headers={"Authorization": f"Bearer {r2b['token']}",
+                         "X-Device-Id": r2b["device_id"]})
+            self.assertEqual(st, 403)
+            # unauthenticated cannot mint
+            st, _, _ = srv.req("POST", "/v1/ws/invite", {"ws": "w1"})
+            self.assertEqual(st, 401)
+
+            # new device redeems the ws code: device pair + grant
+            st, _, r2 = srv.req("POST", "/v1/pair/redeem",
+                                {"code": inv["code"]})
+            self.assertEqual(st, 200)
+            self.assertEqual(r2["mode"], "ws")
+            self.assertEqual(r2["ws"], "w1")
+            self.assertTrue(r2["device_id"])
+            self.assertTrue(r2["token"])
+            self.assertEqual(
+                grants, [(r2["device_id"], "w1", owner_id)])
+        finally:
+            ha.ws_invite_auth = None
+            ha.ws_grant_hook = None
+            srv.close()
+
     def test_pair_url_base_resolution(self):
         # Proxy headers win over the request Host; a configured relay_url
         # wins over everything; loopback falls back to http.

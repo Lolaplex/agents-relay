@@ -71,7 +71,7 @@ def redeem_device(hub_url: str, credential: str, *, label: str = "") -> dict:
     except urllib.error.HTTPError as e:
         detail = e.read()[:300].decode("utf-8", "replace")
         raise RuntimeError(f"redeem failed: HTTP {e.code} {detail}") from e
-    if not body.get("ok") or body.get("mode") != "remote":
+    if not body.get("ok") or body.get("mode") not in ("remote", "ws"):
         raise RuntimeError(f"redeem refused: {body.get('error') or body}")
     if not body.get("device_id") or not body.get("token"):
         raise RuntimeError("hub returned no device credentials")
@@ -95,7 +95,7 @@ def connect_hub(hub_url: str, credential: str, *, label: str = "") -> dict:
     }
     _store_hubs(rows)
     write_secret(_secret_key(hub_id), res["token"], scope="host")
-    return {"hub_id": hub_id, **rows[hub_id]}
+    return {"hub_id": hub_id, "ws": res.get("ws") or "", **rows[hub_id]}
 
 
 def disconnect_hub(hub_id: str) -> bool:
