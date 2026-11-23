@@ -226,6 +226,25 @@ class TestPairing(unittest.TestCase):
             self.assertTrue(r2["token"])
             self.assertEqual(
                 grants, [(r2["device_id"], "w1", owner_id)])
+
+            # ws redeem mints a ws_member device scoped to the granted ws
+            # (agents-relay#41): the token is a guest credential, not a
+            # second host key.
+            from agents_relay import devices
+
+            meta = devices.load_devices().get(r2["device_id"]) or {}
+            self.assertEqual(meta.get("role"), "ws_member")
+            self.assertEqual(meta.get("allowlist"), ["w1"])
+            guest = {"Authorization": f"Bearer {r2['token']}"}
+            st, _, _ = srv.req("POST", "/v1/providers",
+                               {"name": "x", "cmd": "id"}, headers=guest)
+            self.assertEqual(st, 403)  # ws-member gate denies pre-auth
+            st, _, _ = srv.req("DELETE", "/v1/workspaces/w1?hard=1",
+                               headers=guest)
+            self.assertEqual(st, 403)
+            st, _, _ = srv.req("GET", "/v1/workspaces/w2/inbox",
+                               headers=guest)
+            self.assertEqual(st, 403)
         finally:
             ha.ws_invite_auth = None
             ha.ws_grant_hook = None
