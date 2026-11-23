@@ -403,10 +403,18 @@ def handle_chat_stream(handler: BaseHTTPRequestHandler, body: dict) -> None:
         return
 
     run = str(body.get("run") or "").strip() or uuid.uuid4().hex
-    entry = _new_run_entry()
-    cancel = entry["cancel"]
     with _ACTIVE_LOCK:
-        _ACTIVE[run] = entry
+        existing = _ACTIVE.get(run)
+    if existing is not None:
+        # Same run id re-posted (client retry after a dropped stream):
+        # never start a second turn -- follow the one already running.
+        _send_sse_headers(handler)
+        try:
+            _follow_entry(handler, existing)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            log.info("web stream client disconnected (run %s)", run)
+        return
+    entry = _new_run_entry()
 
     ws_ref = str(body.get("workspace") or "").strip()
     persona_ref = str(body.get("persona") or "").strip()
@@ -450,6 +458,10 @@ def handle_chat_stream(handler: BaseHTTPRequestHandler, body: dict) -> None:
             )
             return
 
+    if attachment_notes:
+        entry["pending_notes"] = [
+            {"type": "delta", "text": "\n\n".join(attachment_notes) + "\n\n"}
+        ]
     entry["meta"] = {
         "session": str(body.get("session") or "").strip(),
         "workspace": ws_ref,
@@ -471,6 +483,24 @@ def handle_chat_stream(handler: BaseHTTPRequestHandler, body: dict) -> None:
         attachments=attach_paths,
     )
 
+    # The turn runs in its own thread and publishes into the run entry;
+    # this request only follows the entry (like /v1/runs/stream). A
+    # dropped client socket (mobile background, network switch) detaches
+    # the reader only -- the turn keeps running, stays listed in _ACTIVE
+    # until its process ends, and can be re-attached. Only
+    # POST /v1/chat/stop cancels.
+    with _ACTIVE_LOCK:
+        _ACTIVE[run] = entry  # registered only once the turn really starts
+    _start_run_driver(run, entry, params, config)
+    _send_sse_headers(handler)
+
+    try:
+        _follow_entry(handler, entry)
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        log.info("web stream client disconnected (run %s); turn continues", run)
+
+
+def _send_sse_headers(handler: BaseHTTPRequestHandler) -> None:
     handler.send_response(200)
     handler.send_header("Content-Type", "text/event-stream")
     handler.send_header("Cache-Control", "no-cache, no-transform")
@@ -478,59 +508,110 @@ def handle_chat_stream(handler: BaseHTTPRequestHandler, body: dict) -> None:
     handler.send_header("Connection", "close")
     handler.end_headers()
 
+
+def _event_payload(entry: dict[str, Any], event: Any) -> dict[str, Any] | None:
+    """Map one loop StreamEvent to the SSE payload (None = drop)."""
+    if event.type == "keepalive":
+        return None
+    if event.type == "status":
+        line = _status_text(event.text)
+        return {"type": "status", "text": line} if line else None
+    if event.type == "delta":
+        return {"type": "delta", "text": event.text}
+    if event.type == "trailer":
+        if event.session:
+            entry["meta"]["session"] = event.session
+        return {
+            "type": "trailer",
+            "session": event.session,
+            "user_id": event.user_id,
+            "alias": event.alias,
+            "returncode": event.returncode,
+        }
+    return {"type": "error", "text": event.text or "turn failed"}
+
+
+def _drive_run(run: str, entry: dict[str, Any], params: Any, config: Any) -> None:
+    """Run one turn to completion, publishing every event into ``entry``.
+
+    Independent of any HTTP reader: the loop generator is consumed here,
+    so a client disconnect can never close it (closing it would kill the
+    turn's process tree in its ``finally``).
+    """
     try:
         _publish(entry, {"type": "start", "run": run})
-        handler.wfile.write(_sse({"type": "start", "run": run}))
-        handler.wfile.flush()
-        if attachment_notes:
-            note_payload = {"type": "delta", "text": "\n\n".join(attachment_notes) + "\n\n"}
-            _publish(entry, note_payload)
-            handler.wfile.write(_sse(note_payload))
-            handler.wfile.flush()
-        for event in iter_loop_stream_live(params, config, cancel=cancel):
-            if event.type == "keepalive":
-                handler.wfile.write(b": ping\n\n")
-                handler.wfile.flush()
-                continue
-            if event.type == "status":
-                line = _status_text(event.text)
-                if not line:
-                    continue
-                payload: dict[str, Any] = {"type": "status", "text": line}
-            elif event.type == "delta":
-                payload = {"type": "delta", "text": event.text}
-            elif event.type == "trailer":
-                if event.session:
-                    entry["meta"]["session"] = event.session
-                payload = {
-                    "type": "trailer",
-                    "session": event.session,
-                    "user_id": event.user_id,
-                    "alias": event.alias,
-                    "returncode": event.returncode,
-                }
-            else:
-                payload = {"type": "error", "text": event.text or "turn failed"}
-            _publish(entry, payload)
-            handler.wfile.write(_sse(payload))
-            handler.wfile.flush()
-    except (BrokenPipeError, ConnectionResetError):
-        # A dropped TCP socket detaches the SSE writer only; the
-        # server-side turn keeps running. Only POST /v1/chat/stop cancels.
-        log.info("web stream client disconnected (run %s)", run)
-    except Exception as exc:
-        log.exception("web stream failed")
-        try:
-            handler.wfile.write(_sse({"type": "error", "text": str(exc)}))
-            handler.wfile.flush()
-        except Exception:
-            pass
+        for note in entry.pop("pending_notes", []) or []:
+            _publish(entry, note)
+        for event in iter_loop_stream_live(params, config, cancel=entry["cancel"]):
+            payload = _event_payload(entry, event)
+            if payload is not None:
+                _publish(entry, payload)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("web turn failed (run %s)", run)
+        _publish(entry, {"type": "error", "text": str(exc) or exc.__class__.__name__})
     finally:
         with entry["cond"]:
             entry["done"] = True
+            entry["done_at"] = time.monotonic()
             entry["cond"].notify_all()
+        _schedule_reap(run, entry)
+
+
+def _start_run_driver(run: str, entry: dict[str, Any], params: Any, config: Any) -> threading.Thread:
+    t = threading.Thread(
+        target=_drive_run, args=(run, entry, params, config),
+        name=f"web-turn-{run[:8]}", daemon=True,
+    )
+    entry["thread"] = t
+    t.start()
+    return t
+
+
+# A finished run stays attachable this long so a client that lost its
+# stream right before the end can still fetch the tail + trailer.
+_DONE_GRACE_SEC = 120.0
+
+
+def _schedule_reap(run: str, entry: dict[str, Any]) -> None:
+    def _reap() -> None:
         with _ACTIVE_LOCK:
-            _ACTIVE.pop(run, None)
+            if _ACTIVE.get(run) is entry:
+                _ACTIVE.pop(run, None)
+
+    if _DONE_GRACE_SEC <= 0:
+        _reap()
+        return
+    timer = threading.Timer(_DONE_GRACE_SEC, _reap)
+    timer.daemon = True
+    timer.start()
+
+
+def _follow_entry(handler: BaseHTTPRequestHandler, entry: dict[str, Any], index: int = 0) -> None:
+    """Write every published payload of ``entry`` to the client until done."""
+    cond = entry["cond"]
+    while True:
+        ping = False
+        with cond:
+            pending = entry["events"][index:]
+            index = len(entry["events"])
+            if not pending and not entry["done"]:
+                cond.wait(timeout=_KEEPALIVE_WAIT_SEC)
+                pending = entry["events"][index:]
+                index = len(entry["events"])
+                ping = not pending and not entry["done"]
+            finished = entry["done"] and index >= len(entry["events"])
+        if ping:
+            handler.wfile.write(b": ping\n\n")
+            handler.wfile.flush()
+            continue
+        for payload in pending:
+            handler.wfile.write(_sse(payload))
+            handler.wfile.flush()
+        if finished:
+            break
+
+
+_KEEPALIVE_WAIT_SEC = 12.0
 
 
 def handle_chat_stop(handler: BaseHTTPRequestHandler, body: dict) -> None:
@@ -546,5 +627,7 @@ def handle_chat_stop(handler: BaseHTTPRequestHandler, body: dict) -> None:
 
 
 def active_runs() -> list[str]:
+    """Runs whose turn is still executing (finished runs linger only for
+    re-attach and are not listed)."""
     with _ACTIVE_LOCK:
-        return sorted(_ACTIVE)
+        return sorted(k for k, e in _ACTIVE.items() if not e.get("done"))

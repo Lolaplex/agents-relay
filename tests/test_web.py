@@ -581,12 +581,22 @@ class TestTcpDropAndAuthStatus(unittest.TestCase):
             def end_headers(self):
                 pass
 
+        with web_mod._ACTIVE_LOCK:
+            web_mod._ACTIVE.pop("r1", None)
         with patch.object(web_mod, "iter_loop_stream_live", fake_stream), \
                 patch.object(web_mod, "_new_run_entry", spy_new_run_entry):
             web_mod.handle_chat_stream(FakeHandler(), {"text": "hi", "run": "r1"})
+            with web_mod._ACTIVE_LOCK:
+                entry = web_mod._ACTIVE.get("r1")
+            self.assertIsNotNone(entry)
+            entry["thread"].join(5)
         self.assertIn("cancel", captured)
         self.assertFalse(captured["cancel"].is_set())
         self.assertEqual(active_runs(), [])
+        types = [e["type"] for e in entry["events"]]
+        self.assertEqual(types, ["start", "delta"])
+        with web_mod._ACTIVE_LOCK:
+            web_mod._ACTIVE.pop("r1", None)
 
     def _status(self, headers: dict) -> dict:
         srv = _Server(_cfg())
@@ -635,3 +645,157 @@ class TestApprovalPushPayload(unittest.TestCase):
         self.assertEqual(payload["summary"], "rm -rf /tmp/x")
         self.assertEqual(payload["type"], "approval")
         self.assertEqual(sent["ws_ref"], "demo")
+
+
+class TestTurnSurvivesClientDrop(unittest.TestCase):
+    """A real subprocess turn must outlive the HTTP reader (mobile
+    background / network switch) and stay attachable until it ends."""
+
+    def _patches(self, script: str):
+        import contextlib
+        import subprocess
+
+        from agents_relay import turn as turn_mod
+
+        procs: list = []
+
+        def spawn(argv, env=None, workspace="", workdir="", extra=None):
+            p = subprocess.Popen(["bash", "-c", script],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            procs.append(p)
+            return p, None
+
+        @contextlib.contextmanager
+        def approvals(*a, **k):
+            yield {}
+
+        stack = contextlib.ExitStack()
+        stack.enter_context(patch.object(turn_mod, "prepare_loop", lambda p, c: (p, [], {})))
+        stack.enter_context(patch.object(turn_mod, "build_loop_argv", lambda p, c: ["x"]))
+        stack.enter_context(patch.object(turn_mod, "_spawn_stream", spawn))
+        stack.enter_context(patch.object(turn_mod, "turn_approval_env", approvals))
+        return stack, procs
+
+    def _dropping_handler(self, writes_before_drop: int):
+        class W:
+            n = 0
+
+            def write(self, data):
+                W.n += 1
+                if W.n > writes_before_drop:
+                    raise BrokenPipeError("client gone")
+
+            def flush(self):
+                pass
+
+        class H:
+            wfile = W()
+            headers: dict = {}
+
+            def __init__(self):
+                self._c = _cfg()
+
+            def _cfg(self):
+                return self._c
+
+            def _write_json(self, body, status):
+                raise AssertionError((body, status))
+
+            def send_response(self, code):
+                pass
+
+            def send_header(self, k, v):
+                pass
+
+            def end_headers(self):
+                pass
+
+        return H()
+
+    def test_real_subprocess_keeps_running_after_drop(self):
+        import time as _t
+
+        from agents_relay import web as web_mod
+
+        script = "echo working >&2; sleep 1.5; printf 'done'"
+        stack, procs = self._patches(script)
+        with stack:
+            web_mod.handle_chat_stream(self._dropping_handler(1),
+                                       {"text": "hi", "run": "drop1"})
+            _t.sleep(0.3)
+            # client is gone, but the turn process is alive and listed
+            self.assertTrue(procs and procs[0].poll() is None)
+            self.assertIn("drop1", active_runs())
+            with web_mod._ACTIVE_LOCK:
+                entry = web_mod._ACTIVE["drop1"]
+            entry["thread"].join(10)
+        self.assertEqual(procs[0].returncode, 0)
+        self.assertFalse(entry["cancel"].is_set())
+        types = [e["type"] for e in entry["events"]]
+        self.assertIn("trailer", types)
+        text = "".join(e.get("text", "") for e in entry["events"] if e["type"] == "delta")
+        self.assertIn("done", text)
+        self.assertNotIn("drop1", active_runs())
+        # finished run is still attachable during the grace window
+        run_id, found = web_mod._find_run(run="drop1")
+        self.assertIs(found, entry)
+        with web_mod._ACTIVE_LOCK:
+            web_mod._ACTIVE.pop("drop1", None)
+
+    def test_stop_still_cancels(self):
+        from agents_relay import web as web_mod
+
+        stack, procs = self._patches("sleep 30")
+        with stack:
+            web_mod.handle_chat_stream(self._dropping_handler(0),
+                                       {"text": "hi", "run": "stop1"})
+
+            class SH:
+                def _write_json(self, body, status):
+                    self.out = (body, status)
+
+            sh = SH()
+            web_mod.handle_chat_stop(sh, {"run": "stop1"})
+            self.assertEqual(sh.out[0]["stopped"], ["stop1"])
+            with web_mod._ACTIVE_LOCK:
+                entry = web_mod._ACTIVE["stop1"]
+            entry["thread"].join(10)
+        self.assertIsNotNone(procs[0].poll())
+        with web_mod._ACTIVE_LOCK:
+            web_mod._ACTIVE.pop("stop1", None)
+
+    def test_repost_same_run_follows_existing_turn(self):
+        from agents_relay import web as web_mod
+
+        stack, procs = self._patches("sleep 1; printf ok")
+        with stack:
+            web_mod.handle_chat_stream(self._dropping_handler(0),
+                                       {"text": "hi", "run": "same1"})
+            web_mod.handle_chat_stream(self._dropping_handler(0),
+                                       {"text": "hi", "run": "same1"})
+            with web_mod._ACTIVE_LOCK:
+                entry = web_mod._ACTIVE["same1"]
+            entry["thread"].join(10)
+        self.assertEqual(len(procs), 1)  # no second turn spawned
+        with web_mod._ACTIVE_LOCK:
+            web_mod._ACTIVE.pop("same1", None)
+
+    def test_bad_request_does_not_leak_active_entry(self):
+        from agents_relay import web as web_mod
+
+        class H:
+            def __init__(self):
+                self._c = _cfg()
+
+            def _cfg(self):
+                return self._c
+
+            def _write_json(self, body, status):
+                self.out = status
+
+        h = H()
+        web_mod.handle_chat_stream(h, {"text": "hi", "run": "bad1",
+                                       "persona": "../evil"})
+        self.assertEqual(h.out, 400)
+        with web_mod._ACTIVE_LOCK:
+            self.assertNotIn("bad1", web_mod._ACTIVE)
