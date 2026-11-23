@@ -300,6 +300,10 @@ def _emit_relay_event(kind: str, payload: dict[str, Any] | None = None, *, works
 # ws_grant_hook applies the membership grant on ws-mode redeem.
 ws_invite_auth = None   # fn(device_id, ws_id) -> bool
 ws_grant_hook = None    # fn(device_id, ws_id, granted_by) -> None
+# session:host remote exec (klanker#145 R5): wired by klanker serve —
+# fn(handler, path, body) -> bool, True when the request was proxied to
+# the session's bound host via the hub channel.
+remote_turn_dispatch = None
 
 
 class TurnHandler(BaseHTTPRequestHandler):
@@ -996,6 +1000,9 @@ class TurnHandler(BaseHTTPRequestHandler):
             body = self._read_json()
             if body is None:
                 return
+            if remote_turn_dispatch is not None and remote_turn_dispatch(
+                    self, path, body):
+                return
             handle_chat_stream(self, body)
             return
 
@@ -1073,6 +1080,9 @@ class TurnHandler(BaseHTTPRequestHandler):
             except ValueError:
                 self.send_error(400, "invalid json")
                 return
+            if remote_turn_dispatch is not None and remote_turn_dispatch(
+                    self, path, body):
+                return
             self._handle_stream(body)
             return
 
@@ -1097,6 +1107,12 @@ class TurnHandler(BaseHTTPRequestHandler):
         body = self._read_json()
         if body is None:
             return
+        if path == "/v1/turn" and remote_turn_dispatch is not None:
+            try:
+                if remote_turn_dispatch(self, path, body):
+                    return
+            except Exception as exc:  # noqa: BLE001
+                log.warning("remote turn dispatch failed: %s", exc)
         is_alert = path in ("/v1/alert", "/webhook/alert")
         channel = str(body.get("channel") or ("webhook" if is_alert else "http"))
         user = str(body.get("user") or ("alert" if is_alert else "anonymous"))
