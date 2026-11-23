@@ -95,6 +95,7 @@ class ChannelHub:
         self._op_handler = None
         self._ack_handler = None
         self._ws_handler = None
+        self._connect_handler = None
 
     # -- link lifecycle -------------------------------------------------
 
@@ -180,6 +181,12 @@ class ChannelHub:
         """fn(device_id, kind, payload) receives ws-share control frames
         (``ws:announce``/``ws:revoke``, klanker#145)."""
         self._ws_handler = fn
+
+    def set_connect_handler(self, fn) -> None:
+        """fn(device_id) fires when a device (re)connects its stream —
+        the delivery opportunity for frames that dropped while offline
+        (ws:announce is fire-once-per-member-set, klanker#145)."""
+        self._connect_handler = fn
 
     def handle_upstream(self, device_id: str, msgs: list[dict[str, Any]]) -> dict[str, Any]:
         """Device POSTed envelopes: route rpc-res to pending calls, ack ops,
@@ -306,6 +313,12 @@ def handle_hub_stream(handler: BaseHTTPRequestHandler, device_id: str,
             "hello", {"device_id": device_id, "generation": link.generation,
                       "seq": link.seq})))
         handler.wfile.flush()
+        try:
+            fn = getattr(mgr, "_connect_handler", None)
+            if fn is not None:
+                fn(device_id)
+        except Exception:  # noqa: BLE001
+            log.exception("channel connect handler failed")
         while True:
             try:
                 item = link.queue.get(timeout=heartbeat_sec)
