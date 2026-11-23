@@ -654,15 +654,27 @@ class TurnHandler(BaseHTTPRequestHandler):
             if not ws or not session:
                 self.send_error(400, "ws and session required")
                 return
+            fence = 0
+            if action in ("renew", "release"):
+                raw_fence = body.get("fence")
+                if isinstance(raw_fence, bool) or not isinstance(raw_fence, (int, str)):
+                    self.send_error(400, "fence must be an integer")
+                    return
+                try:
+                    fence = int(raw_fence)
+                except ValueError:
+                    self.send_error(400, "fence must be an integer")
+                    return
+                if fence <= 0:
+                    self.send_error(400, "fence must be positive")
+                    return
             if action == "acquire":
                 out = book.acquire(ws, session, did,
                                    str(body.get("run_id") or ""))
             elif action == "renew":
-                out = book.renew(ws, session, did,
-                                 int(body.get("fence") or 0))
+                out = book.renew(ws, session, did, fence)
             elif action == "release":
-                out = book.release(ws, session, did,
-                                   int(body.get("fence") or 0))
+                out = book.release(ws, session, did, fence)
             else:
                 self.send_error(400, f"unknown lease action: {action!r}")
                 return

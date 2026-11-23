@@ -13,18 +13,63 @@ the current owner downstream.
 """
 from __future__ import annotations
 
+import json
+import os
+import tempfile
 import threading
 import time
+from pathlib import Path
 
 TTL_SEC = 45.0
 
 
 class LeaseBook:
-    def __init__(self, clock=time.monotonic) -> None:
+    """In-memory lease slots; only the fence high-water mark persists.
+
+    Leases themselves die with the hub (holders re-acquire after their
+    TTL), but fence tokens must stay monotonic across restarts or a
+    stale pre-restart holder could present a fence equal to a fresh
+    grant. With ``state_path`` the last issued fence is written before a
+    grant is returned and reloaded on start; without a readable state
+    the counter seeds from wall-clock milliseconds, which is above any
+    fence a counter could have reached in practice.
+    """
+
+    def __init__(self, clock=time.monotonic, state_path=None,
+                 wall=time.time) -> None:
         self._clock = clock
         self._lock = threading.Lock()
         self._slots: dict[tuple[str, str], dict] = {}
-        self._fence = 0
+        self._state_path = Path(state_path) if state_path else None
+        self._fence = self._load_fence(wall)
+
+    def _load_fence(self, wall) -> int:
+        seed = 0
+        if self._state_path is not None:
+            seed = int(wall() * 1000)
+            try:
+                data = json.loads(self._state_path.read_text(encoding="utf-8"))
+                seed = max(seed, int(data.get("fence") or 0))
+            except (OSError, ValueError, TypeError, AttributeError):
+                pass
+        return seed
+
+    def _persist_fence(self) -> None:
+        if self._state_path is None:
+            return
+        path = self._state_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"fence": self._fence}) + "\n")
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     def _slot(self, key, now):
         s = self._slots.get(key)
@@ -46,7 +91,14 @@ class LeaseBook:
                     "run_id": cur["run_id"],
                     "expires_in": round(cur["expires_mono"] - now, 3),
                 }
+            if cur is not None:
+                # Idempotent re-acquire by the same (holder, run_id), e.g. a
+                # retried request: keep the fence, extend the TTL.
+                cur["expires_mono"] = now + ttl
+                return {"granted": True, "fence": cur["fence"],
+                        "expires_in": ttl}
             self._fence += 1
+            self._persist_fence()
             cur = {
                 "holder": holder, "run_id": run_id,
                 "fence": self._fence, "expires_mono": now + ttl,
@@ -95,8 +147,23 @@ class LeaseBook:
 _book: LeaseBook | None = None
 
 
+def _default_state_path():
+    try:
+        from agents_workspace import Host
+
+        return Host.from_env().clients / "hub_leases.json"
+    except Exception:  # noqa: BLE001 - no host dir: in-memory epoch only
+        return None
+
+
 def hub_leases() -> LeaseBook:
     global _book
     if _book is None:
-        _book = LeaseBook()
+        _book = LeaseBook(state_path=_default_state_path())
     return _book
+
+
+def reset_leases() -> None:
+    """Drop the process-wide book (tests; hub reset)."""
+    global _book
+    _book = None
