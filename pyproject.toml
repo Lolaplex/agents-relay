@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agents-relay"
-version = "0.1.1"
+version = "0.2.0"
 description = "HTTP and Telegram relay to agents-harness runner.loop (stdlib only)"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Lolaplex" }]
 requires-python = ">=3.10"
-dependencies = ["agents-workspace>=0.1.0,<1"]
+dependencies = ["agents-workspace>=0.2.0,<1"]
 keywords = ["agents", "relay", "gateway", "telegram", "http", "harness", "cli", "coding-assistant"]
 classifiers = [
     "Development Status :: 4 - Beta",

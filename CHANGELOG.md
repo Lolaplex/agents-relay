@@ -137,8 +137,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Active handoff wake (#18): `POST /v1/workspaces/<ws>/personas/<p>/inbox/<task>/handoff?wake=1` moves the task (peer policy `accepts_messages`/`allow_peers` and the hop window enforced by `agents_workspace.inbox`), then runs it as a detached background turn under `routine:handoff:<task_id>` so interactive chat stays clean. The child env carries `AGENTS_PERSONA`, `AGENTS_PERSONA_HOP`, and `AGENTS_THREAD_ID` (new `extra_env` on `loop_client.run_loop_turn`). The task transitions `open -> running -> done|failed` with `result`/`reply_summary`; tasks with `mode=ask` or a `reply_to` field are handed back to the origin persona as the result notification. Answers 202 `{ok, task, wake: true}`.
 - Team inbox feed: `GET /v1/workspaces/<ws>/inbox` returns per-persona counts (`open`/`running`/`done`/`failed`, `unread`, `total`) plus the newest 20 `handoff`/`reply` events across personas for the Web UI badge and activity feed.
 
-## [0.1.1] - 2026-11-08
-
 ### Added
 - `agents-relay approve --local` waits on `$AGENTS_RELAY_STATE/approvals/<id>.json` without Telegram. `--decide <id> --allow` or `--deny` writes that same decision.
 
@@ -202,8 +200,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Buffered `runner.loop` subprocess with trailer parsing.
 - Telegram message lifecycle from `thinking...` to formatted HTML answer.
 
-[Unreleased]: https://github.com/Lolaplex/agents-relay/compare/v0.1.1...HEAD
-[0.1.1]: https://github.com/Lolaplex/agents-relay/compare/v0.1.0...v0.1.1
+[Unreleased]: https://github.com/Lolaplex/agents-relay/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/Lolaplex/agents-relay/compare/v0.0.2...v0.1.0
 [0.0.2]: https://github.com/Lolaplex/agents-relay/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/Lolaplex/agents-relay/releases/tag/v0.0.1
