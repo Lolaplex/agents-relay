@@ -654,13 +654,16 @@ class TestTurnSurvivesClientDrop(unittest.TestCase):
     def _patches(self, script: str):
         import contextlib
         import subprocess
+        import sys
 
         from agents_relay import turn as turn_mod
 
         procs: list = []
 
         def spawn(argv, env=None, workspace="", workdir="", extra=None):
-            p = subprocess.Popen(["bash", "-c", script],
+            # python -c, not bash -c: 'bash' resolves to WSL on Windows
+            # hosts and dies instantly (agents-relay#41 test fix).
+            p = subprocess.Popen([sys.executable, "-c", script],
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             procs.append(p)
             return p, None
@@ -717,7 +720,8 @@ class TestTurnSurvivesClientDrop(unittest.TestCase):
 
         from agents_relay import web as web_mod
 
-        script = "echo working >&2; sleep 1.5; printf 'done'"
+        script = ("import sys, time; sys.stderr.write('working\\n'); "
+                  "sys.stderr.flush(); time.sleep(1.5); print('done', end='')")
         stack, procs = self._patches(script)
         with stack:
             web_mod.handle_chat_stream(self._dropping_handler(1),
@@ -745,7 +749,7 @@ class TestTurnSurvivesClientDrop(unittest.TestCase):
     def test_stop_still_cancels(self):
         from agents_relay import web as web_mod
 
-        stack, procs = self._patches("sleep 30")
+        stack, procs = self._patches("import time; time.sleep(30)")
         with stack:
             web_mod.handle_chat_stream(self._dropping_handler(0),
                                        {"text": "hi", "run": "stop1"})
@@ -767,7 +771,8 @@ class TestTurnSurvivesClientDrop(unittest.TestCase):
     def test_repost_same_run_follows_existing_turn(self):
         from agents_relay import web as web_mod
 
-        stack, procs = self._patches("sleep 1; printf ok")
+        stack, procs = self._patches(
+            "import time; time.sleep(1); print('ok', end='')")
         with stack:
             web_mod.handle_chat_stream(self._dropping_handler(0),
                                        {"text": "hi", "run": "same1"})

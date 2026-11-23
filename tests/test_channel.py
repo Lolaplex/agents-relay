@@ -223,12 +223,12 @@ class TestChannelWire(unittest.TestCase):
         self.assertTrue(res["token"])
         self.assertNotEqual(res["token"], "expected")  # master never leaves
         self.assertIn("stream", res["hub"])
-        # device token authorizes the API like a scoped credential
+        # the mount table is operator surface — a device token can
+        # never read it (agents-relay#41)
         st, body = self.srv.req(
             "GET", "/v1/remotes",
             headers={"Authorization": f"Bearer {res['token']}"})
-        self.assertEqual(st, 200)
-        self.assertTrue(body["ok"])
+        self.assertEqual(st, 401)
 
     def test_device_token_cannot_mint_or_manage_credentials(self):
         res = self._redeem_device()
@@ -247,6 +247,13 @@ class TestChannelWire(unittest.TestCase):
         st, _ = self.srv.req("DELETE", "/v1/remotes/dev-ghost", headers=auth)
         self.assertEqual(st, 401)
         st, _ = self.srv.req("GET", "/v1/discover", headers=auth)
+        self.assertEqual(st, 401)
+        # provider manifests carry executable commands — device tokens
+        # must never register or delete them (agents-relay#41)
+        st, _ = self.srv.req("POST", "/v1/providers",
+                             {"name": "x", "cmd": "id"}, headers=auth)
+        self.assertEqual(st, 401)
+        st, _ = self.srv.req("DELETE", "/v1/providers/x", headers=auth)
         self.assertEqual(st, 401)
 
     def test_hub_stream_requires_device_auth(self):
@@ -593,6 +600,154 @@ class TestRemotesChannel(unittest.TestCase):
             "secret": "s2"})
         self.assertEqual(err2, "")
         self.assertEqual(row2["id"], "vps")  # canonical row wins
+
+
+class TestWsMemberScope(unittest.TestCase):
+    """agents-relay#41: ws_member devices are allowlist-scoped guests."""
+
+    def setUp(self) -> None:
+        channel.reset_hub()
+        reset_leases()
+        self.td = tempfile.TemporaryDirectory()
+        host_dir = Path(self.td.name)
+        for ws in ("default", "ws-a", "ws-b"):
+            (host_dir / "workspaces" / ws).mkdir(parents=True)
+        self.env = patch.dict(os.environ, {"AGENTS_HOST_DIR": str(host_dir)})
+        self.env.start()
+        from agents_workspace import Host
+
+        for ws in ("ws-a", "ws-b"):
+            Host.from_env().create(ws)
+        self.srv = _Srv(_cfg())
+        self.dev = devices.mint_device(
+            label="guest", role="ws_member", allowlist=["ws-a"])
+        self.auth = {"Authorization": f"Bearer {self.dev['device_token']}"}
+
+    def tearDown(self) -> None:
+        self.srv.close()
+        self.env.stop()
+        self.td.cleanup()
+        channel.reset_hub()
+        reset_leases()
+
+    def test_ws_member_needs_nonempty_allowlist(self):
+        with self.assertRaises(ValueError):
+            devices.mint_device(role="ws_member", allowlist=[])
+
+    def test_ws_member_ws_scope_denials(self):
+        # the granted ws passes the gate
+        st, _ = self.srv.req("GET", "/v1/workspaces/ws-a/inbox",
+                             headers=self.auth)
+        self.assertEqual(st, 200)
+        # a different ws is invisible — allowlist denial, not 404
+        st, _ = self.srv.req("GET", "/v1/workspaces/ws-b/inbox",
+                             headers=self.auth)
+        self.assertEqual(st, 403)
+        st, _ = self.srv.req("GET", "/v1/events?workspace=ws-b",
+                             headers=self.auth)
+        self.assertEqual(st, 403)
+        # hard/soft delete of even a granted ws is denied
+        st, _ = self.srv.req("DELETE", "/v1/workspaces/ws-a?hard=1",
+                             headers=self.auth)
+        self.assertEqual(st, 403)
+        # policy keys are denied even inside an allowed ws
+        st, _ = self.srv.req("PATCH", "/v1/workspaces/ws-a",
+                             {"sync_hosts": ["other"]}, headers=self.auth)
+        self.assertEqual(st, 403)
+        # remote-proxy pivots and admin surfaces stay out of reach
+        st, _ = self.srv.req(
+            "GET", "/v1/remote/dev-other/v1/workspaces",
+            headers=self.auth)
+        self.assertEqual(st, 403)
+        st, _ = self.srv.req("GET", "/v1/remotes", headers=self.auth)
+        self.assertEqual(st, 403)
+        st, _ = self.srv.req("GET", "/v1/personas?workspace=ws-a",
+                             headers=self.auth)
+        self.assertEqual(st, 403)
+        # approval decisions are operator-only
+        st, _ = self.srv.req("POST", "/v1/approvals/a1", {"allow": True},
+                             headers=self.auth)
+        self.assertEqual(st, 403)
+        # channel frames still work — a guest is a real device
+        st, body = self.srv.req(
+            "POST", "/v1/hub/send",
+            {"msgs": [{"kind": "presence", "payload": {}}]},
+            headers={**self.auth,
+                     "X-Device-Id": self.dev["device_id"]})
+        self.assertEqual(st, 200)
+        self.assertTrue(body["ok"])
+
+    def test_rpc_http_denies_pivots_with_403(self):
+        from agents_relay.channel_client import _rpc_http
+
+        cfg = _cfg(relay_port=self.srv.port)
+        for denied in ("/v1/remote/dev-x/v1/pair/create",
+                       "/v1/approvals/a1",
+                       "/v1/pair/redeem?x=1",
+                       "/v1/model"):
+            frames = list(_rpc_http(
+                {"req": {"method": "GET", "path": denied}}, cfg))
+            self.assertEqual(frames[0].get("status"), 403, denied)
+
+    def test_rpc_http_keeps_query_after_normalization(self):
+        from agents_relay.channel_client import _rpc_http
+
+        cfg = _cfg(relay_port=self.srv.port)
+        frames = list(_rpc_http(
+            {"req": {"method": "GET",
+                     "path": "/v1/../health?x=1"}},
+            cfg))
+        self.assertEqual(frames[-1].get("status"), 200)
+
+    def test_approval_replay_and_binding(self):
+        from agents_relay.approvals import (
+            create_pending, mint_approval_token)
+
+        token, _ = mint_approval_token("ws-a")
+        auth = {"Authorization": f"Bearer {token}"}
+        st, body = self.srv.req(
+            "POST", "/v1/approvals/request",
+            {"id": "a1", "tool": "mcp.terminal", "args": {"cmd": "ls"}},
+            headers=auth)
+        self.assertEqual(st, 200)
+        # replaying the granted id with changed args is a conflict
+        st, body = self.srv.req(
+            "POST", "/v1/approvals/request",
+            {"id": "a1", "tool": "mcp.terminal",
+             "args": {"cmd": "rm -rf /"}},
+            headers=auth)
+        self.assertEqual(st, 409)
+        # a record without token_hash fails closed to a turn token
+        create_pending(_cfg(), 0,
+                       {"id": "b2", "tool": "git", "args": {}})
+        st, _ = self.srv.req(
+            "POST", "/v1/approvals/request",
+            {"id": "b2", "tool": "git", "args": {}}, headers=auth)
+        self.assertEqual(st, 403)
+
+
+class TestProxySanitize(unittest.TestCase):
+    """agents-relay#41: CRLF/XSS guards on /v1/remote/* responses."""
+
+    def test_header_injection_rejected(self):
+        from agents_relay.remotes import _proxy_content_type, _sanitize_header_value
+
+        with self.assertRaises(ValueError):
+            _sanitize_header_value("text/html\r\nSet-Cookie: pwn=1")
+        with self.assertRaises(ValueError):
+            _proxy_content_type("text/html\r\nSet-Cookie: pwn=1")
+
+    def test_html_svg_rewrite_to_plain(self):
+        from agents_relay.remotes import _proxy_content_type
+
+        self.assertEqual(
+            _proxy_content_type("text/html; charset=utf-8"),
+            "text/plain; charset=utf-8")
+        self.assertEqual(
+            _proxy_content_type("image/svg+xml"),
+            "text/plain; charset=utf-8")
+        self.assertEqual(
+            _proxy_content_type("application/json"), "application/json")
 
 
 if __name__ == "__main__":

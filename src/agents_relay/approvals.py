@@ -180,6 +180,21 @@ def _mutate(config: RelayConfig, ident: str, fn) -> dict | None:
         return updated
 
 
+def canonical_json(obj: Any) -> str:
+    """Stable serialization for approval request hashing."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False, default=str)
+
+
+def approval_request_hash(request: dict) -> str:
+    """sha256 over the exact tool+args an approval covers — replaying a
+    granted id with different arguments must fail (agents-relay#41)."""
+    return hashlib.sha256(
+        canonical_json(
+            {"tool": request.get("tool"),
+             "args": request.get("args")}).encode("utf-8")).hexdigest()
+
+
 def create_pending(
     config: RelayConfig,
     chat_id: int,
@@ -201,6 +216,7 @@ def create_pending(
             "chat_id": int(chat_id),
             "workspace": eff_ws,
             "request": request,
+            "request_hash": approval_request_hash(request),
             "note": "",
             "decided_by": None,
             "created_at": time.time(),

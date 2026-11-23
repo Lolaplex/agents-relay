@@ -30,7 +30,49 @@ log = logging.getLogger(__name__)
 
 # Query keys never forwarded upstream — they carry OUR relay's secret.
 _STRIP_QS = {"secret", "token"}
-_STREAM_PATHS = ("/v1/chat/stream", "/v1/runs/stream", "/v1/stream")
+_STREAM_PATHS = ("/v1/chat/stream", "/v1/runs/stream", "/v1/stream",
+                 "/v1/events")
+
+# Upstream content types rewritten to plain text (agents-relay#41):
+# active markup from a compromised remote must never reach the shell.
+_REWRITE_CTYPE = ("text/html", "image/svg+xml")
+_SAFE_CTYPE = "text/plain; charset=utf-8"
+_PROXY_CSP = "sandbox; default-src 'none'"
+
+
+def _sanitize_header_value(value: str) -> str:
+    """CR/LF inside a proxied header value is an injection attempt."""
+    v = str(value or "")
+    if "\r" in v or "\n" in v:
+        raise ValueError("upstream header contains CR/LF")
+    return v
+
+
+def _b64decode(data: str) -> bytes:
+    import base64
+
+    return base64.b64decode(data, validate=True)
+
+
+def _proxy_content_type(raw: str) -> str:
+    """Sanitize + rewrite: html/svg bodies are downgraded to text/plain."""
+    v = _sanitize_header_value(raw) or "application/octet-stream"
+    if v.lower().split(";", 1)[0].strip() in _REWRITE_CTYPE:
+        return _SAFE_CTYPE
+    return v
+
+
+def _send_proxy_headers(handler: BaseHTTPRequestHandler, status: int,
+                        ctype: str) -> None:
+    handler.send_response(status)
+    handler.send_header("Content-Type", ctype)
+    handler.send_header("Content-Security-Policy", _PROXY_CSP)
+    handler.send_header("X-Content-Type-Options", "nosniff")
+    if ctype.startswith("text/event-stream"):
+        handler.send_header("Cache-Control", "no-cache")
+        handler.send_header("X-Accel-Buffering", "no")
+        handler.send_header("Connection", "close")
+    handler.end_headers()
 
 
 def validate_remote_base_url(url: str) -> str:
@@ -289,6 +331,22 @@ def handle_proxy(handler: BaseHTTPRequestHandler, rid: str, rest: str) -> None:
     except ValueError as exc:
         handler._write_json({"ok": False, "error": str(exc)}, 400)  # type: ignore[attr-defined]
         return
+    # Non-admin callers stay behind the channel http-RPC denylist —
+    # a mounted remote must never become a credential/policy pivot
+    # (agents-relay#41). Operator surfaces (admin/cookie) keep full
+    # reach: pairing and device management are their job.
+    try:
+        ctx = handler._auth_ctx()  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        ctx = {}
+    if ctx.get("kind") not in ("admin", "cookie"):
+        from .channel_client import _rpc_denied
+
+        if _rpc_denied(handler.command, rest):
+            handler._write_json(
+                {"ok": False,
+                 "error": f"proxy denied: {handler.command} {rest}"}, 403)  # type: ignore[attr-defined]
+            return
     qs = _forward_query(handler.path or "")
     if remote.get("via") == "channel":
         _proxy_via_channel(handler, remote, rest, qs)
@@ -333,18 +391,25 @@ def handle_proxy(handler: BaseHTTPRequestHandler, rid: str, rest: str) -> None:
         handler._write_json({"ok": False, "error": f"remote unreachable: {exc}"}, 502)  # type: ignore[attr-defined]
         return
 
-    handler.send_response(upstream.status)
-    ctype = upstream.headers.get("Content-Type") or "application/octet-stream"
-    handler.send_header("Content-Type", ctype)
-    if ctype.startswith("text/event-stream"):
-        handler.send_header("Cache-Control", "no-cache")
-        handler.send_header("X-Accel-Buffering", "no")
-        handler.send_header("Connection", "close")
-    handler.end_headers()
     try:
+        ctype = _proxy_content_type(
+            upstream.headers.get("Content-Type") or "application/octet-stream")
+    except ValueError:
+        upstream.close()
+        handler._write_json({"ok": False, "error": "invalid upstream header"}, 502)  # type: ignore[attr-defined]
+        return
+    _send_proxy_headers(handler, upstream.status, ctype)
+    try:
+        from .http_adapter import MAX_HTTP_BODY_BYTES
+
+        streamed = any(rest.startswith(p) for p in _STREAM_PATHS)
+        sent = 0
         while True:
             chunk = upstream.read(8192)
             if not chunk:
+                break
+            sent += len(chunk)
+            if not streamed and sent > MAX_HTTP_BODY_BYTES:
                 break
             handler.wfile.write(chunk)
             handler.wfile.flush()
@@ -389,29 +454,40 @@ def _proxy_via_channel(
         handler._write_json({"ok": False, "error": "device returned empty rpc"}, 502)  # type: ignore[attr-defined]
         return
     if "error" in first:
-        code = 503 if first["error"] in ("device offline", "device disconnected") else 502
+        if first["error"] in ("device offline", "device disconnected"):
+            code = 503
+        else:
+            # Carry a real upstream status (403 deny etc.) — never
+            # flatten authz failures into a transport 502.
+            code = int(first.get("status") or 502)
         handler._write_json({"ok": False, "error": str(first["error"])}, code)  # type: ignore[attr-defined]
         return
 
     status = int(first.get("status") or 502)
-    ctype_out = str(first.get("content_type") or "application/octet-stream")
-    handler.send_response(status)
-    handler.send_header("Content-Type", ctype_out)
-    if ctype_out.startswith("text/event-stream"):
-        handler.send_header("Cache-Control", "no-cache")
-        handler.send_header("X-Accel-Buffering", "no")
-        handler.send_header("Connection", "close")
-    handler.end_headers()
     try:
-        import base64
-
-        if "body_b64" in first:
-            handler.wfile.write(base64.b64decode(first["body_b64"]))
-        elif "body" in first:
-            handler.wfile.write(str(first["body"]).encode("utf-8"))
+        ctype_out = _proxy_content_type(
+            str(first.get("content_type") or "application/octet-stream"))
+    except ValueError:
+        handler._write_json({"ok": False, "error": "invalid upstream header"}, 502)  # type: ignore[attr-defined]
+        return
+    # Decode/validate the body BEFORE headers go out — a bad payload
+    # must become a clean 502, not a half-written response.
+    body = b""
+    if "body_b64" in first:
+        try:
+            body = _b64decode(str(first["body_b64"]))
+        except ValueError:
+            handler._write_json({"ok": False, "error": "invalid body_b64"}, 502)  # type: ignore[attr-defined]
+            return
+    elif "body" in first:
+        body = str(first["body"]).encode("utf-8")
+    _send_proxy_headers(handler, status, ctype_out)
+    try:
+        if body:
+            handler.wfile.write(body)
         for fr in frames:
             if "chunk_b64" in fr:
-                handler.wfile.write(base64.b64decode(fr["chunk_b64"]))
+                handler.wfile.write(_b64decode(str(fr["chunk_b64"])))
                 handler.wfile.flush()
             elif "chunk" in fr:
                 handler.wfile.write(str(fr["chunk"]).encode("utf-8"))

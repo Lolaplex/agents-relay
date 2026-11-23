@@ -149,10 +149,11 @@ _STREAM_PATHS = ("/v1/chat/stream", "/v1/runs/stream", "/v1/stream", "/v1/events
 # request against its own loopback WITH ITS MASTER SECRET, so admin and
 # credential-bearing surfaces are never reachable through the channel —
 # regardless of who asked the hub to proxy. Anything under these prefixes
-# could mint credentials, manage devices, or rewrite policy.
+# could mint credentials, manage devices, rewrite policy, or pivot.
 _RPC_DENY_ALWAYS = (
-    "/v1/pair", "/v1/hub", "/v1/remotes", "/v1/discover",
-    "/v1/clients", "/v1/secrets", "/v1/vault",
+    "/v1/pair", "/v1/hub", "/v1/remotes", "/v1/remote", "/v1/discover",
+    "/v1/clients", "/v1/secrets", "/v1/vault", "/v1/ws/invite",
+    "/v1/approvals", "/v1/model", "/v1/auth", "/v1/klanker/routines",
 )
 _RPC_DENY_WRITE = (
     "/v1/providers", "/v1/settings", "/v1/workspaces",
@@ -177,8 +178,12 @@ def _rpc_http(params: dict, cfg: RelayConfig) -> Iterator[dict]:
     from .remotes import _normalize_proxy_rest
 
     req = dict(params.get("req") or {})
+    raw_path = str(req.get("path") or "/")
+    # Deny+normalize decide on the path only — the query is reattached
+    # unchanged so it can never smuggle a denied prefix or be eaten.
+    path_only, sep, query = raw_path.partition("?")
     try:
-        path = _normalize_proxy_rest(str(req.get("path") or "/"))
+        path = _normalize_proxy_rest(path_only)
     except ValueError as exc:
         yield {"error": str(exc)}
         return
@@ -187,13 +192,23 @@ def _rpc_http(params: dict, cfg: RelayConfig) -> Iterator[dict]:
         yield {"error": f"channel http rpc denied: {method} {path}",
                "status": 403, "done": True}
         return
+    from .http_adapter import MAX_HTTP_BODY_BYTES
+
     data: bytes | None = None
     if req.get("body_b64"):
         import base64
 
-        data = base64.b64decode(str(req["body_b64"]))
+        try:
+            data = base64.b64decode(str(req["body_b64"]), validate=True)
+        except ValueError:
+            yield {"error": "invalid body_b64", "status": 400, "done": True}
+            return
     elif isinstance(req.get("body"), str) and req["body"]:
         data = str(req["body"]).encode("utf-8")
+    if data is not None and len(data) > MAX_HTTP_BODY_BYTES:
+        yield {"error": "request body too large", "status": 413,
+               "done": True}
+        return
     headers = {"User-Agent": "agents-relay/channel-rpc"}
     token = _resolve_loopback_secret()
     if token:
@@ -203,7 +218,7 @@ def _rpc_http(params: dict, cfg: RelayConfig) -> Iterator[dict]:
     if req.get("accept"):
         headers["Accept"] = str(req["accept"])
 
-    url = f"http://127.0.0.1:{cfg.relay_port}{path}"
+    url = f"http://127.0.0.1:{cfg.relay_port}{path}{sep + query if sep else ''}"
     hreq = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         resp = urllib.request.urlopen(hreq, timeout=600)
@@ -229,7 +244,11 @@ def _rpc_http(params: dict, cfg: RelayConfig) -> Iterator[dict]:
             return
         yield {"done": True}
         return
-    raw = resp.read()
+    raw = resp.read(MAX_HTTP_BODY_BYTES + 1)
+    if len(raw) > MAX_HTTP_BODY_BYTES:
+        yield {"error": "response body too large", "status": 502,
+               "done": True}
+        return
     import base64
 
     yield {"status": resp.status, "content_type": ctype,

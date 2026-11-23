@@ -71,14 +71,18 @@ def mint_device(device_id: str = "", *, label: str = "", host_id: str = "",
     token (re-pair flow) and keeps label/role/allowlist unless overridden.
 
     role: 'host' = compute node (channel + ws ops); 'client' = operator UI
-    (chat + own approvals). Admin surfaces stay device-denied regardless —
-    see _check_secret(allow_device=False) routes and the channel http-RPC
-    denylist."""
+    (chat + own approvals); 'ws_member' = workspace guest minted by a
+    mode=ws invite (klanker#145) — restricted to the workspaces in its
+    allowlist and denied everywhere else (admin surfaces stay
+    device-denied regardless — see _check_secret(allow_device=False)
+    routes and the channel http-RPC denylist)."""
     did = (device_id or "").strip() or secrets.token_hex(6)
     if not valid_id(did):
         raise ValueError(f"invalid device id: {did!r}")
-    if role not in ("host", "client"):
+    if role not in ("host", "client", "ws_member"):
         raise ValueError(f"invalid device role: {role!r}")
+    if role == "ws_member" and not (allowlist or []):
+        raise ValueError("ws_member devices need a non-empty allowlist")
     rows = load_devices()
     prev = rows.get(did) or {}
     token = secrets.token_urlsafe(24)
