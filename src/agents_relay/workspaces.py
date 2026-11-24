@@ -122,16 +122,19 @@ def patch_workspace(ws_id: str, payload: dict) -> dict:
             ws, {"approval": {"mode": mode if mode not in ("", None) else None}}
         )
     row = workspace_row(host.workspace(ws_id))
-    if set(payload) & _POLICY_FIELDS:
-        try:
-            from .events import emit_event
+    # Single canonical workspace.changed emit per patch — the route
+    # must not re-emit with a different key shape (agents-relay#45).
+    try:
+        from .events import emit_event
 
-            emit_event("workspace.changed",
-                       {"ws": ws_id,
-                        "fields": sorted(set(payload) & _POLICY_FIELDS)},
-                       workspace=ws_id)
-        except Exception:  # noqa: BLE001
-            pass
+        emit_event("workspace.changed",
+                   {"action": "patch", "workspace": ws_id,
+                    "fields": sorted(set(payload)
+                                     & (_PATCH_FIELDS | _POLICY_FIELDS))},
+                   workspace=ws_id)
+    except Exception:  # noqa: BLE001
+        pass
+    if set(payload) & _POLICY_FIELDS:
         fn = globals().get("ws_policy_changed_fn")
         if fn is not None:
             try:

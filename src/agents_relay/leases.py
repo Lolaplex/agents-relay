@@ -105,6 +105,7 @@ class LeaseBook:
     def acquire(self, ws: str, session: str, holder: str,
                 run_id: str = "", ttl: float = TTL_SEC) -> dict:
         key = (ws, session)
+        emit = None
         with self._lock:
             now = self._clock()
             # sweep inside the lock so an expired sibling slot elsewhere
@@ -114,28 +115,34 @@ class LeaseBook:
                     del self._slots[k]
             cur = self._slot(key, now)
             if cur is not None and (cur["holder"], cur["run_id"]) != (holder, run_id):
-                return {
+                result = {
                     "granted": False,
                     "holder": cur["holder"],
                     "run_id": cur["run_id"],
                     "expires_in": round(cur["expires_mono"] - now, 3),
                 }
-            if cur is not None:
+            elif cur is not None:
                 # Idempotent re-acquire by the same (holder, run_id), e.g. a
                 # retried request: keep the fence, extend the TTL.
                 cur["expires_mono"] = now + ttl
-                return {"granted": True, "fence": cur["fence"],
-                        "expires_in": ttl}
-            self._fence += 1
-            self._persist_fence()
-            cur = {
-                "holder": holder, "run_id": run_id,
-                "fence": self._fence, "expires_mono": now + ttl,
-            }
-            self._slots[key] = cur
-            _emit_lease("acquire", ws, session, holder, run_id)
-            return {"granted": True, "fence": self._fence,
-                    "expires_in": ttl}
+                result = {"granted": True, "fence": cur["fence"],
+                          "expires_in": ttl}
+            else:
+                self._fence += 1
+                self._persist_fence()
+                cur = {
+                    "holder": holder, "run_id": run_id,
+                    "fence": self._fence, "expires_mono": now + ttl,
+                }
+                self._slots[key] = cur
+                emit = ("acquire", ws, session, holder, run_id)
+                result = {"granted": True, "fence": self._fence,
+                          "expires_in": ttl}
+        # SSE outside _lock — a slow subscriber must never hold the
+        # lease mutex (agents-relay#45)
+        if emit is not None:
+            _emit_lease(*emit)
+        return result
 
     def renew(self, ws: str, session: str, holder: str, fence: int,
               ttl: float = TTL_SEC) -> dict:
@@ -150,24 +157,32 @@ class LeaseBook:
 
     def release(self, ws: str, session: str, holder: str, fence: int) -> dict:
         key = (ws, session)
+        emit = None
         with self._lock:
             now = self._clock()
             cur = self._slot(key, now)
             if cur is not None and cur["holder"] == holder \
                     and cur["fence"] == int(fence):
                 del self._slots[key]
-                _emit_lease("release", ws, session, holder,
-                            cur.get("run_id") or "")
-            return {"released": True}
+                emit = ("release", ws, session, holder,
+                        cur.get("run_id") or "")
+        if emit is not None:
+            _emit_lease(*emit)
+        return {"released": True}
 
     def release_holder(self, holder: str) -> int:
         """Drop every lease held by ``holder`` — device revocation must
-        not leave dead sessions fencing live ones (agents-relay#42)."""
+        not leave dead sessions fencing live ones (agents-relay#42).
+        Each dropped slot emits ``lease.changed`` outside the lock so
+        ws-scoped SSE sees the holder vanish (agents-relay#45)."""
         with self._lock:
-            dropped = [k for k, s in self._slots.items()
+            dropped = [(k, s) for k, s in self._slots.items()
                        if s["holder"] == holder]
-            for k in dropped:
+            for k, _s in dropped:
                 del self._slots[k]
+        for (ws, session), s in dropped:
+            _emit_lease("release", ws, session, holder,
+                        s.get("run_id") or "")
         return len(dropped)
 
     def snapshot(self) -> list[dict]:

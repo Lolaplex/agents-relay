@@ -52,6 +52,55 @@ _REPLAYED_KINDS = frozenset({"hello", "presence", "op", "ack",
                              "ws:announce", "ws:revoke",
                              "approval-req", "approval-res"})
 
+# Presence frame bounds (agents-relay#45): a device must not stuff
+# unbounded caps/status blobs into the hub's presence table.
+_PRESENCE_MAX_CAPS = 32
+_PRESENCE_MAX_FIELD = 64
+
+
+def _device_workspaces(device_id: str) -> list[str]:
+    """Workspaces that admit ``device_id`` — the SSE fan-out scope for
+    device lifecycle events (agents-relay#45). Union of
+    ``ws.allows_device`` rows and the device's own allowlist; every
+    lookup failure fails closed for that workspace only."""
+    scopes: set[str] = set()
+    try:
+        from .workspaces import list_workspaces
+
+        for ws in list_workspaces():
+            try:
+                if ws.allows_device(device_id):
+                    scopes.add(str(ws.id))
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception:  # noqa: BLE001 - workspace layer optional
+        pass
+    try:
+        from .devices import load_devices
+
+        meta = load_devices().get(device_id) or {}
+        scopes.update(str(w) for w in (meta.get("allowlist") or ())
+                      if str(w or ""))
+    except Exception:  # noqa: BLE001 - registry read never blocks events
+        pass
+    return sorted(scopes)
+
+
+def _emit_device_event(kind: str, device_id: str,
+                       payload: dict[str, Any]) -> None:
+    """Emit one device event per admitted workspace so ws-scoped SSE
+    subscribers (``?workspace=w1``) actually see presence churn; falls
+    back to a single global emit when no workspace admits the device
+    (agents-relay#45)."""
+    try:
+        from .events import emit_event
+
+        scopes = _device_workspaces(device_id) or [""]
+        for ws in scopes:
+            emit_event(kind, payload, workspace=ws)
+    except Exception:  # noqa: BLE001 - events never block transport
+        pass
+
 
 @dataclass
 class _Channel:
@@ -183,43 +232,43 @@ class ChannelHub:
                 return  # a newer stream already replaced us
             del self._links[device_id]
         self._poison(link.queue)  # release the SSE generator
-        try:
-            from .events import emit_event
-
-            emit_event("device.disconnected",
-                       {"device_id": device_id})
-        except Exception:  # noqa: BLE001 - events never block transport
-            pass
+        _emit_device_event("device.disconnected", device_id,
+                           {"device_id": device_id})
 
     # -- presence ----------------------------------------------------------
 
     def note_presence(self, device_id: str, payload: dict[str, Any]) -> None:
         """Inbound ``presence`` frame: last_seen + status/caps, rate-
         bounded — a chatty device cannot flood the events bus
-        (agents-relay#43)."""
+        (agents-relay#43). Field sizes are bounded and the emit decision
+        is taken under ``_lock`` (agents-relay#45)."""
         now = time.time()
+        status = str(payload.get("status") or "online")[:_PRESENCE_MAX_FIELD]
+        raw_caps = payload.get("caps")
+        caps = ([str(c)[:_PRESENCE_MAX_FIELD]
+                 for c in list(raw_caps)[:_PRESENCE_MAX_CAPS]]
+                if isinstance(raw_caps, (list, tuple)) else [])
+        emit = False
         with self._lock:
             prev = self._presence.get(device_id) or {}
             # one presence event per device per second max
-            if now - float(prev.get("_emitted") or 0.0) < 1.0:
-                self._presence[device_id] = {
-                    "ts": now, "_emitted": prev.get("_emitted") or 0.0,
-                    "status": str(payload.get("status") or "online"),
-                    "caps": payload.get("caps") or []}
-                return
+            emit = now - float(prev.get("_emitted") or 0.0) >= 1.0
             self._presence[device_id] = {
-                "ts": now, "_emitted": now,
-                "status": str(payload.get("status") or "online"),
-                "caps": payload.get("caps") or []}
-        try:
-            from .events import emit_event
-
-            emit_event("device.presence", {
+                "ts": now,
+                "_emitted": now if emit else prev.get("_emitted") or 0.0,
+                "status": status,
+                "caps": caps}
+        if emit:
+            _emit_device_event("device.presence", device_id, {
                 "device_id": device_id,
-                "status": self._presence[device_id]["status"],
+                "status": status,
                 "ts": now})
-        except Exception:  # noqa: BLE001
-            pass
+
+    def drop_presence(self, device_id: str) -> None:
+        """Revocation cleanup — a dead device must not keep a presence
+        row forever (agents-relay#45)."""
+        with self._lock:
+            self._presence.pop(device_id, None)
 
     def presence(self, device_id: str) -> dict[str, Any]:
         with self._lock:
@@ -333,19 +382,24 @@ class ChannelHub:
                         not str(payload.get("ws") or "").strip():
                     malformed += 1
                     continue
-                if self._ws_handler is not None:
-                    self._ws_handler(device_id, kind, payload)
-                try:
-                    from .events import emit_event
+                # SSE only when the ws handler's ACL admits the frame —
+                # an unprivileged device must not spoof ws.announced/
+                # ws.revoked events (agents-relay#45).
+                accepted = bool(
+                    self._ws_handler is not None
+                    and self._ws_handler(device_id, kind, payload))
+                if accepted:
+                    try:
+                        from .events import emit_event
 
-                    emit_event(
-                        "ws.announced" if kind == "ws:announce"
-                        else "ws.revoked",
-                        {"device_id": device_id,
-                         "ws": str(payload.get("ws") or "")},
-                        workspace=str(payload.get("ws") or ""))
-                except Exception:  # noqa: BLE001
-                    pass
+                        emit_event(
+                            "ws.announced" if kind == "ws:announce"
+                            else "ws.revoked",
+                            {"device_id": device_id,
+                             "ws": str(payload.get("ws") or "")},
+                            workspace=str(payload.get("ws") or ""))
+                    except Exception:  # noqa: BLE001
+                        pass
             elif kind in ("approval-req", "approval-res"):
                 if not isinstance(payload.get("id"), str) or \
                         not str(payload.get("id") or "").strip():
@@ -517,12 +571,8 @@ def handle_hub_stream(handler: BaseHTTPRequestHandler, device_id: str,
             "hello", {"device_id": device_id, "generation": link.generation,
                       "seq": link.seq})))
         handler.wfile.flush()
-        try:
-            from .events import emit_event
-
-            emit_event("device.connected", {"device_id": device_id})
-        except Exception:  # noqa: BLE001
-            pass
+        _emit_device_event("device.connected", device_id,
+                           {"device_id": device_id})
         try:
             fn = getattr(mgr, "_connect_handler", None)
             if fn is not None:

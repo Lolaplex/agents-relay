@@ -196,12 +196,18 @@ class TestWsHosts(_Env):
             self.assertEqual(res["workspace"], "w1")
             self.assertEqual(res["owner"], "dev-a")
             ids = {h["device_id"] for h in res["hosts"]}
-            self.assertEqual(ids, {"dev-a", "dev-b"})
+            # admin Bearer caller -> local host self row always present
+            self.assertEqual(len(ids), 3)
+            self.assertIn("dev-a", ids)
+            self.assertIn("dev-b", ids)
+            self_row = next(h for h in res["hosts"] if h["self"])
+            self.assertTrue(self_row["online"])
             b = next(h for h in res["hosts"]
                      if h["device_id"] == "dev-b")
             self.assertEqual(b["leases"][0]["session"], "s1")
-            self.assertEqual(b["status"], "busy")
             self.assertFalse(b["online"])  # no live stream attached
+            # disconnected member: stale "busy" forced offline (#45)
+            self.assertEqual(b["status"], "offline")
         finally:
             srv.close()
 
@@ -378,6 +384,280 @@ class TestHubLinksAndSwitch(_Env):
             self.assertEqual(res["error"], "wip_unpushed")
         finally:
             ha.session_host_switch_fn = None
+            srv.close()
+
+
+class TestWsHostsR08(_Env):
+    """agents-relay#45 contract: self-row, offline forcing, allowlist,
+    device admission, spoke relay, validation, SSE isolation."""
+
+    def test_admin_self_row_on_local_workspace(self):
+        # a local-policy ws admits zero devices — the admin Bearer
+        # caller still gets a self row and never hub_offline
+        self._ws("w1")
+        srv = _Srv(_cfg())
+        try:
+            st, res = srv.req(
+                "GET", "/v1/workspaces/w1/hosts",
+                headers={"Authorization": "Bearer expected"})
+            self.assertEqual(st, 200, res)
+            self.assertFalse(res["hub_offline"])
+            self.assertEqual(len(res["hosts"]), 1)
+            self_row = res["hosts"][0]
+            self.assertTrue(self_row["self"])
+            self.assertTrue(self_row["online"])
+            self.assertEqual(self_row["role"], "host")
+        finally:
+            srv.close()
+
+    def test_default_host_joins_members(self):
+        self._ws("w1", sync_policy="synced", sync_hosts=["dev-a"],
+                 default_host="dev-dh")
+        srv = _Srv(_cfg())
+        try:
+            st, res = srv.req(
+                "GET", "/v1/workspaces/w1/hosts",
+                headers={"Authorization": "Bearer expected"})
+            self.assertEqual(st, 200, res)
+            dh = next(h for h in res["hosts"]
+                      if h["device_id"] == "dev-dh")
+            self.assertEqual(dh["role"], "default")
+            self.assertEqual(dh["status"], "offline")
+            self.assertFalse(dh["online"])
+        finally:
+            srv.close()
+
+    def test_device_caller_requires_ws_admission(self):
+        self._ws("w1", sync_policy="synced", sync_hosts=["dev-a"])
+        devices.mint_device(device_id="dev-a", label="a")
+        outsider = devices.mint_device(device_id="dev-z", label="z")
+        srv = _Srv(_cfg())
+        try:
+            st, res = srv.req(
+                "GET", "/v1/workspaces/w1/hosts",
+                headers={"Authorization":
+                         f"Bearer {outsider['device_token']}"})
+            self.assertEqual(st, 403)
+            # admitted device reads the map and sees itself
+            tok = devices._read_secret("dev-a")
+            st, res = srv.req(
+                "GET", "/v1/workspaces/w1/hosts",
+                headers={"Authorization": f"Bearer {tok}"})
+            self.assertEqual(st, 200, res)
+            self_row = next(h for h in res["hosts"] if h["self"])
+            self.assertEqual(self_row["device_id"], "dev-a")
+            self.assertTrue(self_row["online"])
+        finally:
+            srv.close()
+
+    def test_spoke_relays_hub_map_with_self_stamp(self):
+        import agents_relay.http_adapter as ha
+
+        self._ws("w1", sync_policy="synced", sync_hosts=["dev-a"])
+        spoke_map = {
+            "hosts": [{"device_id": "dev-a", "label": "a",
+                       "role": "member", "self": False,
+                       "online": True, "via": "channel",
+                       "last_seen": 1, "status": "online",
+                       "leases": []}],
+            "sync_policy": "synced", "owner": "", "default_host": "",
+            "hub_offline": False}
+        ha.spoke_hosts_fn = lambda ws_id: dict(spoke_map)
+        srv = _Srv(_cfg())
+        try:
+            st, res = srv.req(
+                "GET", "/v1/workspaces/w1/hosts",
+                headers={"Authorization": "Bearer expected"})
+            self.assertEqual(st, 200, res)
+            self.assertFalse(res["hub_offline"])
+            ids = {h["device_id"] for h in res["hosts"]}
+            self.assertIn("dev-a", ids)
+            # admin caller's own self row appended to the relayed map
+            self_row = next(h for h in res["hosts"] if h["self"])
+            self.assertTrue(self_row["online"])
+        finally:
+            ha.spoke_hosts_fn = None
+            srv.close()
+
+    def test_spoke_configured_no_link_shows_hub_offline(self):
+        from agents_relay.channel_client import _store_hubs
+
+        self._ws("w1", sync_policy="synced", sync_hosts=["dev-a"])
+        _store_hubs({"hubx": {"hub_url": "http://h:8787",
+                              "device_id": "dev-me", "label": "vps",
+                              "connected_at": 1, "last_seq": 0}})
+        srv = _Srv(_cfg())
+        try:
+            st, res = srv.req(
+                "GET", "/v1/workspaces/w1/hosts",
+                headers={"Authorization": "Bearer expected"})
+            self.assertEqual(st, 200, res)
+            self.assertTrue(res["hub_offline"])
+        finally:
+            srv.close()
+
+    def test_hub_devices_rows_carry_allowlist(self):
+        devices.mint_device(device_id="dev-ws", label="w",
+                            role="ws_member", allowlist=["w1"])
+        srv = _Srv(_cfg())
+        try:
+            st, res = srv.req(
+                "GET", "/v1/hub/devices",
+                headers={"Authorization": "Bearer expected"})
+            self.assertEqual(st, 200)
+            row = next(r for r in res["devices"]
+                       if r["id"] == "dev-ws")
+            self.assertEqual(row["allowlist"], ["w1"])
+        finally:
+            srv.close()
+
+    def test_host_switch_validation(self):
+        srv = _Srv(_cfg())
+        try:
+            auth = {"Authorization": "Bearer expected"}
+            # malformed JSON -> exactly one 400, no double-response
+            conn = HTTPConnection(srv.host, srv.port, timeout=5)
+            conn.request(
+                "POST", "/v1/workspaces/w1/sessions/s1/host",
+                body=b"{not json",
+                headers={**auth,
+                         "Content-Type": "application/json"})
+            resp = conn.getresponse()
+            resp.read()
+            self.assertEqual(resp.status, 400)
+            conn.close()
+            # invalid host id -> 400 before the hook ever runs
+            st, _ = srv.req(
+                "POST", "/v1/workspaces/w1/sessions/s1/host",
+                {"host": "../escape"}, headers=auth)
+            self.assertEqual(st, 400)
+            st, _ = srv.req(
+                "POST", "/v1/workspaces/w1/sessions/s1/host",
+                {"host": "bad host!"}, headers=auth)
+            self.assertEqual(st, 400)
+        finally:
+            srv.close()
+
+    def test_hub_link_delete_validates_hub_id(self):
+        srv = _Srv(_cfg())
+        try:
+            st, _ = srv.req(
+                "DELETE", "/v1/hub/links/bad..id",
+                headers={"Authorization": "Bearer expected"})
+            self.assertEqual(st, 400)
+        finally:
+            srv.close()
+
+    def test_workspace_changed_single_canonical_emit(self):
+        from agents_relay.events import subscribe
+
+        self._ws("w1", sync_policy="synced", sync_hosts=["dev-a"])
+        sub = subscribe(workspace="w1")
+        srv = _Srv(_cfg())
+        try:
+            st, _ = srv.req(
+                "PATCH", "/v1/workspaces/w1",
+                {"sync_hosts": ["dev-a", "dev-b"], "label": "l"},
+                headers={"Authorization": "Bearer expected"})
+            self.assertEqual(st, 200)
+            evts = []
+            while True:
+                try:
+                    evt = sub.queue.get_nowait()
+                except Exception:
+                    break
+                if evt is None:
+                    break
+                if evt.get("kind") == "workspace.changed":
+                    evts.append(evt)
+            self.assertEqual(len(evts), 1)
+            payload = evts[0]["payload"]
+            self.assertEqual(payload["workspace"], "w1")
+            self.assertNotIn("ws", payload)
+            self.assertIn("sync_hosts", payload["fields"])
+        finally:
+            srv.close()
+
+    def test_ws_announce_sse_gated_by_handler_acl(self):
+        from agents_relay.events import subscribe
+
+        hub = channel.hub()
+        sub = subscribe()
+        try:
+            hub.set_ws_handler(lambda did, k, p: False)
+            hub.handle_upstream("dX", [
+                {"kind": "ws:announce",
+                 "payload": {"ws": "w1", "owner": "dX"}}])
+            self.assertTrue(sub.queue.empty())
+            hub.set_ws_handler(lambda did, k, p: True)
+            hub.handle_upstream("dX", [
+                {"kind": "ws:announce",
+                 "payload": {"ws": "w1", "owner": "dX"}}])
+            evt = sub.queue.get(timeout=2)
+            self.assertEqual(evt["kind"], "ws.announced")
+            self.assertEqual(evt["workspace"], "w1")
+        finally:
+            hub.set_ws_handler(None)
+
+    def test_release_holder_emits_lease_changed(self):
+        from agents_relay.events import subscribe
+
+        book = hub_leases()
+        book.acquire("w1", "s1", "dev-h", "r1", ttl=45)
+        book.acquire("w2", "s2", "dev-h", "r2", ttl=45)
+        sub = subscribe()
+        dropped = book.release_holder("dev-h")
+        self.assertEqual(dropped, 2)
+        kinds = set()
+        while True:
+            try:
+                evt = sub.queue.get_nowait()
+            except Exception:
+                break
+            if evt is None:
+                break
+            if evt.get("kind") == "lease.changed" \
+                    and evt["payload"].get("action") == "release":
+                kinds.add(evt["payload"]["ws"])
+        self.assertEqual(kinds, {"w1", "w2"})
+
+    def test_presence_events_fan_out_to_admitting_workspaces(self):
+        from agents_relay.events import subscribe
+
+        self._ws("w1", sync_policy="synced", sync_hosts=["dev-a"])
+        devices.mint_device(device_id="dev-a", label="a")
+        scoped = subscribe(workspace="w1")
+        other = subscribe(workspace="w9")
+        channel.hub()._presence.pop("dev-a", None)
+        channel.hub().note_presence("dev-a", {"status": "idle"})
+        evt = scoped.queue.get(timeout=2)
+        self.assertEqual(evt["kind"], "device.presence")
+        self.assertEqual(evt["workspace"], "w1")
+        self.assertTrue(other.queue.empty())
+
+    def test_presence_fields_bounded(self):
+        hub = channel.hub()
+        hub._presence.pop("dev-cap", None)
+        hub.note_presence("dev-cap", {
+            "status": "x" * 500,
+            "caps": ["c"] * 100})
+        row = hub.presence("dev-cap")
+        self.assertEqual(len(row["status"]), 64)
+        self.assertEqual(len(row["caps"]), 32)
+
+    def test_revoke_drops_presence_row(self):
+        devices.mint_device(device_id="dev-r", label="r")
+        channel.hub().note_presence("dev-r", {"status": "busy"})
+        self.assertTrue(channel.hub().presence("dev-r"))
+        srv = _Srv(_cfg())
+        try:
+            st, _ = srv.req(
+                "DELETE", "/v1/hub/devices/dev-r",
+                headers={"Authorization": "Bearer expected"})
+            self.assertEqual(st, 200)
+            self.assertEqual(channel.hub().presence("dev-r"),
+                             {"connected": False})
+        finally:
             srv.close()
 
 
