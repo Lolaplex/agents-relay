@@ -41,42 +41,77 @@ def _write_secret(device_id: str, value: str) -> None:
     write_secret(_secret_key(device_id), value, scope="host")
 
 
-_LOCK = threading.Lock()
-_cache: dict = {"mtime_ns": -1, "rows": {}}
+# RLock: writers hold it across load->mutate->store while load_devices
+# itself must also read the cache under it (agents-relay#44).
+_LOCK = threading.RLock()
+# Revocation serialization: DELETE /v1/hub/devices/<id> and the channel
+# auto-register in handle_hub_stream hold this across (revoke + remote
+# delete) vs (registry check + remote upsert) — a revoked device can
+# never resurrect its dev-<id> row (agents-relay#44).
+REVOCATION_LOCK = threading.RLock()
+# Keyed by resolved path (env-switch safe), guarded by _LOCK, rows are
+# CLEARED on invalidation — a deleted devices.json (mtime -1) must never
+# resurrect stale rows (agents-relay#44).
+_cache: dict = {"key": "", "mtime_ns": -2, "rows": {}}
+
+
+def _copy_rows(rows: dict) -> dict:
+    """Deep copy — the allowlist list must never be shared by reference."""
+    return {
+        k: {**v, "allowlist": list(v.get("allowlist") or [])}
+        for k, v in rows.items()
+    }
 
 
 def load_devices() -> dict:
     """devices.json rows — mtime-cached so per-request auth does not
     re-read the registry from disk (agents-relay#42)."""
+    path = _path()
     try:
-        mtime = _path().stat().st_mtime_ns
+        mtime = path.stat().st_mtime_ns
     except OSError:
-        mtime = -1
-    if mtime == _cache["mtime_ns"]:
-        return {k: dict(v) for k, v in _cache["rows"].items()}
-    data = read_json(_path()) or {}
-    rows = data.get("devices")
-    out: dict = {}
-    if isinstance(rows, dict):
-        for did, meta in rows.items():
-            if not isinstance(meta, dict):
-                continue
-            out[did] = {
-                "label": str(meta.get("label") or ""),
-                "host_id": str(meta.get("host_id") or ""),
-                "role": str(meta.get("role") or "host"),
-                "created_at": meta.get("created_at") or 0,
-                "last_seen": meta.get("last_seen") or 0,
-                "allowlist": list(meta.get("allowlist") or []),
-            }
-    _cache["mtime_ns"] = mtime
-    _cache["rows"] = out
-    return {k: dict(v) for k, v in out.items()}
+        # Missing registry = zero devices, never cached rows — this is
+        # the resurrection path for a deleted devices.json (#44).
+        with _LOCK:
+            _cache["key"] = str(path)
+            _cache["mtime_ns"] = -1
+            _cache["rows"] = {}
+        return {}
+    key = str(path)
+    with _LOCK:
+        if _cache["key"] != key:
+            _cache["key"] = key
+            _cache["mtime_ns"] = -2
+            _cache["rows"] = {}
+        if mtime == _cache["mtime_ns"]:
+            return _copy_rows(_cache["rows"])
+        data = read_json(path) or {}
+        rows = data.get("devices")
+        out: dict = {}
+        if isinstance(rows, dict):
+            for did, meta in rows.items():
+                if not isinstance(meta, dict):
+                    continue
+                out[did] = {
+                    "label": str(meta.get("label") or ""),
+                    "host_id": str(meta.get("host_id") or ""),
+                    "role": str(meta.get("role") or "host"),
+                    "created_at": meta.get("created_at") or 0,
+                    "last_seen": meta.get("last_seen") or 0,
+                    "allowlist": list(meta.get("allowlist") or []),
+                }
+        _cache["mtime_ns"] = mtime
+        _cache["rows"] = out
+        return _copy_rows(out)
 
 
 def _store(rows: dict) -> None:
     write_json_atomic(_path(), {"devices": rows})
-    _cache["mtime_ns"] = -1  # invalidate
+    # Invalidate fully: a missing file reads mtime -1, which must hit
+    # empty rows — never the pre-write snapshot (agents-relay#44).
+    _cache["key"] = str(_path())
+    _cache["mtime_ns"] = -1
+    _cache["rows"] = {}
 
 
 def mint_device(device_id: str = "", *, label: str = "", host_id: str = "",
@@ -151,9 +186,15 @@ def add_allowlist(device_id: str, ws_id: str) -> bool:
         return False
     with _LOCK:
         rows = load_devices()
-        if device_id not in rows:
+        meta = rows.get(device_id)
+        if meta is None:
             return False
-        al = list(rows[device_id].get("allowlist") or [])
+        al = list(meta.get("allowlist") or [])
+        if not al and str(meta.get("role") or "") != "ws_member":
+            # An empty allowlist means unrestricted — narrowing it to
+            # one ws would silently de-scope a wildcard client
+            # (agents-relay#44). Only ws_member rows are ws-scoped.
+            return True
         if ws not in al:
             al.append(ws)
             rows[device_id]["allowlist"] = al

@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agents_relay import channel, devices
+from agents_workspace import Host
 from agents_relay.channel_client import ChannelClient, _store_hubs
 from agents_relay.config import RelayConfig
 from agents_relay.http_adapter import serve_http
@@ -449,6 +450,11 @@ class TestChannelWire(unittest.TestCase):
     def test_lease_acquire_contend_release(self):
         res_a = self._redeem_device()
         res_b = self._redeem_device()
+        # ws.allows_device is the lease boundary (agents-relay#44):
+        # register w1 as synced with both devices in sync_hosts.
+        host = Host.from_env()
+        host.create("w1", "w1", sync_policy="synced",
+                    sync_hosts=[res_a["device_id"], res_b["device_id"]])
         auth_a = {"Authorization": f"Bearer {res_a['token']}"}
         auth_b = {"Authorization": f"Bearer {res_b['token']}"}
         st, g = self.srv.req(

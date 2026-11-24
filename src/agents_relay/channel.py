@@ -71,12 +71,19 @@ class DeviceLink:
     generation: int = 0
 
     def push(self, msg: dict[str, Any], lock: threading.Lock) -> None:
-        """Seq + replay + enqueue under the hub lock (agents-relay#42)."""
+        """Seq + replay + enqueue under the hub lock (agents-relay#42).
+
+        Only replayed kinds consume ``chan.seq``: an ephemeral rpc-req
+        that bumped the cursor would poison the ``?since=`` resume
+        check (a client cursor behind it looks "ahead" of every ring
+        entry) without ever being replayable (agents-relay#44)."""
         with lock:
-            self.chan.seq += 1
-            msg = dict(msg, seq=self.chan.seq)
             if msg.get("kind") in _REPLAYED_KINDS:
+                self.chan.seq += 1
+                msg = dict(msg, seq=self.chan.seq)
                 self.chan.replay.append((self.chan.seq, msg))
+            else:
+                msg = dict(msg, seq=self.chan.seq)
         try:
             self.queue.put_nowait(msg)
         except queue.Full:
@@ -287,6 +294,19 @@ class ChannelHub:
                         not str(payload.get("id") or "").strip():
                     malformed += 1
                     continue
+                if kind == "approval-res":
+                    # Forgery guard (agents-relay#44): only a client
+                    # device the approval's workspace actually allows may
+                    # push a terminal decision — anything else is a
+                    # self-approval/cross-ws spoof and is dropped.
+                    if not _approval_res_allowed(device_id, payload):
+                        malformed += 1
+                        continue
+                else:
+                    # The authenticated sender is authoritative — a
+                    # caller can never mirror an ask under another
+                    # device id (agents-relay#44).
+                    payload["__device"] = device_id
                 # handler owns semantics: req mirrors pending state, res
                 # applies the mirror decision + forwards to payload.device
                 if self._approval_handler is not None:
@@ -331,6 +351,37 @@ class ChannelHub:
                 self._pending.pop((device_id, rpc_id), None)
 
 
+def _approval_res_allowed(device_id: str, payload: dict[str, Any]) -> bool:
+    """Terminal-decision gate for upstream ``approval-res`` frames.
+
+    All four must hold (agents-relay#44): the caller is a paired
+    ``role="client"`` device, the approval id is well-formed, the status
+    is a real terminal decision, and the frame's workspace actually
+    allows the caller (``ws.allows_device``). Anything else is a forged
+    self-approval or a cross-workspace spoof — refuse it.
+    """
+    from .approvals import APPROVAL_ID_RE
+    from .devices import load_devices
+    from .workspaces import get_workspace
+
+    aid = str(payload.get("id") or "")
+    status = str(payload.get("status") or "")
+    if not APPROVAL_ID_RE.match(aid) or status not in ("approved", "denied"):
+        return False
+    meta = load_devices().get(device_id) or {}
+    if str(meta.get("role") or "") != "client":
+        return False
+    ws_id = str(payload.get("ws") or payload.get("workspace") or "")
+    try:
+        ws = get_workspace(ws_id)
+    except (KeyError, ValueError):
+        return False
+    try:
+        return bool(ws.allows_device(device_id))
+    except Exception:  # noqa: BLE001 - policy evaluation fails closed
+        return False
+
+
 _HUB = ChannelHub()
 
 
@@ -355,34 +406,40 @@ def handle_hub_stream(handler: BaseHTTPRequestHandler, device_id: str,
     mgr = hub()
     link, replay, resync = mgr.connect(device_id, since=since)
     # TOCTOU: a device revoked between auth and link registration must
-    # not end up streaming (agents-relay#42).
-    try:
-        from .devices import load_devices
+    # not end up streaming (agents-relay#42). REVOCATION_LOCK serializes
+    # the (registry check + remote auto-register) block against
+    # DELETE /v1/hub/devices/<id> so revocation can never resurrect a
+    # dev-<id> remotes.json row (agents-relay#44).
+    from .devices import REVOCATION_LOCK
 
-        if device_id not in load_devices():
+    with REVOCATION_LOCK:
+        try:
+            from .devices import load_devices
+
+            if device_id not in load_devices():
+                mgr.disconnect(device_id, generation=link.generation)
+                handler.send_error(401, "unauthorized")
+                return
+        except Exception:  # noqa: BLE001 - lookup failure must not open stream
             mgr.disconnect(device_id, generation=link.generation)
-            handler.send_error(401, "unauthorized")
+            handler.send_error(503, "device registry unavailable")
             return
-    except Exception:  # noqa: BLE001 - lookup failure must not open stream
-        mgr.disconnect(device_id, generation=link.generation)
-        handler.send_error(503, "device registry unavailable")
-        return
-    try:
-        from .devices import list_public, touch_device
+        try:
+            from .devices import list_public, touch_device
 
-        touch_device(device_id)
-        # Auto-register a channel remote row so /v1/remote/dev-<id> routes
-        # over this channel without manual UI wiring.
-        from .remotes import upsert_remote
+            touch_device(device_id)
+            # Auto-register a channel remote row so /v1/remote/dev-<id>
+            # routes over this channel without manual UI wiring.
+            from .remotes import upsert_remote
 
-        label = next(
-            (r["label"] for r in list_public() if r["id"] == device_id), "")
-        upsert_remote(handler._cfg(), {  # type: ignore[attr-defined]
-            "id": f"dev-{device_id}", "via": "channel",
-            "device_id": device_id, "label": label or device_id,
-        })
-    except Exception:  # noqa: BLE001 - registration never blocks the stream
-        log.exception("channel remote auto-register failed")
+            label = next(
+                (r["label"] for r in list_public() if r["id"] == device_id), "")
+            upsert_remote(handler._cfg(), {  # type: ignore[attr-defined]
+                "id": f"dev-{device_id}", "via": "channel",
+                "device_id": device_id, "label": label or device_id,
+            })
+        except Exception:  # noqa: BLE001 - registration never blocks the stream
+            log.exception("channel remote auto-register failed")
     try:
         handler.send_response(200)
         handler.send_header("Content-Type", "text/event-stream; charset=utf-8")

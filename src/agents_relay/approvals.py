@@ -399,9 +399,20 @@ def run_local_approve(
     if not APPROVAL_ID_RE.match(ident):
         return 2, "invalid approval id"
     existing = read_approval(config, ident)
-    if existing and existing.get("status") == _APPROVED:
-        return 0, str(existing.get("note") or "approved")
-    if existing and existing.get("status") == _DENIED:
+    if existing and existing.get("status") in (_APPROVED, _DENIED):
+        # Replay guard: a decided id only resolves a request that
+        # matches what was decided — a mismatched/empty stored hash
+        # fails closed, never grants (agents-relay#44).
+        ex_hash = str(existing.get("request_hash") or "")
+        if not ex_hash:
+            ex_req = existing.get("request")
+            if isinstance(ex_req, dict):
+                ex_hash = approval_request_hash(ex_req)
+        if not ex_hash or not hmac.compare_digest(
+                ex_hash, approval_request_hash(request)):
+            return 2, "approval request changed"
+        if existing.get("status") == _APPROVED:
+            return 0, str(existing.get("note") or "approved")
         return 1, str(existing.get("note") or "denied")
     create_pending(config, 0, request)
     status, note = wait_for_decision(

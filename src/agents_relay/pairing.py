@@ -6,6 +6,7 @@ import re
 import secrets
 import threading
 import time
+import urllib.parse
 from typing import Any, Callable
 
 # Excludes visually ambiguous 0/O/1/I characters for manual mobile code entry.
@@ -80,13 +81,10 @@ class PairingStore:
 
         with self._lock:
             self._prune_locked(now_mono)
-            while len(self._entries) >= _MAX_PENDING:
-                oldest = next(iter(self._entries))
-                self._entries.pop(oldest, None)
+            # ws invites and admin pairs cap SEPARATELY (agents-relay#44):
+            # a ws burst evicts only ws invites and an admin burst only
+            # admin entries — neither can starve the other's quota.
             if clean_mode == "ws":
-                # ws invites never displace admin pair codes and are
-                # capped separately — a burst of share links must not
-                # starve operator pairing (agents-relay#42).
                 ws_count = sum(
                     1 for e in self._entries.values()
                     if e["mode"] == "ws")
@@ -96,6 +94,16 @@ class PairingStore:
                         if e["mode"] == "ws")
                     self._entries.pop(oldest, None)
                     ws_count -= 1
+            else:
+                admin_count = sum(
+                    1 for e in self._entries.values()
+                    if e["mode"] != "ws")
+                while admin_count >= _MAX_PENDING:
+                    oldest = next(
+                        k for k, e in self._entries.items()
+                        if e["mode"] != "ws")
+                    self._entries.pop(oldest, None)
+                    admin_count -= 1
             self._entries[pair_id] = {
                 "token": token,
                 "code": code,
@@ -108,9 +116,17 @@ class PairingStore:
             }
 
         clean_base = (base_url or "").strip().rstrip("/")
-        # One URL shape for both modes: redeem branches on the stored mode,
-        # so the same link pairs a browser (cookie) and a CLI/desktop (token).
-        pair_url = f"{clean_base}/#pair={token}"
+        # The URL shape declares the kind (agents-relay#44): a pasted ws
+        # link must announce mode + workspace so the redeeming client
+        # cannot mistake it for an admin pair (and vice versa).
+        if clean_mode == "ws":
+            pair_url = (
+                f"{clean_base}/#kind=ws&ws="
+                f"{urllib.parse.quote(str(ws), safe='')}&pair={token}")
+        elif clean_mode == "remote":
+            pair_url = f"{clean_base}/#kind=remote&pair={token}"
+        else:
+            pair_url = f"{clean_base}/#pair={token}"
 
         return {
             "mode": clean_mode,

@@ -192,6 +192,7 @@ def handle_store_append(
     body: Any,
     *,
     persona: str = "",
+    device_id: str = "",
 ) -> tuple[int, dict[str, Any]]:
     mods = _load_store_modules()
     if mods is None:
@@ -208,7 +209,10 @@ def handle_store_append(
         return 400, {"ok": False, "error": "payload must be an object"}
 
     clean_payload = {k: v for k, v in raw_payload.items() if k != "actor"}
-    actor = resolve_store_actor(ws, persona=persona)
+    # A paired device caller signs with its own identity — the host DID
+    # must never sign a device-initiated write (agents-relay#44).
+    actor = (f"device:{device_id.strip()}" if (device_id or "").strip()
+             else resolve_store_actor(ws, persona=persona))
 
     conn = _open_store(db_mod, ws)
     try:

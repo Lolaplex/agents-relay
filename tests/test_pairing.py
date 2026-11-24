@@ -150,10 +150,11 @@ class TestPairing(unittest.TestCase):
                 headers={"Authorization": "Bearer expected"},
             )
             self.assertEqual(st, 200)
-            # Remote pairs mint the same absolute /#pair= link shape as web —
-            # redeem branches on the stored mode, not the URL.
+            # Remote pairs declare their kind in the link shape —
+            # redeem branches on the stored mode AND the URL marker.
             self.assertTrue(
-                created["pair_url"].startswith(f"http://{srv.host}:{srv.port}/#pair="),
+                created["pair_url"].startswith(
+                    f"http://{srv.host}:{srv.port}/#kind=remote&pair="),
                 created["pair_url"],
             )
             self.assertEqual(created["expires_in"], 15)  # clamped minimum
@@ -199,7 +200,7 @@ class TestPairing(unittest.TestCase):
                          "X-Device-Id": owner_id})
             self.assertEqual(st, 200)
             self.assertEqual(inv["ws"], "w1")
-            self.assertIn("/#pair=", inv["pair_url"])
+            self.assertIn("/#kind=ws&ws=w1&pair=", inv["pair_url"])
 
             # a different paired device is authenticated but not owner
             st, _, p2 = srv.req("POST", "/v1/pair/create",
@@ -305,7 +306,8 @@ class TestPairing(unittest.TestCase):
             )
             self.assertEqual(st, 200)
             self.assertTrue(
-                res["pair_url"].startswith("https://relay.internal:9443/#pair="),
+                res["pair_url"].startswith(
+                    "https://relay.internal:9443/#kind=remote&pair="),
                 res["pair_url"],
             )
         finally:
@@ -479,8 +481,12 @@ class TestWsInviteHardening(unittest.TestCase):
         self.assertEqual(res["token"], "")
         self.assertEqual(self.grants, [(member["device_id"], "w2",
                                         owner["device_id"])])
-        self.assertIn("w2", (devices.load_devices()
-                             [member["device_id"]]["allowlist"]))
+        # A wildcard remote-role device keeps an EMPTY allowlist —
+        # granting must never silently narrow it to one ws
+        # (agents-relay#44); membership lives in ws.sync_hosts.
+        self.assertEqual(
+            devices.load_devices()[member["device_id"]]["allowlist"],
+            [])
 
     def test_label_forwarded_to_minted_device(self):
         from agents_relay import devices
@@ -490,10 +496,10 @@ class TestWsInviteHardening(unittest.TestCase):
         self._ha.ws_grant_hook = lambda d, w, b: None
         st, _, res = self.srv.req(
             "POST", "/v1/pair/redeem",
-            {"code": inv["code"], "label": "felix-laptop"})
+            {"code": inv["code"], "label": "alice-laptop"})
         self.assertEqual(st, 200)
         meta = devices.load_devices()[res["device_id"]]
-        self.assertEqual(meta["label"], "felix-laptop")
+        self.assertEqual(meta["label"], "alice-laptop")
 
     def test_ws_quota_separate_from_admin_pairs(self):
         store = pairing.PairingStore()

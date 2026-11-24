@@ -36,7 +36,10 @@ _STREAM_PATHS = ("/v1/chat/stream", "/v1/runs/stream", "/v1/stream",
 
 # Upstream content types rewritten to plain text (agents-relay#41):
 # active markup from a compromised remote must never reach the shell.
-_REWRITE_CTYPE = ("text/html", "image/svg+xml")
+# XML dialects are markup too — served XHTML/SVG-as-XML still carries
+# scriptable content (agents-relay#44).
+_REWRITE_CTYPE = ("text/html", "image/svg+xml",
+                  "application/xhtml+xml", "application/xml", "text/xml")
 _SAFE_CTYPE = "text/plain; charset=utf-8"
 _PROXY_CSP = "sandbox; default-src 'none'"
 
@@ -325,6 +328,23 @@ def _forward_query(raw_path: str) -> str:
     return urllib.parse.urlencode(kept)
 
 
+def _read_proxy_body(handler: BaseHTTPRequestHandler) -> bytes | None:
+    """Bounded request body for upstream forwarding — malformed or
+    oversized Content-Length raises ValueError (agents-relay#44)."""
+    raw = (handler.headers.get("Content-Length") or "0").strip()
+    try:
+        length = int(raw)
+    except ValueError as exc:
+        raise ValueError("invalid Content-Length") from exc
+    if length < 0:
+        raise ValueError("invalid Content-Length")
+    from .http_adapter import MAX_HTTP_BODY_BYTES
+
+    if length > MAX_HTTP_BODY_BYTES:
+        raise ValueError("request body too large")
+    return handler.rfile.read(length) if length else None
+
+
 def handle_proxy(handler: BaseHTTPRequestHandler, rid: str, rest: str) -> None:
     """Forward ``<method> <rest>`` to the remote with its stored Bearer.
 
@@ -367,8 +387,12 @@ def handle_proxy(handler: BaseHTTPRequestHandler, rid: str, rest: str) -> None:
         return
     url = f"{base_url}{rest}{'?' + qs if qs else ''}"
 
-    length = int(handler.headers.get("Content-Length") or "0")
-    data = handler.rfile.read(length) if length else None
+    try:
+        data = _read_proxy_body(handler)
+    except ValueError as exc:
+        handler._write_json({"ok": False, "error": str(exc)},  # type: ignore[attr-defined]
+                            413 if "too large" in str(exc) else 400)
+        return
     from . import __version__
 
     req = urllib.request.Request(
@@ -445,8 +469,12 @@ def _proxy_via_channel(
         handler._write_json({"ok": False, "error": "channel remote missing device_id"}, 400)  # type: ignore[attr-defined]
         return
     path = rest + ("?" + qs if qs else "")
-    length = int(handler.headers.get("Content-Length") or "0")
-    data = handler.rfile.read(length) if length else None
+    try:
+        data = _read_proxy_body(handler)
+    except ValueError as exc:
+        handler._write_json({"ok": False, "error": str(exc)},  # type: ignore[attr-defined]
+                            413 if "too large" in str(exc) else 400)
+        return
     req: dict = {"method": handler.command, "path": path}
     if data is not None:
         import base64
@@ -504,7 +532,10 @@ def _proxy_via_channel(
             handler.wfile.write(body)
         for fr in frames:
             if "chunk_b64" in fr:
-                handler.wfile.write(_b64decode(str(fr["chunk_b64"])))
+                try:
+                    handler.wfile.write(_b64decode(str(fr["chunk_b64"])))
+                except ValueError:
+                    break  # garbage mid-stream — stop, partial already out
                 handler.wfile.flush()
             elif "chunk" in fr:
                 handler.wfile.write(str(fr["chunk"]).encode("utf-8"))
