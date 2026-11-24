@@ -118,6 +118,8 @@ class ChannelHub:
         self._ack_handler = None
         self._ws_handler = None
         self._connect_handler = None
+        self._approval_handler = None
+        self._presence: dict[str, dict[str, Any]] = {}
 
     # -- link lifecycle -------------------------------------------------
 
@@ -181,6 +183,50 @@ class ChannelHub:
                 return  # a newer stream already replaced us
             del self._links[device_id]
         self._poison(link.queue)  # release the SSE generator
+        try:
+            from .events import emit_event
+
+            emit_event("device.disconnected",
+                       {"device_id": device_id})
+        except Exception:  # noqa: BLE001 - events never block transport
+            pass
+
+    # -- presence ----------------------------------------------------------
+
+    def note_presence(self, device_id: str, payload: dict[str, Any]) -> None:
+        """Inbound ``presence`` frame: last_seen + status/caps, rate-
+        bounded — a chatty device cannot flood the events bus
+        (agents-relay#43)."""
+        now = time.time()
+        with self._lock:
+            prev = self._presence.get(device_id) or {}
+            # one presence event per device per second max
+            if now - float(prev.get("_emitted") or 0.0) < 1.0:
+                self._presence[device_id] = {
+                    "ts": now, "_emitted": prev.get("_emitted") or 0.0,
+                    "status": str(payload.get("status") or "online"),
+                    "caps": payload.get("caps") or []}
+                return
+            self._presence[device_id] = {
+                "ts": now, "_emitted": now,
+                "status": str(payload.get("status") or "online"),
+                "caps": payload.get("caps") or []}
+        try:
+            from .events import emit_event
+
+            emit_event("device.presence", {
+                "device_id": device_id,
+                "status": self._presence[device_id]["status"],
+                "ts": now})
+        except Exception:  # noqa: BLE001
+            pass
+
+    def presence(self, device_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = dict(self._presence.get(device_id) or {})
+        row.pop("_emitted", None)
+        row["connected"] = self.is_connected(device_id)
+        return row
 
     def link(self, device_id: str) -> DeviceLink | None:
         with self._lock:
@@ -289,6 +335,17 @@ class ChannelHub:
                     continue
                 if self._ws_handler is not None:
                     self._ws_handler(device_id, kind, payload)
+                try:
+                    from .events import emit_event
+
+                    emit_event(
+                        "ws.announced" if kind == "ws:announce"
+                        else "ws.revoked",
+                        {"device_id": device_id,
+                         "ws": str(payload.get("ws") or "")},
+                        workspace=str(payload.get("ws") or ""))
+                except Exception:  # noqa: BLE001
+                    pass
             elif kind in ("approval-req", "approval-res"):
                 if not isinstance(payload.get("id"), str) or \
                         not str(payload.get("id") or "").strip():
@@ -312,7 +369,7 @@ class ChannelHub:
                 if self._approval_handler is not None:
                     self._approval_handler(device_id, kind, payload)
             elif kind == "presence":
-                pass
+                self.note_presence(device_id, payload)
         return {"acked": acked, "malformed": malformed}
 
     # -- rpc plane --------------------------------------------------------
@@ -460,6 +517,12 @@ def handle_hub_stream(handler: BaseHTTPRequestHandler, device_id: str,
             "hello", {"device_id": device_id, "generation": link.generation,
                       "seq": link.seq})))
         handler.wfile.flush()
+        try:
+            from .events import emit_event
+
+            emit_event("device.connected", {"device_id": device_id})
+        except Exception:  # noqa: BLE001
+            pass
         try:
             fn = getattr(mgr, "_connect_handler", None)
             if fn is not None:

@@ -295,7 +295,15 @@ class TestChannelHub(unittest.TestCase):
             self.assertEqual(events.disconnect_tag("d1"), 1)
             hub.disconnect("d1")
 
-            self.assertIsNone(sub.queue.get(timeout=1.0))
+            # drain past ws-scoped lease.changed events -> the poison
+            # sentinel is the last item the sub ever sees (revoke kills
+            # the stream regardless of queued events)
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if sub.queue.get(timeout=1.0) is None:
+                    break
+            else:
+                self.fail("tagged subscription never poisoned")
             self.assertIsNone(link.queue.get(timeout=1.0))
             # lease slot is free for a new holder
             g2 = hub_leases().acquire("w1", "s1", "d2")

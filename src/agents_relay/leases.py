@@ -23,6 +23,19 @@ from pathlib import Path
 TTL_SEC = 45.0
 
 
+def _emit_lease(action: str, ws: str, session: str, holder: str,
+                run_id: str = "") -> None:
+    """lease.changed SSE for presence/host surfaces (agents-relay#43)."""
+    try:
+        from .events import emit_event
+
+        emit_event("lease.changed", {
+            "action": action, "ws": ws, "session": session,
+            "holder": holder, "run_id": run_id}, workspace=str(ws or ""))
+    except Exception:  # noqa: BLE001 - events never block leasing
+        pass
+
+
 class LeaseBook:
     """In-memory lease slots; only the fence high-water mark persists.
 
@@ -120,6 +133,7 @@ class LeaseBook:
                 "fence": self._fence, "expires_mono": now + ttl,
             }
             self._slots[key] = cur
+            _emit_lease("acquire", ws, session, holder, run_id)
             return {"granted": True, "fence": self._fence,
                     "expires_in": ttl}
 
@@ -142,6 +156,8 @@ class LeaseBook:
             if cur is not None and cur["holder"] == holder \
                     and cur["fence"] == int(fence):
                 del self._slots[key]
+                _emit_lease("release", ws, session, holder,
+                            cur.get("run_id") or "")
             return {"released": True}
 
     def release_holder(self, holder: str) -> int:
