@@ -54,6 +54,11 @@ _NO_CACHE = frozenset({".html", ".js", ".css", ".webmanifest"})
 _ACTIVE: dict[str, dict[str, Any]] = {}
 _ACTIVE_LOCK = threading.Lock()
 
+# fn(run_id, entry) fires once the driver thread finishes the turn —
+# the release point for session leases held over an async run
+# (klanker#148). entry["meta"] carries session/workspace.
+run_done_hook = None
+
 # Event buffer cap per run: deltas are small but long turns are not bounded;
 # an attach that starts mid-run replays only the tail. Trailer/start/meta are
 # always kept (replayed first, marked replayed).
@@ -605,6 +610,11 @@ def _drive_run(run: str, entry: dict[str, Any], params: Any, config: Any) -> Non
             entry["done"] = True
             entry["done_at"] = time.monotonic()
             entry["cond"].notify_all()
+        if run_done_hook is not None:
+            try:
+                run_done_hook(run, entry)
+            except Exception:  # noqa: BLE001 - lease release never kills reap
+                pass
         _schedule_reap(run, entry)
 
 

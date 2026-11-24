@@ -29,7 +29,8 @@ log = logging.getLogger(__name__)
 
 ENVELOPE_V = 1
 KINDS = frozenset({"hello", "presence", "op", "rpc-req", "rpc-res", "ack",
-                   "resync", "ws:announce", "ws:revoke"})
+                   "resync", "ws:announce", "ws:revoke",
+                   "approval-req", "approval-res"})
 REPLAY_LIMIT = 2000
 RPC_TIMEOUT_SEC = 30.0
 RPC_STREAM_TIMEOUT_SEC = 600.0
@@ -43,9 +44,13 @@ def envelope(kind: str, payload: dict[str, Any], *, ch: str = "", seq: int = 0,
 
 # Ephemeral kinds never enter the replay ring (agents-relay#42): a
 # reconnecting device must not re-execute rpc requests; rpc-res is
-# upstream-only, resync is a marker.
+# upstream-only, resync is a marker. approval-* DO replay — both sides
+# apply them idempotently by approval id, and a device offline at
+# decision time must still learn the terminal state on reconnect or its
+# wait_for_decision blocks until timeout (klanker#148).
 _REPLAYED_KINDS = frozenset({"hello", "presence", "op", "ack",
-                             "ws:announce", "ws:revoke"})
+                             "ws:announce", "ws:revoke",
+                             "approval-req", "approval-res"})
 
 
 @dataclass
@@ -231,6 +236,12 @@ class ChannelHub:
         (ws:announce is fire-once-per-member-set, klanker#145)."""
         self._connect_handler = fn
 
+    def set_approval_handler(self, fn) -> None:
+        """fn(device_id, kind, payload) receives upstream approval-req
+        mirrors (klanker#148); approval-res frames are forwarded to the
+        device named in ``payload["device"]`` — the hub just routes."""
+        self._approval_handler = fn
+
     def handle_upstream(self, device_id: str, msgs: list[dict[str, Any]]) -> dict[str, Any]:
         """Device POSTed envelopes: route rpc-res to pending calls, ack ops,
         forward ops to other devices (allowlist-filtered upstream)."""
@@ -271,6 +282,15 @@ class ChannelHub:
                     continue
                 if self._ws_handler is not None:
                     self._ws_handler(device_id, kind, payload)
+            elif kind in ("approval-req", "approval-res"):
+                if not isinstance(payload.get("id"), str) or \
+                        not str(payload.get("id") or "").strip():
+                    malformed += 1
+                    continue
+                # handler owns semantics: req mirrors pending state, res
+                # applies the mirror decision + forwards to payload.device
+                if self._approval_handler is not None:
+                    self._approval_handler(device_id, kind, payload)
             elif kind == "presence":
                 pass
         return {"acked": acked, "malformed": malformed}

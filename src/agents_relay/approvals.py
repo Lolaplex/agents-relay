@@ -40,6 +40,13 @@ _APPROVED = "approved"
 _DENIED = "denied"
 _TIMEOUT = "timeout"
 
+# Approval mirror hooks (klanker#148): a shared-workspace spoke mirrors
+# pending asks onto the hub over the channel (approval-req) so the
+# operator sees them on whichever host's UI is open; decisions ride
+# back as approval-res frames. klanker serve wires both.
+on_pending_fn = None   # fn(record) — freshly-pending local approval
+on_decided_fn = None   # fn(record) — terminal local decision to relay
+
 
 def approval_tokens_dir(config: RelayConfig | None = None) -> Path:
     return approval_dir(config) / "tokens"
@@ -202,6 +209,7 @@ def create_pending(
     *,
     workspace: str = "",
     token_hash: str = "",
+    from_mirror: bool = False,
 ) -> dict:
     ident = str(request.get("id") or "")
     eff_ws = (workspace or str(request.get("workspace") or "")).strip()
@@ -231,6 +239,11 @@ def create_pending(
         from .push import notify_approval_pending
 
         notify_approval_pending(config, {**request, "id": ident}, ws_ref=eff_ws)
+        if not from_mirror and on_pending_fn is not None:
+            try:
+                on_pending_fn(updated)
+            except Exception:  # noqa: BLE001 - mirror never blocks the ask
+                pass
     return updated or {}
 
 
@@ -242,6 +255,7 @@ def record_decision(
     note: str,
     decided_by: int | None,
     expected_chat_id: int | None = None,
+    from_mirror: bool = False,
 ) -> dict | None:
     """Write a terminal status if the record is still pending. None if rejected."""
     changed = False
@@ -267,6 +281,11 @@ def record_decision(
     updated = _mutate(config, ident, _apply)
     if not changed:
         return None
+    if not from_mirror and on_decided_fn is not None:
+        try:
+            on_decided_fn(updated)
+        except Exception:  # noqa: BLE001 - mirror never blocks the decision
+            pass
     return updated
 
 

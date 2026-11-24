@@ -217,6 +217,13 @@ def _rpc_http(params: dict, cfg: RelayConfig) -> Iterator[dict]:
         headers["Content-Type"] = str(req["content_type"])
     if req.get("accept"):
         headers["Accept"] = str(req["accept"])
+    if req.get("x_klanker_hop"):
+        # hop-count survives the channel hop so a bounced dispatch on the
+        # target hits its loop guard instead of proxying again (klanker#148)
+        try:
+            headers["X-Klanker-Hop"] = str(int(req["x_klanker_hop"]))
+        except (TypeError, ValueError):
+            pass
 
     url = f"http://127.0.0.1:{cfg.relay_port}{path}{sep + query if sep else ''}"
     hreq = urllib.request.Request(url, data=data, method=method, headers=headers)
@@ -305,6 +312,7 @@ class ChannelClient:
         self.on_ack = None   # fn(payload) — wired by the sync layer
         self.on_ws = None    # fn(kind, payload) — ws-share control frames
         self.on_hello = None  # fn(payload) — reconnect catch-up trigger
+        self.on_approval = None  # fn(kind, payload) — approval mirror/decision
 
     def _persist_seq(self, force: bool = False) -> None:
         """Flush the resume cursor so a restart replays only the tail."""
@@ -456,6 +464,9 @@ class ChannelClient:
                     elif kind in ("ws:announce", "ws:revoke"):
                         if self.on_ws is not None:
                             self.on_ws(kind, msg.get("payload") or {})
+                    elif kind in ("approval-req", "approval-res"):
+                        if self.on_approval is not None:
+                            self.on_approval(kind, msg.get("payload") or {})
                     elif kind == "resync":
                         self.last_seq = 0  # full resync handled by op-log layer
                     # hello/presence are informational only

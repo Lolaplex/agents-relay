@@ -196,7 +196,7 @@ def _proxy_allowed(ctx: dict) -> bool:
 # ws_member path whitelist (agents-relay#41): channel frames + ws-scoped
 # app reads/writes inside the allowlist — everything else is denied.
 _WS_MEMBER_ALWAYS = frozenset({
-    "/v1/hub/stream", "/v1/hub/send", "/v1/hub/lease",
+    "/v1/hub/stream", "/v1/hub/send", "/v1/hub/lease", "/v1/hub/leases",
     "/v1/auth/status", "/health", "/v1/pair/redeem",
 })
 _WS_MEMBER_TURN = frozenset({
@@ -442,6 +442,29 @@ ws_grant_hook = None    # fn(device_id, ws_id, granted_by) -> None
 # fn(handler, path, body) -> bool, True when the request was proxied to
 # the session's bound host via the hub channel.
 remote_turn_dispatch = None
+# GET-shaped entry points (/v1/runs/stream): same session:host routing,
+# query instead of body (klanker#148).
+remote_query_dispatch = None
+# Run-lock lease guards: acquire before the first local turn execution
+# returns {error payload}->write 409, release runs at turn end. Klanker
+# wires both for hub AND spoke executors (klanker#148, klanker#136).
+turn_lease_hook = None        # fn(handler, body, ctx) -> dict|None
+turn_lease_release_hook = None  # fn(body, ctx) -> None
+
+
+def _turn_lease_conflict(handler, body: dict) -> bool:
+    """Acquire the (ws, session) run lease; True = conflict written."""
+    if turn_lease_hook is None:
+        return False
+    try:
+        conflict = turn_lease_hook(handler, body, handler._auth_ctx())  # type: ignore[attr-defined]
+    except Exception as exc:  # noqa: BLE001 - lease infra must fail loud, not run twice
+        log.warning("turn lease hook failed: %s", exc)
+        conflict = {"ok": False, "error": "lease_unavailable"}
+    if conflict:
+        handler._write_json(conflict, int(conflict.get("status") or 409))  # type: ignore[attr-defined]
+        return True
+    return False
 
 
 class TurnHandler(BaseHTTPRequestHandler):
@@ -942,7 +965,7 @@ class TurnHandler(BaseHTTPRequestHandler):
             body = self._read_json()
             if body is None:
                 return
-            from .leases import hub_leases
+            from .leases import default_ttl, hub_leases
 
             book = hub_leases()
             action = str(body.get("action") or "")
@@ -950,6 +973,9 @@ class TurnHandler(BaseHTTPRequestHandler):
             session = str(body.get("session") or "")
             if not ws or not session:
                 self.send_error(400, "ws and session required")
+                return
+            if not _ws_allowed(self._auth_ctx(), ws):
+                self.send_error(403, "workspace not in allowlist")
                 return
             fence = 0
             if action in ("renew", "release"):
@@ -966,10 +992,12 @@ class TurnHandler(BaseHTTPRequestHandler):
                     self.send_error(400, "fence must be positive")
                     return
             if action == "acquire":
-                out = book.acquire(ws, session, did,
-                                   str(body.get("run_id") or ""))
+                out = book.acquire(
+                    ws, session, did, str(body.get("run_id") or ""),
+                    ttl=default_ttl(ws))
             elif action == "renew":
-                out = book.renew(ws, session, did, fence)
+                out = book.renew(ws, session, did, fence,
+                                 ttl=default_ttl(ws))
             elif action == "release":
                 out = book.release(ws, session, did, fence)
             else:
@@ -1256,6 +1284,8 @@ class TurnHandler(BaseHTTPRequestHandler):
             if remote_turn_dispatch is not None and remote_turn_dispatch(
                     self, path, body):
                 return
+            if _turn_lease_conflict(self, body):
+                return
             handle_chat_stream(self, body)
             return
 
@@ -1265,6 +1295,11 @@ class TurnHandler(BaseHTTPRequestHandler):
                 return
             body = self._read_json()
             if body is None:
+                return
+            # a bound session's stop must reach the executing host —
+            # local _ACTIVE has nothing for remote runs (klanker#148)
+            if remote_turn_dispatch is not None and remote_turn_dispatch(
+                    self, path, body):
                 return
             handle_chat_stop(self, body)
             return
@@ -1342,7 +1377,16 @@ class TurnHandler(BaseHTTPRequestHandler):
             if remote_turn_dispatch is not None and remote_turn_dispatch(
                     self, path, body):
                 return
-            self._handle_stream(body)
+            if _turn_lease_conflict(self, body):
+                return
+            try:
+                self._handle_stream(body)
+            finally:
+                if turn_lease_release_hook is not None:
+                    try:
+                        turn_lease_release_hook(body, self._auth_ctx())
+                    except Exception:  # noqa: BLE001
+                        pass
             return
 
         if path.startswith("/v1/webhook/"):
@@ -1375,6 +1419,8 @@ class TurnHandler(BaseHTTPRequestHandler):
                     return
             except Exception as exc:  # noqa: BLE001
                 log.warning("remote turn dispatch failed: %s", exc)
+        if path == "/v1/turn" and _turn_lease_conflict(self, body):
+            return
         is_alert = path in ("/v1/alert", "/webhook/alert")
         channel = str(body.get("channel") or ("webhook" if is_alert else "http"))
         user = str(body.get("user") or ("alert" if is_alert else "anonymous"))
@@ -1438,6 +1484,12 @@ class TurnHandler(BaseHTTPRequestHandler):
             log.exception("turn failed")
             self.send_error(500, str(exc))
             return
+        finally:
+            if path == "/v1/turn" and turn_lease_release_hook is not None:
+                try:
+                    turn_lease_release_hook(body, self._auth_ctx())
+                except Exception:  # noqa: BLE001
+                    pass
 
         notified = False
         delivered: list[int] = []
@@ -2258,6 +2310,11 @@ class TurnHandler(BaseHTTPRequestHandler):
             if not _check_secret(self, self.relay_secret, query_params):
                 self.send_error(401, "unauthorized")
                 return
+            # re-attach follows the run's executing host, not the local
+            # (empty) _ACTIVE table (klanker#148)
+            if remote_query_dispatch is not None and remote_query_dispatch(
+                    self, path, query_params):
+                return
             handle_runs_attach(self, query_params)
             return
         if path == "/v1/push/vapid-key":
@@ -2386,14 +2443,20 @@ class TurnHandler(BaseHTTPRequestHandler):
             self._write_json({"ok": True, "devices": rows}, 200)
             return
         if path == "/v1/hub/leases":
-            if not _check_secret(self, self.relay_secret, query_params,
-                                 allow_device=False):
+            if not _check_secret(self, self.relay_secret, query_params):
                 self.send_error(401, "unauthorized")
                 return
             from .leases import hub_leases
 
-            self._write_json(
-                {"ok": True, "leases": hub_leases().snapshot()}, 200)
+            ctx = self._auth_ctx()
+            allow = None
+            if ctx.get("role") == "ws_member":
+                # lease rows are workspace-scoped — a guest reads only
+                # its own allowlisted workspaces (klanker#148)
+                allow = set(ctx.get("allowlist") or ())
+            rows = [s for s in hub_leases().snapshot()
+                    if allow is None or s.get("ws") in allow]
+            self._write_json({"ok": True, "leases": rows}, 200)
             return
         if path == "/v1/discover":
             if not _check_secret(self, self.relay_secret, query_params,

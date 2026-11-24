@@ -477,8 +477,13 @@ class TestChannelWire(unittest.TestCase):
             headers={"Authorization": "Bearer expected"})
         self.assertEqual(st, 200)
         self.assertEqual(snap["leases"][0]["session"], "s1")
-        st, _ = self.srv.req("GET", "/v1/hub/leases", headers=auth_b)
-        self.assertEqual(st, 401)
+        # paired devices may READ the lease snapshot (remote lease
+        # checks for session host switching, klanker#148); holder is
+        # already a hash. Mutation stays acquire/renew/release-gated.
+        st, scoped = self.srv.req(
+            "GET", "/v1/hub/leases", headers=auth_b)
+        self.assertEqual(st, 200)
+        self.assertEqual(scoped["leases"][0]["session"], "s1")
         # release frees the slot for the contender
         self.srv.req(
             "POST", "/v1/hub/lease",

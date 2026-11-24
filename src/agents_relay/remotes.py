@@ -414,7 +414,9 @@ def handle_proxy(handler: BaseHTTPRequestHandler, rid: str, rest: str) -> None:
         streamed = any(rest.startswith(p) for p in _STREAM_PATHS)
         sent = 0
         while True:
-            chunk = upstream.read(8192)
+            # read1: whatever the socket has NOW — read(8192) stalls SSE
+            # deltas until the buffer fills (klanker#148)
+            chunk = upstream.read1(8192)
             if not chunk:
                 break
             sent += len(chunk)
@@ -456,6 +458,12 @@ def _proxy_via_channel(
     accept = (handler.headers.get("Accept") or "").strip()
     if accept:
         req["accept"] = accept
+    hop = (handler.headers.get("X-Klanker-Hop") or "").strip()
+    if hop:
+        try:
+            req["x_klanker_hop"] = int(hop)
+        except ValueError:
+            req["x_klanker_hop"] = 1
 
     frames = hub().rpc_call(device_id, "http", {"req": req}, timeout_sec=600.0)
     first = next(frames, None)
