@@ -26,7 +26,11 @@ jobs:
       - name: Install build tools & dependencies
         env:
           READ_REPO_TOKEN: ${{ secrets.READ_REPO_TOKEN }}
-          SUITE_EXTRA_DEPS: "agents-harness agents-traces"
+          SUITE_EXTRA_DEPS: "agents-harness agents-traces agents-store"
+          AGENTS_WORKSPACE_REF: feat/failclosed-policy-identity-secrets
+          AGENTS_STORE_REF: feat/store-migration-scrub-hlc
+          AGENTS_HARNESS_REF: feat/store-projection-readers
+          AGENTS_TRACES_REF: feat/store-projection-readers
         run: |
           python -m pip install --upgrade pip
           pip install build twine pytest httpx
