@@ -295,6 +295,87 @@ class TestWsMemberRouteBypass(_EnvBase, _PairMixin):
         finally:
             srv.close()
 
+    def test_remote_proxy_member_turn_reaches_channel_spoke(self):
+        srv = _Srv(_cfg())
+        try:
+            _owner, m = self._pair_ws_member(srv)
+            target = self._pair_remote(srv, "target")
+            Host.from_env().create(
+                "w1", "w1", sync_policy="synced",
+                sync_hosts=[m["device_id"], target["device_id"]])
+            from agents_relay import remotes
+            remotes.upsert_remote(
+                srv.server.RequestHandlerClass.config,
+                {"id": "devX", "via": "channel",
+                 "device_id": target["device_id"]})
+            calls = []
+
+            def fake_rpc(device_id, kind, payload, timeout_sec=0):
+                calls.append((device_id, kind, payload, timeout_sec))
+                return iter([{
+                    "status": 200,
+                    "content_type": "application/json",
+                    "body": json.dumps({"ok": True, "spoke": True}),
+                }])
+
+            with patch.object(channel.hub(), "rpc_call", fake_rpc):
+                st, _, res = srv.req(
+                    "POST", "/v1/remote/devX/v1/turn",
+                    {"text": "t", "workspace": "w1"},
+                    headers=self._auth(m))
+            self.assertEqual(st, 200, res)
+            self.assertTrue(res["spoke"])
+            self.assertEqual(len(calls), 1)
+            device_id, kind, payload, _timeout = calls[0]
+            self.assertEqual(device_id, target["device_id"])
+            self.assertEqual(kind, "http")
+            req = payload["req"]
+            self.assertEqual(req["method"], "POST")
+            self.assertEqual(req["path"], "/v1/turn")
+            import base64
+
+            forwarded = json.loads(base64.b64decode(
+                req["body_b64"]).decode("utf-8"))
+            self.assertEqual(forwarded["workspace"], "w1")
+            self.assertEqual(forwarded["text"], "t")
+        finally:
+            srv.close()
+
+    def test_remote_proxy_member_body_scope_fail_closed(self):
+        srv = _Srv(_cfg())
+        try:
+            _owner, m = self._pair_ws_member(srv)
+            target = self._pair_remote(srv, "target")
+            Host.from_env().create(
+                "w1", "w1", sync_policy="synced",
+                sync_hosts=[m["device_id"], target["device_id"]])
+            from agents_relay import remotes
+            remotes.upsert_remote(
+                srv.server.RequestHandlerClass.config,
+                {"id": "devX", "via": "channel",
+                 "device_id": target["device_id"]})
+            calls = []
+
+            def fake_rpc(device_id, kind, payload, timeout_sec=0):
+                calls.append(payload)
+                return iter([{"status": 200, "body": "{}"}])
+
+            bodies = (
+                {"text": "t"},
+                {"text": "t", "workspace": "w2"},
+                {"text": "t", "workspace": "w1", "force": True},
+                {"text": "t", "workspace": "w1", "workdir": "/tmp/x"},
+            )
+            with patch.object(channel.hub(), "rpc_call", fake_rpc):
+                for body in bodies:
+                    st, _, _ = srv.req(
+                        "POST", "/v1/remote/devX/v1/turn", body,
+                        headers=self._auth(m))
+                    self.assertEqual(st, 403, body)
+            self.assertEqual(calls, [])
+        finally:
+            srv.close()
+
 
 class TestTokenQueryBruteforce(_EnvBase):
     """C4: GET /?token= must count against the login throttle."""

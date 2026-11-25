@@ -192,13 +192,13 @@ _MEMBER_PROXY_PATHS = frozenset({
 
 
 def _proxy_allowed(ctx: dict, rid: str = "", rest: str = "",
-                   cfg: Any = None) -> bool:
+                   cfg: Any = None, body: dict | None = None) -> bool:
     """`/v1/remote/*` pivots are operator/host-device surfaces —
-    client and ws_member devices never reach them.
+    client devices never reach them.
 
     ws_member exception (agents-relay#44): Hub→Spoke turn/stream/stop
-    proxy only when an allowlisted ws admits the caller AND the target
-    device is in that ws's sync_hosts."""
+    proxy only when the body is scoped to an allowlisted ws that admits
+    the caller AND the target device is in that same ws's sync_hosts."""
     kind = ctx.get("kind")
     if kind in ("admin", "cookie"):
         return True
@@ -223,19 +223,22 @@ def _proxy_allowed(ctx: dict, rid: str = "", rest: str = "",
         return False
     if not target:
         return False
+    if body is None or _ws_member_body_denied(ctx, body):
+        return False
+    ws_id = _body_ws(body)
+    if not _ws_allowed(ctx, ws_id):
+        return False
     did = str(ctx.get("device_id") or "")
     try:
         from .workspaces import get_workspace
     except ImportError:
         return False
-    for ws_id in ctx.get("allowlist") or ():
-        try:
-            ws = get_workspace(str(ws_id))
-            if ws.allows_device(did) and target in set(ws.sync_hosts or ()):
-                return True
-        except (KeyError, ValueError, OSError):
-            continue
-    return False
+    try:
+        ws = get_workspace(ws_id)
+    except (KeyError, ValueError, OSError):
+        return False
+    return bool(ws.allows_device(did)
+                and target in set(ws.sync_hosts or ()))
 
 
 # ws_member path whitelist (agents-relay#41): channel frames + ws-scoped
@@ -278,11 +281,19 @@ def _ws_member_gate(ctx: dict, method: str, path: str,
     Fail-closed: a ws guest may use channel frames, turn/stream entry
     points (body workspace is verified per-route), own approvals, and
     /v1/workspaces/<member-ws>/* — but never ws deletion, policy keys,
-    or any remote-proxy/admin surface.
+    or admin surfaces. POST remote turn/stream/stop proxying passes this
+    path gate only; `_proxy_allowed` applies the ws/body/target ACL.
     """
     if path in _WS_MEMBER_ALWAYS or path in _WS_MEMBER_TURN:
         return ""
-    if path.startswith("/v1/remote/") or path.startswith("/v1/remotes"):
+    if path.startswith("/v1/remote/"):
+        if method == "POST":
+            rparts = path.split("/", 4)
+            upstream = "/" + rparts[4] if len(rparts) > 4 else "/"
+            if upstream.rstrip("/") in _MEMBER_PROXY_PATHS:
+                return ""
+        return "remote proxy is denied to workspace guests"
+    if path.startswith("/v1/remotes"):
         return "remote proxy is denied to workspace guests"
     if path.startswith("/v1/approvals"):
         return ""
@@ -1500,7 +1511,35 @@ class TurnHandler(BaseHTTPRequestHandler):
                 self.send_error(400, f"invalid remote id: {rid!r}")
                 return
             rest = "/" + rparts[4] if len(rparts) > 4 else "/"
-            if not _proxy_allowed(self._auth_ctx(), rid, rest, self._cfg()):
+            ctx = self._auth_ctx()
+            proxy_body = None
+            if ctx.get("role") == "ws_member":
+                # The proxy forwards raw bytes, so read once here for the
+                # ws ACL and cache them for handle_proxy. Member turn
+                # surfaces are JSON objects; anything else fails closed.
+                from .remotes import _read_proxy_body
+
+                try:
+                    raw_body = _read_proxy_body(self)
+                except ValueError as exc:
+                    self._write_json(
+                        {"ok": False, "error": str(exc)},
+                        413 if "too large" in str(exc) else 400)
+                    return
+                self._proxy_body_read = True
+                self._proxy_body = raw_body
+                try:
+                    proxy_body = (json.loads(raw_body.decode("utf-8"))
+                                  if raw_body else {})
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    self._write_json(
+                        {"ok": False, "error": "invalid json"}, 400)
+                    return
+                if not isinstance(proxy_body, dict):
+                    self._write_json(
+                        {"ok": False, "error": "json object required"}, 400)
+                    return
+            if not _proxy_allowed(ctx, rid, rest, self._cfg(), proxy_body):
                 self.send_error(403, "remote proxy denied")
                 return
             from .remotes import handle_proxy

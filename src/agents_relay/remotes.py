@@ -330,7 +330,13 @@ def _forward_query(raw_path: str) -> str:
 
 def _read_proxy_body(handler: BaseHTTPRequestHandler) -> bytes | None:
     """Bounded request body for upstream forwarding — malformed or
-    oversized Content-Length raises ValueError (agents-relay#44)."""
+    oversized Content-Length raises ValueError (agents-relay#44).
+
+    ws_member ACL checks parse the body before proxying; the route caches
+    those bytes on the one-shot handler so the forwarder still has them.
+    """
+    if getattr(handler, "_proxy_body_read", False):
+        return getattr(handler, "_proxy_body", None)
     raw = (handler.headers.get("Content-Length") or "0").strip()
     try:
         length = int(raw)
