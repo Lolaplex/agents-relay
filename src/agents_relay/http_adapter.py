@@ -2149,18 +2149,26 @@ class TurnHandler(BaseHTTPRequestHandler):
             self.send_error(404, "unknown session")
             return
         payload = {"ok": True, "session": rec}
-        # history = session record + its trace events (lazy traces dep)
+        # history = session record + trace events + synced store msgs the
+        # local trace lacks (lazy traces/store deps)
         try:
             from agents_traces.store import TraceStore
             events = [
                 e.to_dict() if hasattr(e, "to_dict") else dict(e)
                 for e in TraceStore(ws.traces).iter_events(session_id=sid)
             ]
-            payload["events"] = events
         except ImportError:
-            pass
+            events = []
         except Exception as exc:
             log.warning("session events unavailable: %s", exc)
+            events = []
+        try:
+            from .storeproj import union_events
+
+            events = union_events(ws, sid, events)
+        except Exception as exc:
+            log.warning("synced session events unavailable: %s", exc)
+        payload["events"] = events
         self._write_json(payload, 200)
 
     def _handle_traces(self, query_params: dict) -> None:

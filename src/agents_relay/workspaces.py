@@ -228,49 +228,120 @@ def _session_store(ws: Workspace):
     return SessionStore(ws)
 
 
+def _synced_row(ws: Workspace, sid: str, meta: dict, persona: str) -> dict:
+    """Session-record-shaped dict for a synced-only session."""
+    effective = meta.get("persona") or getattr(ws, "default_persona", "") \
+        or "default"
+    row = {
+        "id": sid,
+        "user": str(meta.get("user") or ""),
+        "persona": effective,
+        "workspace": getattr(ws, "id", ""),
+        "synced": True,
+    }
+    for key in ("title", "last_active", "host", "branch", "repo"):
+        if meta.get(key):
+            row[key] = meta[key]
+    if meta.get("wip_unpushed"):
+        row["wip_unpushed"] = True
+    if meta.get("last_active"):
+        row["start_date"] = str(meta["last_active"])[:10]
+    return row
+
+
 def list_sessions(ws: Workspace, persona: str = "", user: str = "",
                   include_empty: bool = False,
                   empty_grace_sec: int = 900) -> list[dict]:
-    rows = [r.to_dict() for r in _session_store(ws).list(persona=persona, user=user)]
+    try:
+        store = _session_store(ws)
+    except RuntimeError:
+        # agents-traces absent: still serve the synced projection —
+        # a hard 501 would blind ws-share peers (agents-relay#45).
+        store = None
+    rows = ([r.to_dict() for r in store.list(persona=persona, user=user)]
+            if store is not None else [])
+    try:
+        from .storeproj import synced_sessions
+
+        synced = synced_sessions(ws)
+    except Exception:
+        synced = {"live": {}, "dead": set()}
+    # Synced tombstones: the projection says every msg is gone, so the
+    # local record must not resurrect the session.
+    dead = synced.get("dead") or set()
+    if dead:
+        rows = [r for r in rows if str(r.get("id") or "") not in dead]
+    # Delegate-channel worker records dropped by the grace filter must
+    # not resurrect via the synced extras union either (agents-relay#45).
+    delegate_ids = {str(r.get("id") or "") for r in rows
+                    if str(r.get("channel") or "") == "delegate"}
     want = {str(r.get("id") or "") for r in rows} - {""}
-    if not want:
-        return rows
     # One pass over the trace store: first user message per session becomes
     # the sidebar title, so clients need no per-session history fetch.
+    # Scan oldest file first so a multi-day session's title is the first
+    # day's prompt, not the newest. Skipped entirely when want is empty —
+    # a synced-only ws must not walk the trace dir (agents-relay#45).
     titles: dict[str, str] = {}
     scan_ok = False
-    try:
-        from agents_traces.store import TraceStore
-        for e in TraceStore(ws.traces).iter_events():
-            sid = e.session
-            if sid not in want or sid in titles or e.type != "message":
-                continue
-            md = e.metadata or {}
-            if md.get("role") != "user":
-                continue
-            text = " ".join(str(md.get("content") or "").split())
-            if text:
-                titles[sid] = text[:160]
-            if len(titles) >= len(want):
-                break
-        for r in rows:
-            title = titles.get(str(r.get("id") or ""))
-            if title:
-                r["title"] = title
-        scan_ok = True
-    except Exception:
-        pass
+    if want:
+        try:
+            from agents_traces.store import TraceStore
+            store_t = TraceStore(ws.traces)
+            files = list(reversed(store_t.list_trace_files()))
+            for e in store_t.iter_events(files=files):
+                sid = e.session
+                if sid not in want or sid in titles or e.type != "message":
+                    continue
+                md = e.metadata or {}
+                if md.get("role") != "user":
+                    continue
+                text = " ".join(str(md.get("content") or "").split())
+                if text:
+                    titles[sid] = text[:160]
+                if len(titles) >= len(want):
+                    break
+            for r in rows:
+                title = titles.get(str(r.get("id") or ""))
+                if title:
+                    r["title"] = title
+            scan_ok = True
+        except Exception:
+            pass
+    # Enrich listed rows with synced state (title/last_active/binding).
+    live_synced = synced.get("live") or {}
+    for r in rows:
+        meta = live_synced.get(str(r.get("id") or ""))
+        if not meta:
+            continue
+        if not r.get("title") and meta.get("title"):
+            r["title"] = meta["title"]
+        for key in ("last_active", "host", "branch", "repo"):
+            if meta.get(key) and not r.get(key):
+                r[key] = meta[key]
+            elif key == "last_active" and meta.get(key) \
+                    and str(meta[key]) > str(r.get(key) or ""):
+                r[key] = meta[key]
+        if meta.get("wip_unpushed") and not r.get("wip_unpushed"):
+            r["wip_unpushed"] = True
     if scan_ok and not include_empty:
         # resolve() mints a record per probe/delegate/test turn; a stale
         # record with no user message, and any delegate-channel worker
         # turn, is sidebar noise. Fresh records stay visible so a session
-        # created via the API shows up before its first message.
+        # created via the API shows up before its first message — and a
+        # row still live in the synced projection stays too (it carries
+        # real activity the local traces lack, agents-relay#45).
         now = datetime.now(timezone.utc)
         kept = []
         for r in rows:
+            rid = str(r.get("id") or "")
+            # delegate rows stay dropped even when the synced
+            # projection still holds their msgs (agents-relay#45)
             if str(r.get("channel") or "") == "delegate":
                 continue
-            if str(r.get("id") or "") in titles:
+            if rid in live_synced:
+                kept.append(r)
+                continue
+            if rid in titles:
                 kept.append(r)
                 continue
             stamp = str(r.get("last_active") or r.get("created_at") or "")
@@ -282,16 +353,95 @@ def list_sessions(ws: Workspace, persona: str = "", user: str = "",
             if age <= empty_grace_sec:
                 kept.append(r)
         rows = kept
-    return rows
+    # Union synced-only sessions: no local record, possibly no local
+    # traces at all (store.db arrived via ws-share). They survive the
+    # grace filter — their last_active comes from the projection.
+    have = {str(r.get("id") or "") for r in rows}
+    extras = []
+    for sid, meta in sorted(
+            live_synced.items(),
+            key=lambda kv: str(kv[1].get("last_active") or ""),
+            reverse=True):
+        if sid in have or sid in delegate_ids:
+            continue
+        mu = str(meta.get("user") or "")
+        # under a user= filter an unstamped synced row leaks — its owner
+        # is unknown, so it must not surface (agents-relay#45)
+        if user and mu != user and not mu.endswith(f":{user}"):
+            continue
+        row = _synced_row(ws, sid, meta, persona)
+        if persona and row["persona"] != persona:
+            continue
+        extras.append(row)
+    out = rows + extras
+    out.sort(
+        key=lambda r: str(r.get("last_active") or r.get("created_at") or ""),
+        reverse=True)
+    return out
 
 
 def get_session(ws: Workspace, persona: str, session_id: str) -> dict | None:
-    rec = _session_store(ws).get(session_id, persona=persona)
-    return rec.to_dict() if rec else None
+    try:
+        store = _session_store(ws)
+    except RuntimeError:
+        store = None  # no agents-traces: synced fallback still answers
+    rec = store.get(session_id, persona=persona) \
+        if store is not None else None
+    try:
+        from .storeproj import synced_dead, synced_session
+
+        if synced_dead(ws, session_id):
+            return None
+        meta = synced_session(ws, session_id)
+    except Exception:
+        meta = None
+    if rec is None:
+        if meta is None:
+            return None
+        row = _synced_row(ws, session_id, meta, persona)
+        if persona and row["persona"] != persona:
+            return None
+        return row
+    out = rec.to_dict()
+    if meta:
+        # synced-only fields fill gaps; store last_active wins when newer
+        if not out.get("title") and meta.get("title"):
+            out["title"] = meta["title"]
+        for key in ("host", "branch", "repo"):
+            if meta.get(key) and not out.get(key):
+                out[key] = meta[key]
+        if meta.get("wip_unpushed") and not out.get("wip_unpushed"):
+            out["wip_unpushed"] = True
+        if meta.get("last_active") and str(meta["last_active"]) > str(
+                out.get("last_active") or ""):
+            out["last_active"] = meta["last_active"]
+    return out
 
 
 def delete_session(ws: Workspace, persona: str, session_id: str) -> bool:
-    return _session_store(ws).delete(session_id, persona=persona)
+    """Drop the local record AND tombstone the synced projection —
+    otherwise a store.db copy resurrects the session on every peer
+    (agents-relay#45). Synced-only sessions (no local JSON) delete via
+    the tombstone alone."""
+    removed = False
+    try:
+        removed = bool(
+            _session_store(ws).delete(session_id, persona=persona))
+    except RuntimeError:
+        pass  # agents-traces absent — tombstone still applies
+    from .storeproj import session_known, tombstone_session
+
+    try:
+        known = session_known(ws, session_id)
+    except Exception:  # noqa: BLE001 - store unreadable: local verdict
+        known = False
+    if not removed and not known:
+        return False
+    try:
+        tombstone_session(ws, session_id)
+    except Exception:  # noqa: BLE001 - tombstone best-effort on top
+        pass
+    return True
 
 
 def create_session(ws: Workspace, persona: str, *, user: str = "",
