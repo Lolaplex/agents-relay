@@ -261,10 +261,12 @@ _WS_MEMBER_DENY_KEYS = frozenset({
 })
 
 
-def _ws_member_body_denied(ctx: dict, body: dict) -> bool:
-    """True when a ws_member body carries policy/exec keys."""
+def _ws_member_body_denied(ctx: dict, body: Any) -> bool:
+    """True when a ws_member body is non-object or carries policy/exec keys."""
     if ctx.get("role") != "ws_member":
         return False
+    if not isinstance(body, dict):
+        return True
     return bool(set(body or {}) & _WS_MEMBER_DENY_KEYS)
 
 
@@ -272,6 +274,30 @@ def _device_admin_denied(ctx: dict) -> bool:
     """Workspace/admin mutations are operator surface — host/client
     device tokens never reach them (agents-relay#44)."""
     return ctx.get("kind") == "device" and ctx.get("role") != "ws_member"
+
+
+def _workspace_owner_id(ws_id: str) -> str:
+    """execution.owner for ``ws_id``; unknown/corrupt workspaces fail closed."""
+    try:
+        from .workspaces import get_workspace
+
+        execution = getattr(get_workspace(ws_id), "execution", None) or {}
+    except (ImportError, KeyError, ValueError, OSError, TypeError):
+        return ""
+    if not isinstance(execution, dict):
+        return ""
+    return str(execution.get("owner") or "").strip()
+
+
+def _force_host_switch_allowed(ctx: dict, ws_id: str) -> bool:
+    """force=True is operator/workspace-owner only; everyone else fails closed."""
+    if ctx.get("kind") in ("admin", "cookie"):
+        return True
+    if ctx.get("kind") != "device":
+        return False
+    owner = _workspace_owner_id(ws_id)
+    did = str(ctx.get("device_id") or "")
+    return bool(owner and did) and hmac.compare_digest(owner, did)
 
 
 def _ws_member_gate(ctx: dict, method: str, path: str,
@@ -1413,6 +1439,10 @@ class TurnHandler(BaseHTTPRequestHandler):
             body = self._read_json()
             if body is None:
                 return  # _read_json already sent 400/413 (agents-relay#45)
+            ctx = self._auth_ctx()
+            if _ws_member_body_denied(ctx, body):
+                self.send_error(403, "ws_member cannot set workdir/policy fields")
+                return
             new_host = str(body.get("host") or "").strip()
             if not new_host:
                 self.send_error(400, "host is required")
@@ -1421,6 +1451,9 @@ class TurnHandler(BaseHTTPRequestHandler):
                 self.send_error(400, f"invalid host id: {new_host!r}")
                 return
             force = bool(body.get("force"))
+            if force and not _force_host_switch_allowed(ctx, ws_id):
+                self.send_error(403, "force host switch requires workspace owner")
+                return
             fn = getattr(self.server, "session_host_switch_fn", None) \
                 or session_host_switch_fn
             if fn is None:

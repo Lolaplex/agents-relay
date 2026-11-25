@@ -538,6 +538,81 @@ class TestWsHostsR08(_Env):
         finally:
             srv.close()
 
+    @staticmethod
+    def _device_auth(dev: dict) -> dict:
+        return {"Authorization": f"Bearer {dev['device_token']}",
+                "X-Device-Id": dev["device_id"]}
+
+    def test_host_switch_member_deny_keys_fail_closed(self):
+        import agents_relay.http_adapter as ha
+
+        member = devices.mint_device(
+            device_id="dev-m", label="m", role="ws_member",
+            allowlist=["w1"])
+        self._ws("w1", sync_policy="synced", sync_hosts=["dev-m"])
+        calls = []
+        ha.session_host_switch_fn = (
+            lambda ws, sid, host, force=False:
+            calls.append((ws, sid, host, force)) or {"session": sid})
+        srv = _Srv(_cfg())
+        try:
+            for body in (
+                {"host": "dev-b", "force": True},
+                {"host": "dev-b", "workdir": "/tmp/x"},
+                {"host": "dev-b", "sync_hosts": ["dev-b"]},
+            ):
+                st, _ = srv.req(
+                    "POST", "/v1/workspaces/w1/sessions/s1/host", body,
+                    headers=self._device_auth(member))
+                self.assertEqual(st, 403, body)
+            st, _ = srv.req(
+                "POST", "/v1/workspaces/w1/sessions/s1/host",
+                "not-an-object", headers=self._device_auth(member))
+            self.assertEqual(st, 403)
+            self.assertEqual(calls, [])
+        finally:
+            ha.session_host_switch_fn = None
+            srv.close()
+
+    def test_host_switch_force_requires_admin_or_owner(self):
+        import agents_relay.http_adapter as ha
+
+        owner = devices.mint_device(device_id="dev-a", label="owner")
+        other = devices.mint_device(device_id="dev-c", label="other")
+        self._ws(
+            "w1", sync_policy="synced", sync_hosts=["dev-a", "dev-c"],
+            execution={"owner": "dev-a", "failover": "none",
+                       "lease_sec": 45})
+        calls = []
+        ha.session_host_switch_fn = (
+            lambda ws, sid, host, force=False:
+            calls.append((ws, sid, host, force)) or {"session": sid})
+        srv = _Srv(_cfg())
+        try:
+            st, _ = srv.req(
+                "POST", "/v1/workspaces/w1/sessions/s1/host",
+                {"host": "dev-b", "force": True},
+                headers=self._device_auth(other))
+            self.assertEqual(st, 403)
+            self.assertEqual(calls, [])
+
+            st, res = srv.req(
+                "POST", "/v1/workspaces/w1/sessions/s1/host",
+                {"host": "dev-b", "force": True},
+                headers=self._device_auth(owner))
+            self.assertEqual(st, 200, res)
+            self.assertEqual(calls, [("w1", "s1", "dev-b", True)])
+
+            st, res = srv.req(
+                "POST", "/v1/workspaces/w1/sessions/s1/host",
+                {"host": "dev-b", "force": True},
+                headers={"Authorization": "Bearer expected"})
+            self.assertEqual(st, 200, res)
+            self.assertEqual(calls[-1], ("w1", "s1", "dev-b", True))
+        finally:
+            ha.session_host_switch_fn = None
+            srv.close()
+
     def test_hub_link_delete_validates_hub_id(self):
         srv = _Srv(_cfg())
         try:
