@@ -48,6 +48,9 @@ class _Srv:
 
 
 class TestEventsSSE(unittest.TestCase):
+    def setUp(self) -> None:
+        events.reset_bus()  # module bus may carry _closed from elsewhere
+
     def tearDown(self) -> None:
         events.shutdown_all()
         events.reset_bus()
@@ -132,3 +135,40 @@ class TestEventsSSE(unittest.TestCase):
             self.assertTrue(sub_a.queue.empty())
         finally:
             events.unsubscribe(sub_a)
+
+    def test_global_events_never_reach_scoped_subscribers(self):
+        """agents-relay#42: global (workspace="") events stay out of
+        ws-scoped subscriptions unless include_global opted in."""
+        sub = events.subscribe(workspace="ws-a")
+        sub_all = events.subscribe(workspace="ws-a", include_global=True)
+        try:
+            events.emit_event("device.connected", {"d": 1})  # global
+            events.emit_event("workspace.changed", {"n": 2},
+                              workspace="ws-a")
+            first = sub.queue.get(timeout=1.0)
+            # global event skipped — the ws event arrives first
+            self.assertEqual(first["kind"], "workspace.changed")
+            self.assertTrue(sub.queue.empty())
+            got = [sub_all.queue.get(timeout=1.0),
+                   sub_all.queue.get(timeout=1.0)]
+            self.assertEqual([g["kind"] for g in got],
+                             ["device.connected", "workspace.changed"])
+        finally:
+            events.unsubscribe(sub)
+            events.unsubscribe(sub_all)
+
+    def test_disconnect_tag_poisons_device_subscriptions(self):
+        """Revocation kills a device's event streams immediately."""
+        sub = events.subscribe(workspace="w1", tag="dev-1")
+        other = events.subscribe(workspace="w1", tag="dev-2")
+        try:
+            self.assertEqual(events.disconnect_tag("dev-1"), 1)
+            self.assertIsNone(sub.queue.get(timeout=1.0))
+            # untouched subscriber still receives events
+            events.emit_event("workspace.changed", {"n": 1},
+                              workspace="w1")
+            self.assertIsNotNone(other.queue.get(timeout=1.0))
+            self.assertEqual(events.disconnect_tag("dev-1"), 0)
+        finally:
+            events.unsubscribe(sub)
+            events.unsubscribe(other)

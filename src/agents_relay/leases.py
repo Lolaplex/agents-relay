@@ -78,11 +78,27 @@ class LeaseBook:
             return None
         return s
 
+    def sweep(self) -> int:
+        """Drop every expired slot — run on writes + snapshots so dead
+        leases never accumulate or shadow a snapshot (klanker#148)."""
+        with self._lock:
+            now = self._clock()
+            dead = [k for k, s in self._slots.items()
+                    if s["expires_mono"] <= now]
+            for k in dead:
+                del self._slots[k]
+        return len(dead)
+
     def acquire(self, ws: str, session: str, holder: str,
                 run_id: str = "", ttl: float = TTL_SEC) -> dict:
         key = (ws, session)
         with self._lock:
             now = self._clock()
+            # sweep inside the lock so an expired sibling slot elsewhere
+            # is dropped in the same write op (klanker#148)
+            for k, s in list(self._slots.items()):
+                if s["expires_mono"] <= now:
+                    del self._slots[k]
             cur = self._slot(key, now)
             if cur is not None and (cur["holder"], cur["run_id"]) != (holder, run_id):
                 return {
@@ -128,12 +144,23 @@ class LeaseBook:
                 del self._slots[key]
             return {"released": True}
 
+    def release_holder(self, holder: str) -> int:
+        """Drop every lease held by ``holder`` — device revocation must
+        not leave dead sessions fencing live ones (agents-relay#42)."""
+        with self._lock:
+            dropped = [k for k, s in self._slots.items()
+                       if s["holder"] == holder]
+            for k in dropped:
+                del self._slots[k]
+        return len(dropped)
+
     def snapshot(self) -> list[dict]:
         with self._lock:
             now = self._clock()
             out = []
-            for (ws, session), s in self._slots.items():
+            for (ws, session), s in list(self._slots.items()):
                 if s["expires_mono"] <= now:
+                    del self._slots[(ws, session)]
                     continue
                 out.append({
                     "ws": ws, "session": session,
@@ -145,6 +172,22 @@ class LeaseBook:
 
 
 _book: LeaseBook | None = None
+_book_lock = threading.Lock()
+
+# klanker serves wire workspace policy in: fn(ws_id) -> lease ttl seconds
+# (ws.execution.lease_sec, agents-workspace#44 / klanker#148).
+lease_ttl_fn = None
+
+
+def default_ttl(ws_id: str) -> float:
+    if lease_ttl_fn is not None:
+        try:
+            ttl = float(lease_ttl_fn(ws_id) or 0)
+            if ttl > 0:
+                return ttl
+        except Exception:  # noqa: BLE001 - policy lookup never blocks leases
+            pass
+    return TTL_SEC
 
 
 def _default_state_path():
@@ -158,12 +201,16 @@ def _default_state_path():
 
 def hub_leases() -> LeaseBook:
     global _book
-    if _book is None:
-        _book = LeaseBook(state_path=_default_state_path())
+    if _book is not None:
+        return _book
+    with _book_lock:
+        if _book is None:
+            _book = LeaseBook(state_path=_default_state_path())
     return _book
 
 
 def reset_leases() -> None:
     """Drop the process-wide book (tests; hub reset)."""
     global _book
-    _book = None
+    with _book_lock:
+        _book = None

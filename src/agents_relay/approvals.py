@@ -40,6 +40,13 @@ _APPROVED = "approved"
 _DENIED = "denied"
 _TIMEOUT = "timeout"
 
+# Approval mirror hooks (klanker#148): a shared-workspace spoke mirrors
+# pending asks onto the hub over the channel (approval-req) so the
+# operator sees them on whichever host's UI is open; decisions ride
+# back as approval-res frames. klanker serve wires both.
+on_pending_fn = None   # fn(record) — freshly-pending local approval
+on_decided_fn = None   # fn(record) — terminal local decision to relay
+
 
 def approval_tokens_dir(config: RelayConfig | None = None) -> Path:
     return approval_dir(config) / "tokens"
@@ -180,6 +187,21 @@ def _mutate(config: RelayConfig, ident: str, fn) -> dict | None:
         return updated
 
 
+def canonical_json(obj: Any) -> str:
+    """Stable serialization for approval request hashing."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False, default=str)
+
+
+def approval_request_hash(request: dict) -> str:
+    """sha256 over the exact tool+args an approval covers — replaying a
+    granted id with different arguments must fail (agents-relay#41)."""
+    return hashlib.sha256(
+        canonical_json(
+            {"tool": request.get("tool"),
+             "args": request.get("args")}).encode("utf-8")).hexdigest()
+
+
 def create_pending(
     config: RelayConfig,
     chat_id: int,
@@ -187,6 +209,7 @@ def create_pending(
     *,
     workspace: str = "",
     token_hash: str = "",
+    from_mirror: bool = False,
 ) -> dict:
     ident = str(request.get("id") or "")
     eff_ws = (workspace or str(request.get("workspace") or "")).strip()
@@ -201,6 +224,7 @@ def create_pending(
             "chat_id": int(chat_id),
             "workspace": eff_ws,
             "request": request,
+            "request_hash": approval_request_hash(request),
             "note": "",
             "decided_by": None,
             "created_at": time.time(),
@@ -215,6 +239,11 @@ def create_pending(
         from .push import notify_approval_pending
 
         notify_approval_pending(config, {**request, "id": ident}, ws_ref=eff_ws)
+        if not from_mirror and on_pending_fn is not None:
+            try:
+                on_pending_fn(updated)
+            except Exception:  # noqa: BLE001 - mirror never blocks the ask
+                pass
     return updated or {}
 
 
@@ -226,6 +255,7 @@ def record_decision(
     note: str,
     decided_by: int | None,
     expected_chat_id: int | None = None,
+    from_mirror: bool = False,
 ) -> dict | None:
     """Write a terminal status if the record is still pending. None if rejected."""
     changed = False
@@ -251,6 +281,11 @@ def record_decision(
     updated = _mutate(config, ident, _apply)
     if not changed:
         return None
+    if not from_mirror and on_decided_fn is not None:
+        try:
+            on_decided_fn(updated)
+        except Exception:  # noqa: BLE001 - mirror never blocks the decision
+            pass
     return updated
 
 
@@ -364,9 +399,20 @@ def run_local_approve(
     if not APPROVAL_ID_RE.match(ident):
         return 2, "invalid approval id"
     existing = read_approval(config, ident)
-    if existing and existing.get("status") == _APPROVED:
-        return 0, str(existing.get("note") or "approved")
-    if existing and existing.get("status") == _DENIED:
+    if existing and existing.get("status") in (_APPROVED, _DENIED):
+        # Replay guard: a decided id only resolves a request that
+        # matches what was decided — a mismatched/empty stored hash
+        # fails closed, never grants (agents-relay#44).
+        ex_hash = str(existing.get("request_hash") or "")
+        if not ex_hash:
+            ex_req = existing.get("request")
+            if isinstance(ex_req, dict):
+                ex_hash = approval_request_hash(ex_req)
+        if not ex_hash or not hmac.compare_digest(
+                ex_hash, approval_request_hash(request)):
+            return 2, "approval request changed"
+        if existing.get("status") == _APPROVED:
+            return 0, str(existing.get("note") or "approved")
         return 1, str(existing.get("note") or "denied")
     create_pending(config, 0, request)
     status, note = wait_for_decision(

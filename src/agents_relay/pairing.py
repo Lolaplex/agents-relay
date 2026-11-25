@@ -6,16 +6,18 @@ import re
 import secrets
 import threading
 import time
+import urllib.parse
 from typing import Any, Callable
 
 # Excludes visually ambiguous 0/O/1/I characters for manual mobile code entry.
 _CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
 _CODE_LEN = 8
-_MODES = frozenset({"web", "remote"})
+_MODES = frozenset({"web", "remote", "ws"})
 _MIN_TTL_SEC = 15
 _MAX_TTL_SEC = 120
 _DEFAULT_TTL_SEC = 60
 _MAX_PENDING = 64
+_MAX_WS_PENDING = 16  # ws invites are rarer than admin pairs — own quota
 _RATE_WINDOW_SEC = 60.0
 _MAX_FAILS_PER_WINDOW = 5
 
@@ -57,10 +59,13 @@ class PairingStore:
         ttl_sec: int = _DEFAULT_TTL_SEC,
         host_id: str = "",
         base_url: str = "",
+        ws: str = "",
+        granted_by: str = "",
     ) -> dict[str, Any]:
         clean_mode = (mode or "web").strip().lower()
         if clean_mode not in _MODES:
-            raise ValueError(f"mode must be 'web' or 'remote', got {mode!r}")
+            raise ValueError(
+                f"mode must be 'web', 'remote' or 'ws', got {mode!r}")
         try:
             ttl = int(ttl_sec)
         except (TypeError, ValueError):
@@ -76,22 +81,52 @@ class PairingStore:
 
         with self._lock:
             self._prune_locked(now_mono)
-            while len(self._entries) >= _MAX_PENDING:
-                oldest = next(iter(self._entries))
-                self._entries.pop(oldest, None)
+            # ws invites and admin pairs cap SEPARATELY (agents-relay#44):
+            # a ws burst evicts only ws invites and an admin burst only
+            # admin entries — neither can starve the other's quota.
+            if clean_mode == "ws":
+                ws_count = sum(
+                    1 for e in self._entries.values()
+                    if e["mode"] == "ws")
+                while ws_count >= _MAX_WS_PENDING:
+                    oldest = next(
+                        k for k, e in self._entries.items()
+                        if e["mode"] == "ws")
+                    self._entries.pop(oldest, None)
+                    ws_count -= 1
+            else:
+                admin_count = sum(
+                    1 for e in self._entries.values()
+                    if e["mode"] != "ws")
+                while admin_count >= _MAX_PENDING:
+                    oldest = next(
+                        k for k, e in self._entries.items()
+                        if e["mode"] != "ws")
+                    self._entries.pop(oldest, None)
+                    admin_count -= 1
             self._entries[pair_id] = {
                 "token": token,
                 "code": code,
                 "code_norm": code_norm,
                 "mode": clean_mode,
                 "host_id": host_id,
+                "ws": ws,
+                "granted_by": granted_by,
                 "expires_mono": now_mono + ttl,
             }
 
         clean_base = (base_url or "").strip().rstrip("/")
-        # One URL shape for both modes: redeem branches on the stored mode,
-        # so the same link pairs a browser (cookie) and a CLI/desktop (token).
-        pair_url = f"{clean_base}/#pair={token}"
+        # The URL shape declares the kind (agents-relay#44): a pasted ws
+        # link must announce mode + workspace so the redeeming client
+        # cannot mistake it for an admin pair (and vice versa).
+        if clean_mode == "ws":
+            pair_url = (
+                f"{clean_base}/#kind=ws&ws="
+                f"{urllib.parse.quote(str(ws), safe='')}&pair={token}")
+        elif clean_mode == "remote":
+            pair_url = f"{clean_base}/#kind=remote&pair={token}"
+        else:
+            pair_url = f"{clean_base}/#pair={token}"
 
         return {
             "mode": clean_mode,
@@ -101,6 +136,8 @@ class PairingStore:
             "expires_in": ttl,
             "expires_at": now_wall + ttl,
             "host_id": host_id,
+            "ws": ws,
+            "granted_by": granted_by,
         }
 
     def redeem_pair(
@@ -139,6 +176,8 @@ class PairingStore:
                 return "ok", {
                     "mode": consumed["mode"],
                     "host_id": consumed["host_id"],
+                    "ws": consumed.get("ws") or "",
+                    "granted_by": consumed.get("granted_by") or "",
                 }
 
             self._fails.setdefault(ip, []).append(now_mono)
@@ -159,8 +198,12 @@ def create_pair(
     ttl_sec: int = _DEFAULT_TTL_SEC,
     host_id: str = "",
     base_url: str = "",
+    ws: str = "",
+    granted_by: str = "",
 ) -> dict[str, Any]:
-    return _STORE.create_pair(mode=mode, ttl_sec=ttl_sec, host_id=host_id, base_url=base_url)
+    return _STORE.create_pair(
+        mode=mode, ttl_sec=ttl_sec, host_id=host_id, base_url=base_url,
+        ws=ws, granted_by=granted_by)
 
 
 def redeem_pair(credential: str, *, client_ip: str = "") -> tuple[str, dict[str, Any] | None]:

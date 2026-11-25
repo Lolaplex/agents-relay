@@ -54,6 +54,11 @@ _NO_CACHE = frozenset({".html", ".js", ".css", ".webmanifest"})
 _ACTIVE: dict[str, dict[str, Any]] = {}
 _ACTIVE_LOCK = threading.Lock()
 
+# fn(run_id, entry) fires once the driver thread finishes the turn —
+# the release point for session leases held over an async run
+# (klanker#148). entry["meta"] carries session/workspace.
+run_done_hook = None
+
 # Event buffer cap per run: deltas are small but long turns are not bounded;
 # an attach that starts mid-run replays only the tail. Trailer/start/meta are
 # always kept (replayed first, marked replayed).
@@ -84,7 +89,14 @@ def _publish(entry: dict[str, Any], payload: dict[str, Any]) -> None:
 def _find_run(run: str = "", session: str = "", workspace: str = "", persona: str = "") -> tuple[str, dict[str, Any] | None]:
     with _ACTIVE_LOCK:
         if run:
-            return run, _ACTIVE.get(run)
+            entry = _ACTIVE.get(run)
+            # An explicit workspace filter scopes a direct run lookup
+            # too — run ids are unguessable but a ws-bound caller must
+            # never attach across its boundary (agents-relay#44).
+            if entry is not None and workspace and \
+                    (entry.get("meta") or {}).get("workspace") != workspace:
+                return run, None
+            return run, entry
         for rid, entry in _ACTIVE.items():
             meta = entry.get("meta") or {}
             if session and meta.get("session") != session:
@@ -97,8 +109,51 @@ def _find_run(run: str = "", session: str = "", workspace: str = "", persona: st
     return "", None
 
 
-def handle_runs_attach(handler: BaseHTTPRequestHandler, query: dict[str, Any]) -> None:
-    """SSE attach to a running turn: replay buffered events, then live fan-out."""
+# Revocation teardown (agents-relay#44): device-tagged stream attaches
+# die with the credential — DELETE /v1/hub/devices/<id> fires
+# disconnect_stream_tag alongside channel disconnect + remote delete.
+_STREAM_TAGS_LOCK = threading.Lock()
+_STREAM_TAGS: dict[str, list[tuple[threading.Event, threading.Condition]]] = {}
+
+
+def register_stream_tag(tag: str, cancel: threading.Event,
+                        cond: threading.Condition) -> None:
+    t = (tag or "").strip()
+    if not t:
+        return
+    with _STREAM_TAGS_LOCK:
+        _STREAM_TAGS.setdefault(t, []).append((cancel, cond))
+
+
+def unregister_stream_tag(tag: str, cancel: threading.Event) -> None:
+    t = (tag or "").strip()
+    if not t:
+        return
+    with _STREAM_TAGS_LOCK:
+        kept = [row for row in _STREAM_TAGS.get(t, []) if row[0] is not cancel]
+        if kept:
+            _STREAM_TAGS[t] = kept
+        else:
+            _STREAM_TAGS.pop(t, None)
+
+
+def disconnect_stream_tag(tag: str) -> int:
+    """Kill every stream attach bound to ``tag``; returns how many died."""
+    with _STREAM_TAGS_LOCK:
+        rows = _STREAM_TAGS.pop((tag or "").strip(), [])
+    for cancel, cond in rows:
+        cancel.set()
+        with cond:
+            cond.notify_all()
+    return len(rows)
+
+
+def handle_runs_attach(handler: BaseHTTPRequestHandler, query: dict[str, Any],
+                       *, tag: str = "") -> None:
+    """SSE attach to a running turn: replay buffered events, then live fan-out.
+
+    ``tag`` binds the attach to a caller identity (device id) so
+    revocation can tear it down (agents-relay#44)."""
     run_id, entry = _find_run(
         run=str(query.get("run") or "").strip(),
         session=str(query.get("session") or "").strip(),
@@ -117,20 +172,24 @@ def handle_runs_attach(handler: BaseHTTPRequestHandler, query: dict[str, Any]) -
 
     index = 0
     cond = entry["cond"]
+    cancel = threading.Event()
+    register_stream_tag(tag, cancel, cond)
     try:
         handler.wfile.write(_sse({"type": "attach", "run": run_id, "meta": entry.get("meta") or {}}))
         handler.wfile.flush()
-        while True:
+        while not cancel.is_set():
             ping = False
             with cond:
                 pending = entry["events"][index:]
                 index = len(entry["events"])
-                if not pending and not entry["done"]:
+                if not pending and not entry["done"] and not cancel.is_set():
                     cond.wait(timeout=15.0)
                     pending = entry["events"][index:]
                     index = len(entry["events"])
                     ping = not pending and not entry["done"]
                 finished = entry["done"] and index >= len(entry["events"])
+            if cancel.is_set():
+                break
             if ping:
                 handler.wfile.write(b": ping\n\n")
                 handler.wfile.flush()
@@ -142,6 +201,8 @@ def handle_runs_attach(handler: BaseHTTPRequestHandler, query: dict[str, Any]) -
                 break
     except (BrokenPipeError, ConnectionResetError):
         log.info("attached client disconnected (run %s)", run_id)
+    finally:
+        unregister_stream_tag(tag, cancel)
 
 
 def web_enabled(config: RelayConfig) -> bool:
@@ -218,8 +279,28 @@ _LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1", "")
 
 
 def _forwarded_proto(handler: BaseHTTPRequestHandler) -> str:
+    """X-Forwarded-Proto only counts behind a trusted proxy —
+    RELAY_TRUST_PROXY=1 opts in; otherwise the client can spoof its
+    own scheme (agents-relay#42)."""
+    import os
+
+    if os.environ.get("RELAY_TRUST_PROXY", "").strip().lower() not in (
+            "1", "true", "yes", "on"):
+        return ""
     raw = handler.headers.get("X-Forwarded-Proto") or ""
     return raw.split(",")[0].strip().lower()
+
+
+def _host_only(host_header: str) -> str:
+    """Bare host token from a Host header — ``[::1]:8787`` must parse to
+    ``::1``, not ``[`` (agents-relay#44)."""
+    h = (host_header or "").strip()
+    if h.startswith("["):
+        end = h.find("]")
+        return (h[1:end] if end >= 0 else h[1:]).strip().lower()
+    if h.count(":") == 1:
+        h = h.rsplit(":", 1)[0]
+    return h.strip().lower()
 
 
 def _secure_for(handler: BaseHTTPRequestHandler, config: RelayConfig) -> bool:
@@ -228,8 +309,7 @@ def _secure_for(handler: BaseHTTPRequestHandler, config: RelayConfig) -> bool:
     xfp = _forwarded_proto(handler)
     if xfp:
         return xfp == "https"
-    host = (handler.headers.get("Host") or "").split(":")[0].strip().lower()
-    return host not in _LOOPBACK_HOSTS
+    return _host_only(handler.headers.get("Host") or "") not in _LOOPBACK_HOSTS
 
 
 def _cookie_header(config: RelayConfig, value: str, *, secure: bool) -> str:
@@ -245,13 +325,64 @@ def _cookie_header(config: RelayConfig, value: str, *, secure: bool) -> str:
     return "; ".join(parts)
 
 
+_LOGIN_WINDOW_SEC = 60.0
+_LOGIN_MAX_FAILS = 5
+_login_lock = threading.Lock()
+_login_fails: dict[str, list[float]] = {}
+
+
+def _client_ip(handler: BaseHTTPRequestHandler) -> str:
+    try:
+        return str(handler.client_address[0] or "unknown")
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
+def _prune_login_fails(now: float) -> None:
+    """Drop stale rows for ALL ips — the dict must not grow with every
+    source ip that ever probed the token oracle (agents-relay#44)."""
+    cutoff = now - _LOGIN_WINDOW_SEC
+    for ip in list(_login_fails):
+        kept = [t for t in _login_fails[ip] if t > cutoff]
+        if kept:
+            _login_fails[ip] = kept
+        else:
+            _login_fails.pop(ip, None)
+
+
+def _login_allowed(ip: str) -> bool:
+    """Sliding-window login throttle — a relay reachable over the
+    network must not be a token oracle (agents-relay#42)."""
+    now = time.monotonic()
+    with _login_lock:
+        _prune_login_fails(now)
+        return len(_login_fails.get(ip, ())) < _LOGIN_MAX_FAILS
+
+
+def _login_failed(ip: str) -> None:
+    now = time.monotonic()
+    with _login_lock:
+        _prune_login_fails(now)
+        _login_fails.setdefault(ip, []).append(now)
+
+
+def reset_login_limits() -> None:
+    with _login_lock:
+        _login_fails.clear()
+
+
 def handle_login(handler: BaseHTTPRequestHandler, body: dict) -> None:
     config = handler._cfg()  # type: ignore[attr-defined]
     if not web_enabled(config):
         handler._write_json({"ok": False, "error": "web surface disabled"}, 404)  # type: ignore[attr-defined]
         return
+    ip = _client_ip(handler)
+    if not _login_allowed(ip):
+        handler._write_json({"ok": False, "error": "rate limited"}, 429)  # type: ignore[attr-defined]
+        return
     token = str(body.get("token") or "").strip()
     if not token or not hmac.compare_digest(token, config.web_token):
+        _login_failed(ip)
         handler._write_json({"ok": False, "error": "invalid token"}, 401)  # type: ignore[attr-defined]
         return
     value = issue_cookie(config)
@@ -277,7 +408,14 @@ def handle_token_query(handler: BaseHTTPRequestHandler, token: str) -> bool:
     config = handler._cfg()  # type: ignore[attr-defined]
     if not web_enabled(config) or not token:
         return False
+    # The query-token path was an unthrottled oracle — it counts the same
+    # login budget as POST /v1/web/login (agents-relay#44).
+    ip = _client_ip(handler)
+    if not _login_allowed(ip):
+        handler._write_json({"ok": False, "error": "rate limited"}, 429)  # type: ignore[attr-defined]
+        return True
     if not hmac.compare_digest(token, config.web_token):
+        _login_failed(ip)
         return False
     value = issue_cookie(config)
     handler.send_response(302)
@@ -308,7 +446,7 @@ def handle_status(handler: BaseHTTPRequestHandler) -> None:
     raw = cookie_from_header(handler.headers.get("Cookie") or "")
     user = verify_cookie(config, raw) if web_enabled(config) else None
     is_secure = _secure_for(handler, config)
-    host = (handler.headers.get("Host") or "").split(":")[0].strip().lower()
+    host = _host_only(handler.headers.get("Host") or "")
     plain_http_non_loopback = (
         _forwarded_proto(handler) != "https" and host not in _LOOPBACK_HOSTS
     )
@@ -394,13 +532,16 @@ def _status_text(raw: str) -> str:
     return line
 
 
-def handle_chat_stream(handler: BaseHTTPRequestHandler, body: dict) -> None:
+def handle_chat_stream(handler: BaseHTTPRequestHandler, body: dict) -> bool:
+    """Start-or-follow the run and stream SSE; returns True when a turn
+    is (or stays) running — False on a validation 400 so lease holders
+    can release (agents-relay#44)."""
     config = handler._cfg()  # type: ignore[attr-defined]
     text = str(body.get("text") or "").strip()
     raw_attachments = body.get("attachments")
     if not text and not raw_attachments:
         handler._write_json({"ok": False, "error": "text is required"}, 400)  # type: ignore[attr-defined]
-        return
+        return False
 
     run = str(body.get("run") or "").strip() or uuid.uuid4().hex
     with _ACTIVE_LOCK:
@@ -413,7 +554,7 @@ def handle_chat_stream(handler: BaseHTTPRequestHandler, body: dict) -> None:
             _follow_entry(handler, existing)
         except (BrokenPipeError, ConnectionResetError, OSError):
             log.info("web stream client disconnected (run %s)", run)
-        return
+        return True
     entry = _new_run_entry()
 
     ws_ref = str(body.get("workspace") or "").strip()
@@ -426,13 +567,13 @@ def handle_chat_stream(handler: BaseHTTPRequestHandler, body: dict) -> None:
             ws = resolve_workspace_id(ws_ref)
         except ValueError as exc:
             handler._write_json({"ok": False, "error": str(exc)}, 400)  # type: ignore[attr-defined]
-            return
+            return False
     if persona_ref:
         from .turn import valid_id
 
         if not valid_id(persona_ref):
             handler._write_json({"ok": False, "error": f"invalid persona id: {persona_ref!r}"}, 400)  # type: ignore[attr-defined]
-            return
+            return False
 
     attach_paths: tuple[str, ...] = ()
     attachment_notes: list[str] = []
@@ -448,7 +589,7 @@ def handle_chat_stream(handler: BaseHTTPRequestHandler, body: dict) -> None:
             ))
         except AttachmentRejected:
             handler._write_json({"ok": False, "error": "attachment path outside allowed directory"}, 400)  # type: ignore[attr-defined]
-            return
+            return False
         if attachment_notes:
             text = apply_notes(text, attachment_notes)
         if not attach_paths and not str(body.get("text") or "").strip():
@@ -456,7 +597,7 @@ def handle_chat_stream(handler: BaseHTTPRequestHandler, body: dict) -> None:
                 {"ok": False, "error": "; ".join(attachment_notes) or "attachment rejected"},
                 400,
             )
-            return
+            return False
 
     if attachment_notes:
         entry["pending_notes"] = [
@@ -498,6 +639,7 @@ def handle_chat_stream(handler: BaseHTTPRequestHandler, body: dict) -> None:
         _follow_entry(handler, entry)
     except (BrokenPipeError, ConnectionResetError, OSError):
         log.info("web stream client disconnected (run %s); turn continues", run)
+    return True
 
 
 def _send_sse_headers(handler: BaseHTTPRequestHandler) -> None:
@@ -554,6 +696,11 @@ def _drive_run(run: str, entry: dict[str, Any], params: Any, config: Any) -> Non
             entry["done"] = True
             entry["done_at"] = time.monotonic()
             entry["cond"].notify_all()
+        if run_done_hook is not None:
+            try:
+                run_done_hook(run, entry)
+            except Exception:  # noqa: BLE001 - lease release never kills reap
+                pass
         _schedule_reap(run, entry)
 
 
@@ -616,10 +763,16 @@ _KEEPALIVE_WAIT_SEC = 12.0
 
 def handle_chat_stop(handler: BaseHTTPRequestHandler, body: dict) -> None:
     run = str(body.get("run") or "").strip()
+    # A workspace filter scopes the sweep — a ws-bound caller cancels
+    # only its own runs, never the whole host (agents-relay#44).
+    ws_filter = str(body.get("workspace") or "").strip()
     stopped: list[str] = []
     with _ACTIVE_LOCK:
         for key, entry in list(_ACTIVE.items()):
             if run and key != run:
+                continue
+            if ws_filter and \
+                    (entry.get("meta") or {}).get("workspace") != ws_filter:
                 continue
             entry["cancel"].set()
             stopped.append(key)

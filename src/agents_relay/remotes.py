@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import posixpath
 import re
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -30,7 +31,52 @@ log = logging.getLogger(__name__)
 
 # Query keys never forwarded upstream — they carry OUR relay's secret.
 _STRIP_QS = {"secret", "token"}
-_STREAM_PATHS = ("/v1/chat/stream", "/v1/runs/stream", "/v1/stream")
+_STREAM_PATHS = ("/v1/chat/stream", "/v1/runs/stream", "/v1/stream",
+                 "/v1/events")
+
+# Upstream content types rewritten to plain text (agents-relay#41):
+# active markup from a compromised remote must never reach the shell.
+# XML dialects are markup too — served XHTML/SVG-as-XML still carries
+# scriptable content (agents-relay#44).
+_REWRITE_CTYPE = ("text/html", "image/svg+xml",
+                  "application/xhtml+xml", "application/xml", "text/xml")
+_SAFE_CTYPE = "text/plain; charset=utf-8"
+_PROXY_CSP = "sandbox; default-src 'none'"
+
+
+def _sanitize_header_value(value: str) -> str:
+    """CR/LF inside a proxied header value is an injection attempt."""
+    v = str(value or "")
+    if "\r" in v or "\n" in v:
+        raise ValueError("upstream header contains CR/LF")
+    return v
+
+
+def _b64decode(data: str) -> bytes:
+    import base64
+
+    return base64.b64decode(data, validate=True)
+
+
+def _proxy_content_type(raw: str) -> str:
+    """Sanitize + rewrite: html/svg bodies are downgraded to text/plain."""
+    v = _sanitize_header_value(raw) or "application/octet-stream"
+    if v.lower().split(";", 1)[0].strip() in _REWRITE_CTYPE:
+        return _SAFE_CTYPE
+    return v
+
+
+def _send_proxy_headers(handler: BaseHTTPRequestHandler, status: int,
+                        ctype: str) -> None:
+    handler.send_response(status)
+    handler.send_header("Content-Type", ctype)
+    handler.send_header("Content-Security-Policy", _PROXY_CSP)
+    handler.send_header("X-Content-Type-Options", "nosniff")
+    if ctype.startswith("text/event-stream"):
+        handler.send_header("Cache-Control", "no-cache")
+        handler.send_header("X-Accel-Buffering", "no")
+        handler.send_header("Connection", "close")
+    handler.end_headers()
 
 
 def validate_remote_base_url(url: str) -> str:
@@ -65,6 +111,9 @@ def _normalize_proxy_rest(rest: str) -> str:
     if norm != "/health" and not norm.startswith("/v1/"):
         raise ValueError(f"proxy path not allowed: {norm}")
     return norm
+
+
+_LOCK = threading.Lock()
 
 
 def _path() -> Path:
@@ -211,35 +260,39 @@ def upsert_remote(config: RelayConfig, body: dict) -> tuple[dict | None, str]:
         except ValueError as exc:
             return None, str(exc)
     migrating = not _path().is_file()
-    remotes = load_remotes(config)
-    if migrating:
-        for other_id, info in remotes.items():
-            if other_id != rid and isinstance(info, dict):
-                other_secret = str(info.get("secret") or "").strip()
-                if other_secret and not _read_secret(str(other_id)):
-                    _write_secret(str(other_id), other_secret)
-    # Host dedupe: a second row for an already-mounted endpoint reuses the
-    # canonical id instead of forking credentials (klanker#144).
-    if via == "relay":
-        new_host = _host_key(base_url)
-        for other_id, info in remotes.items():
-            if other_id != rid and _host_key(str(info.get("base_url") or "")) == new_host:
-                rid = other_id
-                break
-    prev = remotes.get(rid) or {}
-    new_secret = str(body.get("secret") or "").strip()
-    prev_secret = str(prev.get("secret") or "").strip()
-    secret = new_secret or prev_secret
-    if secret and (new_secret or not _read_secret(rid)):
-        _write_secret(rid, secret)
-    label = str(body.get("label") or "").strip()
-    remotes[rid] = {
-        "base_url": base_url,
-        "label": label,
-        "via": via,
-        "device_id": device_id,
-    }
-    _store(remotes)
+    # Whole read-modify-write under the module lock — concurrent
+    # upserts (e.g. channel auto-register + UI save) must not clobber
+    # each other (agents-relay#42).
+    with _LOCK:
+        remotes = load_remotes(config)
+        if migrating:
+            for other_id, info in remotes.items():
+                if other_id != rid and isinstance(info, dict):
+                    other_secret = str(info.get("secret") or "").strip()
+                    if other_secret and not _read_secret(str(other_id)):
+                        _write_secret(str(other_id), other_secret)
+        # Host dedupe: a second row for an already-mounted endpoint reuses
+        # the canonical id instead of forking credentials (klanker#144).
+        if via == "relay":
+            new_host = _host_key(base_url)
+            for other_id, info in remotes.items():
+                if other_id != rid and _host_key(str(info.get("base_url") or "")) == new_host:
+                    rid = other_id
+                    break
+        prev = remotes.get(rid) or {}
+        new_secret = str(body.get("secret") or "").strip()
+        prev_secret = str(prev.get("secret") or "").strip()
+        secret = new_secret or prev_secret
+        if secret and (new_secret or not _read_secret(rid)):
+            _write_secret(rid, secret)
+        label = str(body.get("label") or "").strip()
+        remotes[rid] = {
+            "base_url": base_url,
+            "label": label,
+            "via": via,
+            "device_id": device_id,
+        }
+        _store(remotes)
     return {
         "id": rid,
         "base_url": base_url,
@@ -252,17 +305,18 @@ def upsert_remote(config: RelayConfig, body: dict) -> tuple[dict | None, str]:
 
 def delete_remote(config: RelayConfig, rid: str) -> bool:
     migrating = not _path().is_file()
-    remotes = load_remotes(config)
-    if rid not in remotes:
-        return False
-    if migrating:
-        for other_id, info in remotes.items():
-            if other_id != rid and isinstance(info, dict):
-                other_secret = str(info.get("secret") or "").strip()
-                if other_secret and not _read_secret(str(other_id)):
-                    _write_secret(str(other_id), other_secret)
-    del remotes[rid]
-    _store(remotes)
+    with _LOCK:
+        remotes = load_remotes(config)
+        if rid not in remotes:
+            return False
+        if migrating:
+            for other_id, info in remotes.items():
+                if other_id != rid and isinstance(info, dict):
+                    other_secret = str(info.get("secret") or "").strip()
+                    if other_secret and not _read_secret(str(other_id)):
+                        _write_secret(str(other_id), other_secret)
+        del remotes[rid]
+        _store(remotes)
     _delete_secret(rid)
     return True
 
@@ -272,6 +326,29 @@ def _forward_query(raw_path: str) -> str:
     pairs = urllib.parse.parse_qsl(qs, keep_blank_values=True)
     kept = [(k, v) for k, v in pairs if k.lower() not in _STRIP_QS]
     return urllib.parse.urlencode(kept)
+
+
+def _read_proxy_body(handler: BaseHTTPRequestHandler) -> bytes | None:
+    """Bounded request body for upstream forwarding — malformed or
+    oversized Content-Length raises ValueError (agents-relay#44).
+
+    ws_member ACL checks parse the body before proxying; the route caches
+    those bytes on the one-shot handler so the forwarder still has them.
+    """
+    if getattr(handler, "_proxy_body_read", False):
+        return getattr(handler, "_proxy_body", None)
+    raw = (handler.headers.get("Content-Length") or "0").strip()
+    try:
+        length = int(raw)
+    except ValueError as exc:
+        raise ValueError("invalid Content-Length") from exc
+    if length < 0:
+        raise ValueError("invalid Content-Length")
+    from .http_adapter import MAX_HTTP_BODY_BYTES
+
+    if length > MAX_HTTP_BODY_BYTES:
+        raise ValueError("request body too large")
+    return handler.rfile.read(length) if length else None
 
 
 def handle_proxy(handler: BaseHTTPRequestHandler, rid: str, rest: str) -> None:
@@ -289,6 +366,22 @@ def handle_proxy(handler: BaseHTTPRequestHandler, rid: str, rest: str) -> None:
     except ValueError as exc:
         handler._write_json({"ok": False, "error": str(exc)}, 400)  # type: ignore[attr-defined]
         return
+    # Non-admin callers stay behind the channel http-RPC denylist —
+    # a mounted remote must never become a credential/policy pivot
+    # (agents-relay#41). Operator surfaces (admin/cookie) keep full
+    # reach: pairing and device management are their job.
+    try:
+        ctx = handler._auth_ctx()  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        ctx = {}
+    if ctx.get("kind") not in ("admin", "cookie"):
+        from .channel_client import _rpc_denied
+
+        if _rpc_denied(handler.command, rest):
+            handler._write_json(
+                {"ok": False,
+                 "error": f"proxy denied: {handler.command} {rest}"}, 403)  # type: ignore[attr-defined]
+            return
     qs = _forward_query(handler.path or "")
     if remote.get("via") == "channel":
         _proxy_via_channel(handler, remote, rest, qs)
@@ -300,8 +393,12 @@ def handle_proxy(handler: BaseHTTPRequestHandler, rid: str, rest: str) -> None:
         return
     url = f"{base_url}{rest}{'?' + qs if qs else ''}"
 
-    length = int(handler.headers.get("Content-Length") or "0")
-    data = handler.rfile.read(length) if length else None
+    try:
+        data = _read_proxy_body(handler)
+    except ValueError as exc:
+        handler._write_json({"ok": False, "error": str(exc)},  # type: ignore[attr-defined]
+                            413 if "too large" in str(exc) else 400)
+        return
     from . import __version__
 
     req = urllib.request.Request(
@@ -333,18 +430,27 @@ def handle_proxy(handler: BaseHTTPRequestHandler, rid: str, rest: str) -> None:
         handler._write_json({"ok": False, "error": f"remote unreachable: {exc}"}, 502)  # type: ignore[attr-defined]
         return
 
-    handler.send_response(upstream.status)
-    ctype = upstream.headers.get("Content-Type") or "application/octet-stream"
-    handler.send_header("Content-Type", ctype)
-    if ctype.startswith("text/event-stream"):
-        handler.send_header("Cache-Control", "no-cache")
-        handler.send_header("X-Accel-Buffering", "no")
-        handler.send_header("Connection", "close")
-    handler.end_headers()
     try:
+        ctype = _proxy_content_type(
+            upstream.headers.get("Content-Type") or "application/octet-stream")
+    except ValueError:
+        upstream.close()
+        handler._write_json({"ok": False, "error": "invalid upstream header"}, 502)  # type: ignore[attr-defined]
+        return
+    _send_proxy_headers(handler, upstream.status, ctype)
+    try:
+        from .http_adapter import MAX_HTTP_BODY_BYTES
+
+        streamed = any(rest.startswith(p) for p in _STREAM_PATHS)
+        sent = 0
         while True:
-            chunk = upstream.read(8192)
+            # read1: whatever the socket has NOW — read(8192) stalls SSE
+            # deltas until the buffer fills (klanker#148)
+            chunk = upstream.read1(8192)
             if not chunk:
+                break
+            sent += len(chunk)
+            if not streamed and sent > MAX_HTTP_BODY_BYTES:
                 break
             handler.wfile.write(chunk)
             handler.wfile.flush()
@@ -369,8 +475,12 @@ def _proxy_via_channel(
         handler._write_json({"ok": False, "error": "channel remote missing device_id"}, 400)  # type: ignore[attr-defined]
         return
     path = rest + ("?" + qs if qs else "")
-    length = int(handler.headers.get("Content-Length") or "0")
-    data = handler.rfile.read(length) if length else None
+    try:
+        data = _read_proxy_body(handler)
+    except ValueError as exc:
+        handler._write_json({"ok": False, "error": str(exc)},  # type: ignore[attr-defined]
+                            413 if "too large" in str(exc) else 400)
+        return
     req: dict = {"method": handler.command, "path": path}
     if data is not None:
         import base64
@@ -382,6 +492,12 @@ def _proxy_via_channel(
     accept = (handler.headers.get("Accept") or "").strip()
     if accept:
         req["accept"] = accept
+    hop = (handler.headers.get("X-Klanker-Hop") or "").strip()
+    if hop:
+        try:
+            req["x_klanker_hop"] = int(hop)
+        except ValueError:
+            req["x_klanker_hop"] = 1
 
     frames = hub().rpc_call(device_id, "http", {"req": req}, timeout_sec=600.0)
     first = next(frames, None)
@@ -389,29 +505,43 @@ def _proxy_via_channel(
         handler._write_json({"ok": False, "error": "device returned empty rpc"}, 502)  # type: ignore[attr-defined]
         return
     if "error" in first:
-        code = 503 if first["error"] in ("device offline", "device disconnected") else 502
+        if first["error"] in ("device offline", "device disconnected"):
+            code = 503
+        else:
+            # Carry a real upstream status (403 deny etc.) — never
+            # flatten authz failures into a transport 502.
+            code = int(first.get("status") or 502)
         handler._write_json({"ok": False, "error": str(first["error"])}, code)  # type: ignore[attr-defined]
         return
 
     status = int(first.get("status") or 502)
-    ctype_out = str(first.get("content_type") or "application/octet-stream")
-    handler.send_response(status)
-    handler.send_header("Content-Type", ctype_out)
-    if ctype_out.startswith("text/event-stream"):
-        handler.send_header("Cache-Control", "no-cache")
-        handler.send_header("X-Accel-Buffering", "no")
-        handler.send_header("Connection", "close")
-    handler.end_headers()
     try:
-        import base64
-
-        if "body_b64" in first:
-            handler.wfile.write(base64.b64decode(first["body_b64"]))
-        elif "body" in first:
-            handler.wfile.write(str(first["body"]).encode("utf-8"))
+        ctype_out = _proxy_content_type(
+            str(first.get("content_type") or "application/octet-stream"))
+    except ValueError:
+        handler._write_json({"ok": False, "error": "invalid upstream header"}, 502)  # type: ignore[attr-defined]
+        return
+    # Decode/validate the body BEFORE headers go out — a bad payload
+    # must become a clean 502, not a half-written response.
+    body = b""
+    if "body_b64" in first:
+        try:
+            body = _b64decode(str(first["body_b64"]))
+        except ValueError:
+            handler._write_json({"ok": False, "error": "invalid body_b64"}, 502)  # type: ignore[attr-defined]
+            return
+    elif "body" in first:
+        body = str(first["body"]).encode("utf-8")
+    _send_proxy_headers(handler, status, ctype_out)
+    try:
+        if body:
+            handler.wfile.write(body)
         for fr in frames:
             if "chunk_b64" in fr:
-                handler.wfile.write(base64.b64decode(fr["chunk_b64"]))
+                try:
+                    handler.wfile.write(_b64decode(str(fr["chunk_b64"])))
+                except ValueError:
+                    break  # garbage mid-stream — stop, partial already out
                 handler.wfile.flush()
             elif "chunk" in fr:
                 handler.wfile.write(str(fr["chunk"]).encode("utf-8"))

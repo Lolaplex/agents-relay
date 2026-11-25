@@ -273,7 +273,11 @@ class TestAcpProviderWiring(unittest.TestCase):
     def test_agent_cmd_suffix_and_fallback(self):
         from agents_relay.acp import acp_agent_cmd
 
-        self._env_save("AGENTS_ACP_CMD", "AGENTS_ACP_CMD_DEVIN")
+        self._env_save("AGENTS_ACP_CMD", "AGENTS_ACP_CMD_DEVIN",
+                       "AGENTS_HOST_DIR")
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        os.environ["AGENTS_HOST_DIR"] = tmp.name  # isolate provider manifests
         os.environ["AGENTS_ACP_CMD"] = "devin acp"
         os.environ["AGENTS_ACP_CMD_DEVIN"] = "devin acp --model x"
         self.assertEqual(acp_agent_cmd("acp.devin"), "devin acp --model x")

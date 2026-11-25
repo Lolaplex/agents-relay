@@ -1,0 +1,7 @@
+name: security
+kind: inferred
+shape: event
+face: in
+membrane: false
+route:
+note: Security-class remediation signal — authz/forgery/race fixes that close a live abuse path.

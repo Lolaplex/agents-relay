@@ -121,6 +121,203 @@ def _check_secret(
     return False
 
 
+def _auth_context(handler: BaseHTTPRequestHandler) -> dict:
+    """Structured caller identity (agents-relay#41).
+
+    kind: "admin" (master secret) | "cookie" (web session) |
+          "device" (paired device token) | "" (unauthenticated).
+    Device callers carry device_id, role (host|client|ws_member) and
+    the ws allowlist — ws_member can only touch workspaces in it.
+    """
+    ctx = {"kind": "", "device_id": "", "role": "",
+           "allowlist": frozenset()}
+    expected = getattr(handler, "relay_secret", "") or ""
+    auth_header = (handler.headers.get("Authorization") or "").strip()
+    bearer = (auth_header[7:].strip()
+              if auth_header.lower().startswith("bearer ") else "")
+    got = (handler.headers.get("X-Relay-Secret")
+           or handler.headers.get("Relay-Secret")
+           or handler.headers.get("X-Gateway-Secret")
+           or handler.headers.get("Gateway-Secret")
+           or bearer or "").strip()
+    if expected and got and hmac.compare_digest(
+            got.encode("utf-8"), expected.encode("utf-8")):
+        ctx["kind"] = "admin"
+        return ctx
+    cfg = getattr(handler, "config", None)
+    if not expected:
+        # No master secret: the web cookie is the only gate — without a
+        # web surface this is loopback admin, matching _check_secret.
+        if not (isinstance(cfg, RelayConfig) and web_enabled(cfg)):
+            ctx["kind"] = "admin"
+            return ctx
+    if got:
+        try:
+            from .devices import device_id_for_token, load_devices
+
+            did = device_id_for_token(got)
+            if did:
+                meta = (load_devices().get(did) or {})
+                ctx.update(kind="device", device_id=did,
+                           role=str(meta.get("role") or "host"),
+                           allowlist=frozenset(
+                               str(w) for w in (meta.get("allowlist")
+                                                or [])))
+                return ctx
+        except Exception:  # noqa: BLE001
+            pass
+    if isinstance(cfg, RelayConfig) and web_enabled(cfg):
+        raw = cookie_from_header(handler.headers.get("Cookie") or "")
+        if raw and verify_cookie(cfg, raw):
+            ctx["kind"] = "cookie"
+    return ctx
+
+
+def _ws_allowed(ctx: dict, ws_id: str) -> bool:
+    """ws_member allowlist gate; every other caller passes."""
+    if ctx.get("role") == "ws_member":
+        return bool(ws_id) and ws_id in (ctx.get("allowlist") or ())
+    return True
+
+
+def _body_ws(body: dict) -> str:
+    return str((body or {}).get("workspace") or "").strip()
+
+
+# ws_member may proxy ONLY these surfaces to a channel device in the
+# same allowlisted workspace (agents-relay#44).
+_MEMBER_PROXY_PATHS = frozenset({
+    "/v1/turn", "/v1/chat/stream", "/v1/stream", "/v1/chat/stop",
+})
+
+
+def _proxy_allowed(ctx: dict, rid: str = "", rest: str = "",
+                   cfg: Any = None, body: dict | None = None) -> bool:
+    """`/v1/remote/*` pivots are operator/host-device surfaces —
+    client devices never reach them.
+
+    ws_member exception (agents-relay#44): Hub→Spoke turn/stream/stop
+    proxy only when the body is scoped to an allowlisted ws that admits
+    the caller AND the target device is in that same ws's sync_hosts."""
+    kind = ctx.get("kind")
+    if kind in ("admin", "cookie"):
+        return True
+    if kind != "device":
+        return False
+    role = ctx.get("role")
+    if role == "host":
+        return True
+    if role != "ws_member":
+        return False
+    upstream = (rest or "").split("?", 1)[0].rstrip("/")
+    if upstream not in _MEMBER_PROXY_PATHS:
+        return False
+    target = ""
+    try:
+        from .remotes import load_remotes
+
+        if cfg is not None:
+            target = str((load_remotes(cfg).get(rid) or {})
+                         .get("device_id") or "")
+    except Exception:  # noqa: BLE001 - registry read fails closed
+        return False
+    if not target:
+        return False
+    if body is None or _ws_member_body_denied(ctx, body):
+        return False
+    ws_id = _body_ws(body)
+    if not _ws_allowed(ctx, ws_id):
+        return False
+    did = str(ctx.get("device_id") or "")
+    try:
+        from .workspaces import get_workspace
+    except ImportError:
+        return False
+    try:
+        ws = get_workspace(ws_id)
+    except (KeyError, ValueError, OSError):
+        return False
+    return bool(ws.allows_device(did)
+                and target in set(ws.sync_hosts or ()))
+
+
+# ws_member path whitelist (agents-relay#41): channel frames + ws-scoped
+# app reads/writes inside the allowlist — everything else is denied.
+_WS_MEMBER_ALWAYS = frozenset({
+    "/v1/hub/stream", "/v1/hub/send", "/v1/hub/lease", "/v1/hub/leases",
+    "/v1/auth/status", "/health", "/v1/pair/redeem",
+})
+_WS_MEMBER_TURN = frozenset({
+    "/v1/turn", "/v1/chat/stream", "/v1/stream",
+    "/v1/runs/stream", "/v1/chat/stop", "/v1/inject",
+})
+# Body keys a ws_member caller may never set — exec/policy escapes
+# (workdir, browser_profile, force-driven host switch) are host trust
+# boundaries, not guest surface (agents-relay#44).
+_WS_MEMBER_DENY_KEYS = frozenset({
+    "sync_hosts", "approval_mode", "workdir", "workdir_lock",
+    "browser_profile", "force", "new_host",
+    "sync_policy", "default_host", "repos", "execution",
+})
+
+
+def _ws_member_body_denied(ctx: dict, body: dict) -> bool:
+    """True when a ws_member body carries policy/exec keys."""
+    if ctx.get("role") != "ws_member":
+        return False
+    return bool(set(body or {}) & _WS_MEMBER_DENY_KEYS)
+
+
+def _device_admin_denied(ctx: dict) -> bool:
+    """Workspace/admin mutations are operator surface — host/client
+    device tokens never reach them (agents-relay#44)."""
+    return ctx.get("kind") == "device" and ctx.get("role") != "ws_member"
+
+
+def _ws_member_gate(ctx: dict, method: str, path: str,
+                    parts: list, query: dict) -> str:
+    """Rejection reason for ws_member callers, else "".
+
+    Fail-closed: a ws guest may use channel frames, turn/stream entry
+    points (body workspace is verified per-route), own approvals, and
+    /v1/workspaces/<member-ws>/* — but never ws deletion, policy keys,
+    or admin surfaces. POST remote turn/stream/stop proxying passes this
+    path gate only; `_proxy_allowed` applies the ws/body/target ACL.
+    """
+    if path in _WS_MEMBER_ALWAYS or path in _WS_MEMBER_TURN:
+        return ""
+    if path.startswith("/v1/remote/"):
+        if method == "POST":
+            rparts = path.split("/", 4)
+            upstream = "/" + rparts[4] if len(rparts) > 4 else "/"
+            if upstream.rstrip("/") in _MEMBER_PROXY_PATHS:
+                return ""
+        return "remote proxy is denied to workspace guests"
+    if path.startswith("/v1/remotes"):
+        return "remote proxy is denied to workspace guests"
+    if path.startswith("/v1/approvals"):
+        return ""
+    if path == "/v1/events":
+        ws = str((query or {}).get("workspace") or "")
+        if _ws_allowed(ctx, ws):
+            return ""
+        return "workspace not in allowlist"
+    if len(parts) >= 4 and parts[1] == "v1" \
+            and parts[2] == "workspaces":
+        ws_id = parts[3]
+        if not _ws_allowed(ctx, ws_id):
+            return "workspace not in allowlist"
+        if method == "DELETE":
+            if len(parts) == 4:
+                return "ws_member cannot delete workspaces"
+            # A guest may archive a persona row but never hard-delete
+            # it (agents-relay#44).
+            if str((query or {}).get("hard") or "") == "1":
+                return "ws_member cannot hard-delete"
+        return ""
+    return "denied to workspace guests"
+
+
 def _check_device(handler: BaseHTTPRequestHandler) -> str:
     """Device-channel auth: Bearer device_token + X-Device-Id (agents-relay#40).
 
@@ -199,8 +396,19 @@ class _TurnHook:
         return self.fn(**kwargs)
 
 
+MAX_HTTP_BODY_BYTES = 16 * 1024 * 1024
+
+
 def _read_json_body(handler: BaseHTTPRequestHandler) -> tuple[dict, bytes]:
-    length = int(handler.headers.get("Content-Length") or "0")
+    raw_len = (handler.headers.get("Content-Length") or "0").strip()
+    try:
+        length = int(raw_len)
+    except ValueError as exc:
+        raise ValueError("invalid Content-Length") from exc
+    if length < 0:
+        raise ValueError("invalid Content-Length")
+    if length > MAX_HTTP_BODY_BYTES:
+        raise ValueError(f"body too large: {length} bytes")
     raw = handler.rfile.read(length)
     try:
         body = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
@@ -260,6 +468,27 @@ def _is_private_host(host: str) -> bool:
     return False
 
 
+def _trust_proxy() -> bool:
+    """X-Forwarded-* headers are client-supplied — only honor them
+    behind a trusted reverse proxy (RELAY_TRUST_PROXY=1). Otherwise a
+    spoofed header poisons generated pair URLs and cookie security
+    decisions (agents-relay#42)."""
+    import os
+
+    return os.environ.get("RELAY_TRUST_PROXY", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+_HOST_BAD_RE = re.compile(r"[\x00-\x20\"'<>\\^`{|}]+")
+
+
+def _clean_host(raw: str) -> str:
+    """Host/X-Forwarded-Host value or '' — whitespace, quotes and CRLF
+    never reach a generated URL (agents-relay#44)."""
+    h = (raw or "").split(",")[0].strip()
+    return "" if not h or _HOST_BAD_RE.search(h) else h
+
+
 def _request_base_url(handler, cfg) -> str:
     """Absolute base for self-links (pair URLs).
 
@@ -273,12 +502,14 @@ def _request_base_url(handler, cfg) -> str:
     auto_bound = str(getattr(getattr(handler, "server", None), "relay_url", "") or "").strip().rstrip("/")
     if configured and configured != auto_bound:
         return configured
-    proto = (handler.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
-    host = (
-        handler.headers.get("X-Forwarded-Host")
-        or handler.headers.get("Host")
-        or ""
-    ).split(",")[0].strip()
+    if _trust_proxy():
+        proto = (handler.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
+        host = _clean_host(
+            handler.headers.get("X-Forwarded-Host")
+            or handler.headers.get("Host") or "")
+    else:
+        proto = ""
+        host = _clean_host(handler.headers.get("Host") or "")
     if host:
         if proto not in ("http", "https"):
             proto = "http" if _is_private_host(host) else "https"
@@ -293,6 +524,40 @@ def _emit_relay_event(kind: str, payload: dict[str, Any] | None = None, *, works
         emit_event(kind, payload, workspace=workspace)
     except Exception:
         pass
+
+
+# ws-share hooks (klanker#145): the host app (klanker serve) wires these
+# at boot. ws_invite_auth gates invite minting (owner check);
+# ws_grant_hook applies the membership grant on ws-mode redeem.
+ws_invite_auth = None   # fn(device_id, ws_id) -> bool
+ws_grant_hook = None    # fn(device_id, ws_id, granted_by) -> None
+# session:host remote exec (klanker#145 R5): wired by klanker serve —
+# fn(handler, path, body) -> bool, True when the request was proxied to
+# the session's bound host via the hub channel.
+remote_turn_dispatch = None
+# GET-shaped entry points (/v1/runs/stream): same session:host routing,
+# query instead of body (klanker#148).
+remote_query_dispatch = None
+# Run-lock lease guards: acquire before the first local turn execution
+# returns {error payload}->write 409, release runs at turn end. Klanker
+# wires both for hub AND spoke executors (klanker#148, klanker#136).
+turn_lease_hook = None        # fn(handler, body, ctx) -> dict|None
+turn_lease_release_hook = None  # fn(body, ctx) -> None
+
+
+def _turn_lease_conflict(handler, body: dict) -> bool:
+    """Acquire the (ws, session) run lease; True = conflict written."""
+    if turn_lease_hook is None:
+        return False
+    try:
+        conflict = turn_lease_hook(handler, body, handler._auth_ctx())  # type: ignore[attr-defined]
+    except Exception as exc:  # noqa: BLE001 - lease infra must fail loud, not run twice
+        log.warning("turn lease hook failed: %s", exc)
+        conflict = {"ok": False, "error": "lease_unavailable"}
+    if conflict:
+        handler._write_json(conflict, int(conflict.get("status") or 409))  # type: ignore[attr-defined]
+        return True
+    return False
 
 
 class TurnHandler(BaseHTTPRequestHandler):
@@ -317,7 +582,18 @@ class TurnHandler(BaseHTTPRequestHandler):
                 pass
 
     def _read_json(self) -> dict | None:
-        length = int(self.headers.get("Content-Length") or "0")
+        raw_len = (self.headers.get("Content-Length") or "0").strip()
+        try:
+            length = int(raw_len)
+        except ValueError:
+            self.send_error(400, "invalid Content-Length")
+            return None
+        if length < 0:
+            self.send_error(400, "invalid Content-Length")
+            return None
+        if length > MAX_HTTP_BODY_BYTES:
+            self.send_error(413, "request body too large")
+            return None
         raw = self.rfile.read(length).decode("utf-8", errors="replace")
         try:
             return json.loads(raw) if raw else {}
@@ -335,6 +611,26 @@ class TurnHandler(BaseHTTPRequestHandler):
 
     def _cfg(self) -> RelayConfig:
         return self.config or RelayConfig.from_env()
+
+    def _auth_ctx(self) -> dict:
+        ctx = getattr(self, "_ctx", None)
+        if ctx is None:
+            ctx = _auth_context(self)
+            self._ctx = ctx
+        return ctx
+
+    def _gate_ws_member(self, method: str, path: str,
+                        query_params: dict) -> bool:
+        """True when the request was rejected (403 already sent)."""
+        ctx = self._auth_ctx()
+        if ctx.get("role") != "ws_member":
+            return False
+        reason = _ws_member_gate(ctx, method, path,
+                                 path.split("/"), query_params)
+        if reason:
+            self.send_error(403, reason)
+            return True
+        return False
 
     #: Origins only a Tauri webview can produce — browsers never send these,
     #: so echoing them is safe for the bundled desktop shell.
@@ -401,6 +697,15 @@ class TurnHandler(BaseHTTPRequestHandler):
     def _handle_inject(self, query_params: dict[str, str] | None = None) -> None:
         body = self._read_json()
         if body is None:
+            return
+        # ws_member inject was the last unguarded turn surface — a guest
+        # could smuggle text into any telegram chat (agents-relay#44).
+        ctx = self._auth_ctx()
+        if not _ws_allowed(ctx, _body_ws(body)):
+            self.send_error(403, "workspace not in allowlist")
+            return
+        if _ws_member_body_denied(ctx, body):
+            self.send_error(403, "ws_member cannot set workdir/policy fields")
             return
         qp = query_params or {}
         cfg = self._cfg()
@@ -489,6 +794,8 @@ class TurnHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path, query_params = _parse_query(self.path)
+        if self._gate_ws_member("POST", path, query_params):
+            return
 
         if path == "/v1/auth/login":
             body = self._read_json()
@@ -513,7 +820,12 @@ class TurnHandler(BaseHTTPRequestHandler):
                 return
             from .pairing import create_pair
 
-            mode = str(body.get("mode") or "web")
+            mode = str(body.get("mode") or "web").strip().lower()
+            if mode == "ws":
+                # ws invites are minted by an owner device through
+                # /v1/ws/invite, never by the admin pair endpoint.
+                self.send_error(400, "mode=ws requires /v1/ws/invite")
+                return
             ttl = body.get("ttl_sec", 60)
             host_id = ""
             try:
@@ -536,6 +848,56 @@ class TurnHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self.send_error(400, str(exc))
                 return
+            self._write_json({"ok": True, **res}, 200)
+            return
+
+        if path == "/v1/ws/invite":
+            # ws-share invite mint (klanker#145): a paired device or the
+            # hub operator (master secret/cookie -> __admin__) asks for
+            # a single-use code that redeems as device pair AND ws
+            # member grant. ws_invite_auth decides ownership — never
+            # grant without it; an unconfigured hook means invites are
+            # off. relay_web cookie auth counts as operator too —
+            # the UI mints invites for its own workspaces
+            # (agents-relay#44).
+            ctx = self._auth_ctx()
+            device_id = ""
+            if ctx.get("kind") == "device":
+                device_id = str(ctx.get("device_id") or "")
+            elif ctx.get("kind") in ("admin", "cookie"):
+                device_id = "__admin__"
+            if not device_id:
+                self.send_error(401, "unauthorized")
+                return
+            body = self._read_json()
+            if body is None:
+                return
+            ws_id = str(body.get("ws") or "").strip()
+            if not valid_id(ws_id):
+                self.send_error(400, f"invalid workspace id: {ws_id!r}")
+                return
+            if ws_grant_hook is None or ws_invite_auth is None:
+                self.send_error(503, "workspace invites not configured")
+                return
+            if not ws_invite_auth(device_id, ws_id):
+                self.send_error(403, "not the workspace owner")
+                return
+            from .pairing import create_pair
+
+            cfg = self._cfg()
+            host_id = ""
+            try:
+                from agents_workspace import Host
+
+                hid_fn = getattr(Host.from_env(), "host_id", None)
+                if callable(hid_fn):
+                    host_id = str(hid_fn() or "")
+            except Exception:
+                pass
+            res = create_pair(
+                mode="ws", ws=ws_id, granted_by=device_id,
+                host_id=host_id, ttl_sec=body.get("ttl_sec", 60),
+                base_url=_request_base_url(self, cfg))
             self._write_json({"ok": True, **res}, 200)
             return
 
@@ -573,24 +935,100 @@ class TurnHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(payload)
                 return
-            # mode=remote mints a scoped device credential — the master
+            ws_id = str(entry.get("ws") or "")
+            granted_by = str(entry.get("granted_by") or "")
+            label = str(body.get("label") or "").strip()
+            if entry["mode"] == "ws":
+                # Re-verify at redeem time (agents-relay#42): the inviter
+                # may have been revoked or lost ownership since the code
+                # was minted — the invite window is not a grant window.
+                if ws_grant_hook is None or ws_invite_auth is None:
+                    self._write_json(
+                        {"ok": False,
+                         "error": "workspace invites not configured"}, 503)
+                    return
+                from .devices import load_devices
+
+                # __admin__ minted under the master secret — nothing to
+                # re-verify at redeem; a device inviter must still exist
+                # AND still pass the ownership hook.
+                granter_ok = (
+                    granted_by == "__admin__"
+                    or (granted_by in load_devices()
+                        and ws_invite_auth(granted_by, ws_id))
+                )
+                if not granter_ok:
+                    self._write_json(
+                        {"ok": False,
+                         "error": "invite grant no longer valid"}, 403)
+                    return
+                # An already-paired device presenting its credential
+                # gains the ws grant without a second device_id.
+                ctx = self._auth_ctx()
+                if ctx.get("kind") == "device" and ctx.get("device_id"):
+                    did = str(ctx["device_id"])
+                    try:
+                        ws_grant_hook(did, ws_id, granted_by)
+                        from .devices import add_allowlist
+
+                        add_allowlist(did, ws_id)
+                    except Exception as exc:  # noqa: BLE001
+                        self._write_json(
+                            {"ok": False,
+                             "error": f"ws grant failed: {exc}"}, 500)
+                        return
+                    self._write_json(
+                        {"ok": True, "mode": "ws", "ws": ws_id,
+                         "host_id": entry.get("host_id", ""),
+                         "granted_by": granted_by,
+                         "device_id": did, "token": "",
+                         "hub": {
+                             "stream": "/v1/hub/stream",
+                             "send": "/v1/hub/send",
+                             "devices": "/v1/hub/devices",
+                             "lease": "/v1/hub/lease",
+                         }},
+                        200,
+                    )
+                    return
+            # mode=remote|ws mints a scoped device credential — the master
             # relay_secret is never handed out by pairing (agents-relay#38/#40).
             try:
                 from .devices import mint_device
 
+                # mode=ws guests are ws_member-scoped to the granted ws;
+                # mode=remote pairs a compute node (role=host).
                 dev = mint_device(
-                    label=self.address_string(),
+                    label=label or self.address_string(),
                     host_id=entry.get("host_id", ""),
+                    role="ws_member" if entry["mode"] == "ws" else "host",
+                    allowlist=[ws_id] if entry["mode"] == "ws" else None,
                 )
             except Exception as exc:  # noqa: BLE001
                 self._write_json(
                     {"ok": False, "error": f"device mint failed: {exc}"}, 500)
                 return
+            if entry["mode"] == "ws" and ws_id and ws_grant_hook is not None:
+                try:
+                    ws_grant_hook(
+                        dev["device_id"], ws_id, granted_by)
+                except Exception as exc:  # noqa: BLE001
+                    # Roll back the minted device — no leaked credential
+                    # for a grant that never landed (agents-relay#42).
+                    from .devices import revoke_device
+
+                    revoke_device(dev["device_id"])
+                    self._write_json(
+                        {"ok": False,
+                         "error": f"ws grant failed: {exc}"}, 500)
+                    return
             self._write_json(
                 {
                     "ok": True,
-                    "mode": "remote",
+                    "mode": entry["mode"],
                     "host_id": entry.get("host_id", ""),
+                    "ws": ws_id,
+                    "granted_by": entry.get("granted_by", ""),
                     "device_id": dev["device_id"],
                     "token": dev["device_token"],
                     "hub": {
@@ -645,7 +1083,7 @@ class TurnHandler(BaseHTTPRequestHandler):
             body = self._read_json()
             if body is None:
                 return
-            from .leases import hub_leases
+            from .leases import default_ttl, hub_leases
 
             book = hub_leases()
             action = str(body.get("action") or "")
@@ -653,6 +1091,9 @@ class TurnHandler(BaseHTTPRequestHandler):
             session = str(body.get("session") or "")
             if not ws or not session:
                 self.send_error(400, "ws and session required")
+                return
+            if not _ws_allowed(self._auth_ctx(), ws):
+                self.send_error(403, "workspace not in allowlist")
                 return
             fence = 0
             if action in ("renew", "release"):
@@ -668,11 +1109,33 @@ class TurnHandler(BaseHTTPRequestHandler):
                 if fence <= 0:
                     self.send_error(400, "fence must be positive")
                     return
+            # The workspace must actually admit this device — an
+            # allowlist row is a route filter, ws.allows_device is the
+            # exec trust boundary (agents-relay#44).
+            try:
+                from .workspaces import get_workspace
+            except ImportError:
+                self.send_error(503, "workspace registry unavailable")
+                return
+            try:
+                lease_ws = get_workspace(ws)
+            except (KeyError, ValueError):
+                self.send_error(404, "unknown workspace")
+                return
+            try:
+                if not lease_ws.allows_device(did):
+                    self.send_error(403, "device not in workspace sync_hosts")
+                    return
+            except Exception:  # noqa: BLE001 - policy read fails closed
+                self.send_error(403, "device not in workspace sync_hosts")
+                return
             if action == "acquire":
-                out = book.acquire(ws, session, did,
-                                   str(body.get("run_id") or ""))
+                out = book.acquire(
+                    ws, session, did, str(body.get("run_id") or ""),
+                    ttl=default_ttl(ws))
             elif action == "renew":
-                out = book.renew(ws, session, did, fence)
+                out = book.renew(ws, session, did, fence,
+                                 ttl=default_ttl(ws))
             elif action == "release":
                 out = book.release(ws, session, did, fence)
             else:
@@ -684,6 +1147,9 @@ class TurnHandler(BaseHTTPRequestHandler):
         if path == "/v1/workspaces":
             if not _check_secret(self, self.relay_secret, query_params):
                 self.send_error(401, "unauthorized")
+                return
+            if _device_admin_denied(self._auth_ctx()):
+                self.send_error(403, "workspace admin is operator-only")
                 return
             body = self._read_json()
             if body is None:
@@ -710,6 +1176,9 @@ class TurnHandler(BaseHTTPRequestHandler):
         if path == "/v1/jobs":
             if not _check_secret(self, self.relay_secret, query_params):
                 self.send_error(401, "unauthorized")
+                return
+            if _device_admin_denied(self._auth_ctx()):
+                self.send_error(403, "job control is operator-only")
                 return
             body = self._read_json()
             if body is None:
@@ -785,7 +1254,11 @@ class TurnHandler(BaseHTTPRequestHandler):
             body = self._read_json()
             if body is None:
                 return
-            status_code, payload = handle_store_append(ws, body)
+            _actx = self._auth_ctx()
+            status_code, payload = handle_store_append(
+                ws, body,
+                device_id=(str(_actx.get("device_id") or "")
+                           if _actx.get("kind") == "device" else ""))
             self._write_json(payload, status_code)
             return
 
@@ -814,6 +1287,9 @@ class TurnHandler(BaseHTTPRequestHandler):
         if path == "/v1/send":
             if not _check_secret(self, self.relay_secret, query_params):
                 self.send_error(401, "unauthorized")
+                return
+            if _device_admin_denied(self._auth_ctx()):
+                self.send_error(403, "send is operator-only")
                 return
             body = self._read_json()
             if body is None:
@@ -853,6 +1329,9 @@ class TurnHandler(BaseHTTPRequestHandler):
         if path == "/v1/model":
             if not _check_secret(self, self.relay_secret, query_params):
                 self.send_error(401, "unauthorized")
+                return
+            if _device_admin_denied(self._auth_ctx()):
+                self.send_error(403, "model switch is operator-only")
                 return
             body = self._read_json()
             if body is None:
@@ -899,7 +1378,10 @@ class TurnHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/v1/providers":
-            if not _check_secret(self, self.relay_secret, query_params):
+            # Provider manifests carry executable commands — device
+            # tokens never register new ones (agents-relay#41).
+            if not _check_secret(self, self.relay_secret, query_params,
+                                 allow_device=False):
                 self.send_error(401, "unauthorized")
                 return
             body = self._read_json()
@@ -922,6 +1404,9 @@ class TurnHandler(BaseHTTPRequestHandler):
         if path == "/v1/favorites":
             if not _check_secret(self, self.relay_secret, query_params):
                 self.send_error(401, "unauthorized")
+                return
+            if _device_admin_denied(self._auth_ctx()):
+                self.send_error(403, "favorites are operator-only")
                 return
             body = self._read_json()
             if body is None:
@@ -950,7 +1435,29 @@ class TurnHandler(BaseHTTPRequestHandler):
             body = self._read_json()
             if body is None:
                 return
-            handle_chat_stream(self, body)
+            ctx = self._auth_ctx()
+            if not _ws_allowed(ctx, _body_ws(body)):
+                self.send_error(403, "workspace not in allowlist")
+                return
+            if _ws_member_body_denied(ctx, body):
+                self.send_error(403, "ws_member cannot set workdir/policy fields")
+                return
+            if remote_turn_dispatch is not None and remote_turn_dispatch(
+                    self, path, body):
+                return
+            if _turn_lease_conflict(self, body):
+                return
+            started = False
+            try:
+                started = bool(handle_chat_stream(self, body))
+            finally:
+                # A validation 400 after acquire must not pin the
+                # (ws, session) run lock forever (agents-relay#44).
+                if not started and turn_lease_release_hook is not None:
+                    try:
+                        turn_lease_release_hook(body, self._auth_ctx())
+                    except Exception:  # noqa: BLE001
+                        pass
             return
 
         if path == "/v1/chat/stop":
@@ -959,6 +1466,16 @@ class TurnHandler(BaseHTTPRequestHandler):
                 return
             body = self._read_json()
             if body is None:
+                return
+            # ws gate BEFORE dispatch/local — `{}` from a ws_member must
+            # never fan out a host-wide cancel (agents-relay#44).
+            if not _ws_allowed(self._auth_ctx(), _body_ws(body)):
+                self.send_error(403, "workspace not in allowlist")
+                return
+            # a bound session's stop must reach the executing host —
+            # local _ACTIVE has nothing for remote runs (klanker#148)
+            if remote_turn_dispatch is not None and remote_turn_dispatch(
+                    self, path, body):
                 return
             handle_chat_stop(self, body)
             return
@@ -993,9 +1510,41 @@ class TurnHandler(BaseHTTPRequestHandler):
             if not valid_id(rid):
                 self.send_error(400, f"invalid remote id: {rid!r}")
                 return
+            rest = "/" + rparts[4] if len(rparts) > 4 else "/"
+            ctx = self._auth_ctx()
+            proxy_body = None
+            if ctx.get("role") == "ws_member":
+                # The proxy forwards raw bytes, so read once here for the
+                # ws ACL and cache them for handle_proxy. Member turn
+                # surfaces are JSON objects; anything else fails closed.
+                from .remotes import _read_proxy_body
+
+                try:
+                    raw_body = _read_proxy_body(self)
+                except ValueError as exc:
+                    self._write_json(
+                        {"ok": False, "error": str(exc)},
+                        413 if "too large" in str(exc) else 400)
+                    return
+                self._proxy_body_read = True
+                self._proxy_body = raw_body
+                try:
+                    proxy_body = (json.loads(raw_body.decode("utf-8"))
+                                  if raw_body else {})
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    self._write_json(
+                        {"ok": False, "error": "invalid json"}, 400)
+                    return
+                if not isinstance(proxy_body, dict):
+                    self._write_json(
+                        {"ok": False, "error": "json object required"}, 400)
+                    return
+            if not _proxy_allowed(ctx, rid, rest, self._cfg(), proxy_body):
+                self.send_error(403, "remote proxy denied")
+                return
             from .remotes import handle_proxy
 
-            handle_proxy(self, rid, "/" + rparts[4] if len(rparts) > 4 else "/")
+            handle_proxy(self, rid, rest)
             return
 
         if path == "/v1/inject":
@@ -1027,7 +1576,26 @@ class TurnHandler(BaseHTTPRequestHandler):
             except ValueError:
                 self.send_error(400, "invalid json")
                 return
-            self._handle_stream(body)
+            ctx = self._auth_ctx()
+            if not _ws_allowed(ctx, _body_ws(body)):
+                self.send_error(403, "workspace not in allowlist")
+                return
+            if _ws_member_body_denied(ctx, body):
+                self.send_error(403, "ws_member cannot set workdir/policy fields")
+                return
+            if remote_turn_dispatch is not None and remote_turn_dispatch(
+                    self, path, body):
+                return
+            if _turn_lease_conflict(self, body):
+                return
+            try:
+                self._handle_stream(body)
+            finally:
+                if turn_lease_release_hook is not None:
+                    try:
+                        turn_lease_release_hook(body, self._auth_ctx())
+                    except Exception:  # noqa: BLE001
+                        pass
             return
 
         if path.startswith("/v1/webhook/"):
@@ -1051,108 +1619,132 @@ class TurnHandler(BaseHTTPRequestHandler):
         body = self._read_json()
         if body is None:
             return
-        is_alert = path in ("/v1/alert", "/webhook/alert")
-        channel = str(body.get("channel") or ("webhook" if is_alert else "http"))
-        user = str(body.get("user") or ("alert" if is_alert else "anonymous"))
-        text = _extract_payload_text(body, query_params, include_extra=is_alert)
-        session = str(body.get("session") or "")
-        user_id = str(body.get("user_id") or "")
-        new_session = bool(body.get("new_session"))
-        notify = bool(is_alert or body.get("notify") or body.get("broadcast"))
-        raw_attachments = body.get("attachments") or []
-
-        # Workspace/persona are ids only — a path or label is a client bug.
-        ws = None
-        ws_ref = str(body.get("workspace") or "").strip()
-        if ws_ref:
-            try:
-                ws = resolve_workspace_id(ws_ref)
-            except ValueError as exc:
-                self.send_error(400, str(exc))
-                return
-        persona_ref = str(body.get("persona") or "").strip()
-        if persona_ref and not valid_id(persona_ref):
-            self.send_error(400, f"invalid persona id: {persona_ref!r}")
+        ctx = self._auth_ctx()
+        if not _ws_allowed(ctx, _body_ws(body)):
+            self.send_error(403, "workspace not in allowlist")
             return
-
-        turn_kwargs = {
-            "channel": channel,
-            "user": user,
-            "message": text,
-            "session": session,
-            "user_id": user_id,
-            "new_session": new_session,
-        }
-        for key in ("provider", "model", "persona", "project", "workspace", "workdir"):
-            val = str(body.get(key) or "").strip()
-            if val:
-                turn_kwargs[key] = val
-        attachment_notes: list[str] = []
-        if raw_attachments:
-            from .attachments import AttachmentRejected, materialize_for_turn
-
-            try:
-                turn_kwargs["attachments"] = materialize_for_turn(
-                    raw_attachments,
-                    config=self._cfg(),
-                    workspace_id=ws.id if ws is not None else "",
-                    notes=attachment_notes,
-                )
-            except AttachmentRejected:
-                self.send_error(400, "attachment path outside allowed directory")
+        if _ws_member_body_denied(ctx, body):
+            self.send_error(403, "ws_member cannot set workdir/policy fields")
+            return
+        if path == "/v1/turn" and remote_turn_dispatch is not None:
+            # Fail loud, not silent local fallback: a bound session that
+            # errors mid-proxy must not run the turn twice
+            # (agents-relay#44).
+            if remote_turn_dispatch(self, path, body):
                 return
-            if attachment_notes:
-                from .attachments import apply_notes
-
-                turn_kwargs["message"] = apply_notes(text, attachment_notes)
-            if not turn_kwargs["attachments"] and not text.strip():
-                self.send_error(400, "; ".join(attachment_notes) or "attachment rejected")
-                return
+        if path == "/v1/turn" and _turn_lease_conflict(self, body):
+            return
         try:
-            result = self._run_turn(turn_kwargs)
-        except Exception as exc:
-            log.exception("turn failed")
-            self.send_error(500, str(exc))
-            return
+            is_alert = path in ("/v1/alert", "/webhook/alert")
+            channel = str(body.get("channel") or ("webhook" if is_alert else "http"))
+            user = str(body.get("user") or ("alert" if is_alert else "anonymous"))
+            text = _extract_payload_text(body, query_params, include_extra=is_alert)
+            session = str(body.get("session") or "")
+            user_id = str(body.get("user_id") or "")
+            new_session = bool(body.get("new_session"))
+            notify = bool(is_alert or body.get("notify") or body.get("broadcast"))
+            raw_attachments = body.get("attachments") or []
 
-        notified = False
-        delivered: list[int] = []
-        skipped: list[str] = []
-        cfg = self._cfg()
-        if notify and cfg.telegram_bot_token and cfg.telegram_allowed_chat_ids:
-            from .telegram_adapter import deliver_html, resolve_delivery
-            from .telegram_format import extract_traces, format_telegram_html
-
-            spec = str(body.get("deliver") or body.get("deliver_to") or "").strip()
-            if spec:
-                targets, skipped = resolve_delivery(spec, cfg)
-            else:
-                targets = [int(cfg.telegram_allowed_chat_ids[0])]
-            if targets:
-                _, err_traces = extract_traces(result.stderr or "")
-                html = format_telegram_html(result.reply, err_traces)
-            for chat in targets:
+            # Workspace/persona are ids only — a path or label is a client bug.
+            ws = None
+            ws_ref = str(body.get("workspace") or "").strip()
+            if ws_ref:
                 try:
-                    deliver_html(cfg.telegram_bot_token, chat, html)
-                    delivered.append(chat)
-                except Exception as exc:
-                    log.warning("failed to broadcast notification to telegram %s: %s", chat, exc)
-            notified = bool(delivered)
+                    ws = resolve_workspace_id(ws_ref)
+                except ValueError as exc:
+                    self.send_error(400, str(exc))
+                    return
+            persona_ref = str(body.get("persona") or "").strip()
+            if persona_ref and not valid_id(persona_ref):
+                self.send_error(400, f"invalid persona id: {persona_ref!r}")
+                return
 
-        from .attachments import apply_notes
+            turn_kwargs = {
+                "channel": channel,
+                "user": user,
+                "message": text,
+                "session": session,
+                "user_id": user_id,
+                "new_session": new_session,
+            }
+            for key in ("provider", "model", "persona", "project", "workspace", "workdir"):
+                val = str(body.get(key) or "").strip()
+                if val:
+                    turn_kwargs[key] = val
+            attachment_notes: list[str] = []
+            if raw_attachments:
+                from .attachments import AttachmentRejected, materialize_for_turn
 
-        payload = {
-            "reply": apply_notes(result.reply, attachment_notes),
-            "session": result.session,
-            "user_id": result.user_id,
-            "alias": result.alias,
-            "returncode": result.returncode,
-            "notified": notified,
-        }
-        if delivered or skipped:
-            payload["delivered"] = delivered
-            payload["skipped"] = skipped
-        self._write_json(payload, 200 if result.returncode == 0 else 502)
+                try:
+                    turn_kwargs["attachments"] = materialize_for_turn(
+                        raw_attachments,
+                        config=self._cfg(),
+                        workspace_id=ws.id if ws is not None else "",
+                        notes=attachment_notes,
+                    )
+                except AttachmentRejected:
+                    self.send_error(400, "attachment path outside allowed directory")
+                    return
+                if attachment_notes:
+                    from .attachments import apply_notes
+
+                    turn_kwargs["message"] = apply_notes(text, attachment_notes)
+                if not turn_kwargs["attachments"] and not text.strip():
+                    self.send_error(400, "; ".join(attachment_notes) or "attachment rejected")
+                    return
+            try:
+                result = self._run_turn(turn_kwargs)
+            except Exception as exc:
+                log.exception("turn failed")
+                self.send_error(500, str(exc))
+                return
+
+            notified = False
+            delivered: list[int] = []
+            skipped: list[str] = []
+            cfg = self._cfg()
+            if notify and cfg.telegram_bot_token and cfg.telegram_allowed_chat_ids:
+                from .telegram_adapter import deliver_html, resolve_delivery
+                from .telegram_format import extract_traces, format_telegram_html
+
+                spec = str(body.get("deliver") or body.get("deliver_to") or "").strip()
+                if spec:
+                    targets, skipped = resolve_delivery(spec, cfg)
+                else:
+                    targets = [int(cfg.telegram_allowed_chat_ids[0])]
+                if targets:
+                    _, err_traces = extract_traces(result.stderr or "")
+                    html = format_telegram_html(result.reply, err_traces)
+                for chat in targets:
+                    try:
+                        deliver_html(cfg.telegram_bot_token, chat, html)
+                        delivered.append(chat)
+                    except Exception as exc:
+                        log.warning("failed to broadcast notification to telegram %s: %s", chat, exc)
+                notified = bool(delivered)
+
+            from .attachments import apply_notes
+
+            payload = {
+                "reply": apply_notes(result.reply, attachment_notes),
+                "session": result.session,
+                "user_id": result.user_id,
+                "alias": result.alias,
+                "returncode": result.returncode,
+                "notified": notified,
+            }
+            if delivered or skipped:
+                payload["delivered"] = delivered
+                payload["skipped"] = skipped
+            self._write_json(payload, 200 if result.returncode == 0 else 502)
+        finally:
+            # Lease release covers the ENTIRE post-acquire tail — early
+            # 400 validation exits included (agents-relay#44).
+            if path == "/v1/turn" and turn_lease_release_hook is not None:
+                try:
+                    turn_lease_release_hook(body, self._auth_ctx())
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _ws_and_persona(self, parts: list[str]):
         """(Workspace, persona id) from route segments; ids only (C22 rules)."""
@@ -1191,6 +1783,9 @@ class TurnHandler(BaseHTTPRequestHandler):
             return
         if len(parts) == 7 and parts[6] == "sessions":
             # POST .../personas/<p>/sessions {user, channel, workdir}
+            if _ws_member_body_denied(self._auth_ctx(), body):
+                self.send_error(403, "ws_member cannot set workdir/policy fields")
+                return
             try:
                 rec = create_session(
                     ws, persona,
@@ -1490,6 +2085,7 @@ class TurnHandler(BaseHTTPRequestHandler):
         from .approvals import (
             APPROVAL_ID_RE,
             approval_keyboard,
+            approval_request_hash,
             create_pending,
             format_approval_html,
             read_approval,
@@ -1504,11 +2100,24 @@ class TurnHandler(BaseHTTPRequestHandler):
         cfg = self._cfg()
         tok_ws = str(tok_rec.get("workspace") or "").strip()
         tok_hash = str(tok_rec.get("token_hash") or "").strip()
+        req_hash = approval_request_hash(req_obj)
         existing = read_approval(cfg, ident)
         if existing is not None:
             ex_tok = str(existing.get("token_hash") or "").strip()
-            if ex_tok and not hmac.compare_digest(ex_tok, tok_hash):
+            if not ex_tok or not hmac.compare_digest(ex_tok, tok_hash):
                 self._write_json({"ok": False, "error": "approval id conflict"}, 403)
+                return
+            ex_hash = str(existing.get("request_hash") or "")
+            if not ex_hash:
+                ex_req = existing.get("request")
+                if isinstance(ex_req, dict):
+                    ex_hash = approval_request_hash(ex_req)
+            # Fail closed: an unverifiable prior request is a conflict,
+            # never a silent pass (agents-relay#44).
+            if not ex_hash or not hmac.compare_digest(ex_hash, req_hash):
+                self._write_json(
+                    {"ok": False,
+                     "error": "approval request changed"}, 409)
                 return
             ex_ws = str(existing.get("workspace") or "").strip()
             if (ex_ws or tok_ws) and ex_ws != tok_ws:
@@ -1526,7 +2135,10 @@ class TurnHandler(BaseHTTPRequestHandler):
             )
             return
 
-        raw_user = str(body.get("user") or req_obj.get("user") or "")
+        # cfg.approver pins the decision target — a caller-supplied
+        # "user" must never redirect the prompt (agents-relay#41).
+        raw_user = "" if cfg.approver else str(
+            body.get("user") or req_obj.get("user") or "")
         chat_id, _ = resolve_approver_chat(
             raw_user,
             approver=cfg.approver,
@@ -1609,7 +2221,7 @@ class TurnHandler(BaseHTTPRequestHandler):
         if (ap_ws or tok_ws) and ap_ws != tok_ws:
             self._write_json({"ok": False, "error": "workspace mismatch"}, 403)
             return
-        if ap_tok and not hmac.compare_digest(ap_tok, tok_hash):
+        if not ap_tok or not hmac.compare_digest(ap_tok, tok_hash):
             self._write_json({"ok": False, "error": "forbidden"}, 403)
             return
 
@@ -1665,6 +2277,9 @@ class TurnHandler(BaseHTTPRequestHandler):
     def _handle_approvals_get(self, query_params: dict) -> None:
         from .state import read_json
 
+        ctx = self._approval_actor_allowed()
+        if not ctx:
+            return
         try:
             adir = self._approvals_dir(query_params)
         except KeyError:
@@ -1674,6 +2289,8 @@ class TurnHandler(BaseHTTPRequestHandler):
             self.send_error(400, str(exc))
             return
         ws_ref = str(query_params.get("workspace") or "").strip()
+        allow_ws = (ctx.get("allowlist") or frozenset()
+                    ) if ctx.get("kind") == "device" else frozenset()
         pending: list[tuple[float, dict]] = []
         if adir.is_dir():
             for path in adir.glob("*.json"):
@@ -1684,7 +2301,12 @@ class TurnHandler(BaseHTTPRequestHandler):
                 if not isinstance(req, dict):
                     req = {}
                 rec_ws = str(rec.get("workspace") or req.get("workspace") or "").strip()
-                if ws_ref and rec_ws and rec_ws != ws_ref:
+                # Fail closed: a ws-scoped filter hides unscoped records
+                # too — a missing rec_ws must never widen visibility
+                # (agents-relay#44).
+                if ws_ref and rec_ws != ws_ref:
+                    continue
+                if allow_ws and rec_ws not in allow_ws:
                     continue
                 try:
                     created = float(rec.get("created_at") or 0)
@@ -1694,6 +2316,8 @@ class TurnHandler(BaseHTTPRequestHandler):
                     "id": str(rec.get("id") or path.stem),
                     "tool": str(req.get("tool") or ""),
                     "summary": str(req.get("summary") or ""),
+                    "session": str(rec.get("session") or req.get("session") or ""),
+                    "device": str(rec.get("device") or req.get("device") or ""),
                 }
                 if rec_ws:
                     row["workspace"] = rec_ws
@@ -1701,8 +2325,24 @@ class TurnHandler(BaseHTTPRequestHandler):
         rows = [row for _, row in sorted(pending, key=lambda item: item[0])]
         self._write_json({"ok": True, "approvals": rows}, 200)
 
+    def _approval_actor_allowed(self) -> dict:
+        """Approval decisions belong to operators only: admin/cookie
+        callers or role=client devices. host/ws_member tokens that did
+        not create the record never decide it (agents-relay#41)."""
+        ctx = self._auth_ctx()
+        kind = ctx.get("kind")
+        if kind in ("admin", "cookie"):
+            return ctx
+        if kind == "device" and ctx.get("role") == "client":
+            return ctx
+        self.send_error(403, "approvals are operator-only")
+        return {}
+
     def _handle_approval_post(self, ident: str, query_params: dict) -> None:
         """Resolve a pending approval through the host-owned approval file."""
+        ctx = self._approval_actor_allowed()
+        if not ctx:
+            return
         body = self._read_json()
         if body is None:
             return
@@ -1723,13 +2363,20 @@ class TurnHandler(BaseHTTPRequestHandler):
                 return
         from .approvals import decide_approval, read_approval
 
-        if ws_ref:
-            rec = read_approval(cfg, ident)
-            if rec is not None:
-                rec_ws = str(rec.get("workspace") or "").strip()
-                if rec_ws and rec_ws != ws_ref:
-                    self.send_error(403, "workspace mismatch")
-                    return
+        rec = read_approval(cfg, ident)
+        rec_ws = ""
+        if rec is not None:
+            rec_ws = str(rec.get("workspace") or "").strip()
+        # Fail closed on BOTH sides: a rec without a workspace stamp can
+        # never satisfy a ws-scoped decide (agents-relay#44).
+        if ws_ref and rec is not None and rec_ws != ws_ref:
+            self.send_error(403, "workspace mismatch")
+            return
+        if rec is not None and ctx.get("kind") == "device":
+            allow_ws = ctx.get("allowlist") or frozenset()
+            if allow_ws and rec_ws not in allow_ws:
+                self.send_error(403, "workspace not in allowlist")
+                return
         try:
             code, note = decide_approval(cfg, ident, allow=allow)
         except ValueError as exc:
@@ -1742,7 +2389,7 @@ class TurnHandler(BaseHTTPRequestHandler):
         if code != 0:
             self.send_error(400 if note == "invalid approval id" else 404, note)
             return
-        _emit_relay_event("approval.changed", {"action": "decide", "id": ident, "allow": allow}, workspace=ws_ref)
+        _emit_relay_event("approval.changed", {"action": "decide", "id": ident, "allow": allow}, workspace=rec_ws or ws_ref)
         self._write_json({"ok": True, "id": ident, "status": note}, 200)
 
     def _handle_stream(self, body: dict) -> None:
@@ -1828,6 +2475,8 @@ class TurnHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path, query_params = _parse_query(self.path)
         cfg = self._cfg()
+        if self._gate_ws_member("GET", path, query_params):
+            return
         if path == "/v1/auth/status":
             handle_status(self)
             return
@@ -1842,7 +2491,9 @@ class TurnHandler(BaseHTTPRequestHandler):
             from .events import handle_events_sse
 
             hb = float(getattr(self.server, "events_heartbeat_sec", 25.0))
-            handle_events_sse(self, workspace=ws_filter, heartbeat_sec=hb)
+            handle_events_sse(
+                self, workspace=ws_filter, heartbeat_sec=hb,
+                tag=str(self._auth_ctx().get("device_id") or ""))
             return
         if path == "/v1/workspaces":
             if not _check_secret(self, self.relay_secret, query_params):
@@ -1885,7 +2536,21 @@ class TurnHandler(BaseHTTPRequestHandler):
             if not _check_secret(self, self.relay_secret, query_params):
                 self.send_error(401, "unauthorized")
                 return
-            handle_runs_attach(self, query_params)
+            # ws gate BEFORE dispatch — an unscoped attach must never
+            # leak another workspace's run events (agents-relay#44).
+            rctx = self._auth_ctx()
+            if not _ws_allowed(
+                    rctx, str(query_params.get("workspace") or "")):
+                self.send_error(403, "workspace not in allowlist")
+                return
+            # re-attach follows the run's executing host, not the local
+            # (empty) _ACTIVE table (klanker#148)
+            if remote_query_dispatch is not None and remote_query_dispatch(
+                    self, path, query_params):
+                return
+            handle_runs_attach(
+                self, query_params,
+                tag=str(rctx.get("device_id") or ""))
             return
         if path == "/v1/push/vapid-key":
             if not _check_secret(self, self.relay_secret, query_params):
@@ -1972,7 +2637,10 @@ class TurnHandler(BaseHTTPRequestHandler):
                               "providers": rows}, 200)
             return
         if path == "/v1/remotes":
-            if not _check_secret(self, self.relay_secret, query_params):
+            # Mount table is operator surface — device tokens never read
+            # it either (agents-relay#41).
+            if not _check_secret(self, self.relay_secret, query_params,
+                                 allow_device=False):
                 self.send_error(401, "unauthorized")
                 return
             from .remotes import list_public
@@ -2010,14 +2678,40 @@ class TurnHandler(BaseHTTPRequestHandler):
             self._write_json({"ok": True, "devices": rows}, 200)
             return
         if path == "/v1/hub/leases":
-            if not _check_secret(self, self.relay_secret, query_params,
-                                 allow_device=False):
+            if not _check_secret(self, self.relay_secret, query_params):
                 self.send_error(401, "unauthorized")
                 return
             from .leases import hub_leases
 
-            self._write_json(
-                {"ok": True, "leases": hub_leases().snapshot()}, 200)
+            ctx = self._auth_ctx()
+            rows = hub_leases().snapshot()
+            if ctx.get("kind") == "device":
+                # Every device reads only workspaces that actually
+                # admit it — ws.allows_device is the trust boundary,
+                # the allowlist narrows ws_member reads further
+                # (agents-relay#44).
+                did = str(ctx.get("device_id") or "")
+                allow = (set(ctx.get("allowlist") or ())
+                         if ctx.get("role") == "ws_member" else None)
+                try:
+                    from .workspaces import get_workspace
+                except ImportError:
+                    get_workspace = None
+
+                def _lease_visible(s: dict) -> bool:
+                    ws_name = str(s.get("ws") or "")
+                    if allow is not None and ws_name not in allow:
+                        return False
+                    if get_workspace is None:
+                        return False
+                    try:
+                        return bool(get_workspace(ws_name)
+                                    .allows_device(did))
+                    except (KeyError, ValueError, OSError):
+                        return False
+
+                rows = [s for s in rows if _lease_visible(s)]
+            self._write_json({"ok": True, "leases": rows}, 200)
             return
         if path == "/v1/discover":
             if not _check_secret(self, self.relay_secret, query_params,
@@ -2040,6 +2734,9 @@ class TurnHandler(BaseHTTPRequestHandler):
         if path.startswith("/v1/remote/"):
             if not _check_secret(self, self.relay_secret, query_params):
                 self.send_error(401, "unauthorized")
+                return
+            if not _proxy_allowed(self._auth_ctx()):
+                self.send_error(403, "remote proxy denied")
                 return
             parts = path.split("/", 4)
             rid = parts[3] if len(parts) > 3 else ""
@@ -2184,6 +2881,8 @@ class TurnHandler(BaseHTTPRequestHandler):
 
     def do_PATCH(self) -> None:
         path, query_params = _parse_query(self.path)
+        if self._gate_ws_member("PATCH", path, query_params):
+            return
         parts = path.split("/")
         # PATCH /v1/workspaces/<id> — per-workspace separation settings.
         if (len(parts) == 4 and parts[1] == "v1"
@@ -2195,8 +2894,15 @@ class TurnHandler(BaseHTTPRequestHandler):
             if not valid_id(ws_id):
                 self.send_error(400, f"invalid workspace id: {ws_id!r}")
                 return
+            ctx = self._auth_ctx()
+            if _device_admin_denied(ctx):
+                self.send_error(403, "workspace admin is operator-only")
+                return
             body = self._read_json()
             if body is None:
+                return
+            if _ws_member_body_denied(ctx, body):
+                self.send_error(403, "ws_member cannot set sync/policy fields")
                 return
             from .workspaces import patch_workspace
 
@@ -2215,11 +2921,14 @@ class TurnHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:
         path, query_params = _parse_query(self.path)
+        if self._gate_ws_member("DELETE", path, query_params):
+            return
         parts = path.split("/")
         # DELETE /v1/providers/<name> — file-managed manifests only.
         if (len(parts) == 4 and parts[1] == "v1"
                 and parts[2] == "providers" and parts[3]):
-            if not _check_secret(self, self.relay_secret, query_params):
+            if not _check_secret(self, self.relay_secret, query_params,
+                                 allow_device=False):
                 self.send_error(401, "unauthorized")
                 return
             from .providers_api import ProviderError, delete_provider
@@ -2257,18 +2966,35 @@ class TurnHandler(BaseHTTPRequestHandler):
                                  allow_device=False):
                 self.send_error(401, "unauthorized")
                 return
-            from .devices import revoke_device
+            from .devices import REVOCATION_LOCK, revoke_device
 
-            if not revoke_device(parts[4]):
-                self.send_error(404, "unknown device")
-                return
+            # REVOCATION_LOCK serializes (revoke + disconnect + remote
+            # delete) against the channel auto-register race in
+            # handle_hub_stream — a revoked device can never resurrect
+            # its dev-<id> row (agents-relay#44).
+            with REVOCATION_LOCK:
+                if not revoke_device(parts[4]):
+                    self.send_error(404, "unknown device")
+                    return
+                try:
+                    from .channel import hub
+
+                    hub().disconnect(parts[4])  # drop any live stream too
+                    from .remotes import delete_remote
+
+                    delete_remote(self._cfg(), f"dev-{parts[4]}")
+                except Exception:
+                    pass
             try:
-                from .channel import hub
+                # Revocation is total: live leases + tagged SSE streams
+                # die with the credential (agents-relay#42/#44).
+                from .events import disconnect_tag
+                from .leases import hub_leases
+                from .web import disconnect_stream_tag
 
-                hub().disconnect(parts[4])  # drop any live stream too
-                from .remotes import delete_remote
-
-                delete_remote(self._cfg(), f"dev-{parts[4]}")
+                disconnect_tag(parts[4])
+                disconnect_stream_tag(parts[4])
+                hub_leases().release_holder(parts[4])
             except Exception:
                 pass
             _emit_relay_event("device.changed", {"action": "revoke", "id": parts[4]})
@@ -2284,15 +3010,22 @@ class TurnHandler(BaseHTTPRequestHandler):
             if not valid_id(rid):
                 self.send_error(400, f"invalid remote id: {rid!r}")
                 return
+            rest = "/" + rparts[4] if len(rparts) > 4 else "/"
+            if not _proxy_allowed(self._auth_ctx(), rid, rest, self._cfg()):
+                self.send_error(403, "remote proxy denied")
+                return
             from .remotes import handle_proxy
 
-            handle_proxy(self, rid, "/" + rparts[4] if len(rparts) > 4 else "/")
+            handle_proxy(self, rid, rest)
             return
         # DELETE /v1/workspaces/<id>[?hard=1]
         if (len(parts) == 4 and parts[1] == "v1"
                 and parts[2] == "workspaces" and parts[3]):
             if not _check_secret(self, self.relay_secret, query_params):
                 self.send_error(401, "unauthorized")
+                return
+            if _device_admin_denied(self._auth_ctx()):
+                self.send_error(403, "workspace admin is operator-only")
                 return
             ws_id = parts[3]
             if not valid_id(ws_id):

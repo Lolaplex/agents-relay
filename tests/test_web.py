@@ -85,6 +85,9 @@ class TestCookie(unittest.TestCase):
 
 class TestAuthEndpoints(unittest.TestCase):
     def setUp(self):
+        from agents_relay.web import reset_login_limits
+
+        reset_login_limits()  # per-IP fails must not leak across tests
         self.srv = _Server(_cfg())
 
     def tearDown(self):
@@ -93,6 +96,53 @@ class TestAuthEndpoints(unittest.TestCase):
     def test_login_rejects_wrong_token(self):
         resp = self.srv.request("POST", "/v1/auth/login", {"token": "nope"})
         self.assertEqual(resp.status, 401)
+
+    def test_login_rate_limited_after_five_failures(self):
+        """agents-relay#42: a network-reachable relay must not be a
+        token oracle — sliding-window per-IP throttle."""
+        from agents_relay.web import reset_login_limits
+
+        reset_login_limits()
+        try:
+            for _ in range(5):
+                resp = self.srv.request(
+                    "POST", "/v1/auth/login", {"token": "nope"})
+                self.assertEqual(resp.status, 401)
+                resp.read()
+            resp = self.srv.request(
+                "POST", "/v1/auth/login", {"token": "nope"})
+            self.assertEqual(resp.status, 429)
+            resp.read()
+            # even the CORRECT token is throttled inside the window
+            resp = self.srv.request(
+                "POST", "/v1/auth/login", {"token": "tok"})
+            self.assertEqual(resp.status, 429)
+            resp.read()
+        finally:
+            reset_login_limits()
+
+    def test_forwarded_proto_ignored_without_trust_proxy(self):
+        """X-Forwarded-Proto is client input — Secure-cookie decisions
+        must not trust it unless RELAY_TRUST_PROXY=1 (agents-relay#42)."""
+        srv = _Server(_cfg(web_secure=True))
+        try:
+            resp = srv.request(
+                "POST", "/v1/auth/login", {"token": "tok"},
+                headers={"X-Forwarded-Proto": "https"})
+            raw = resp.getheader("Set-Cookie") or ""
+            parts = [p.strip() for p in raw.split(";")]
+            self.assertNotIn("Secure", parts)
+            resp.read()
+            with patch.dict(os.environ, {"RELAY_TRUST_PROXY": "1"}):
+                resp = srv.request(
+                    "POST", "/v1/auth/login", {"token": "tok"},
+                    headers={"X-Forwarded-Proto": "https"})
+                raw = resp.getheader("Set-Cookie") or ""
+                parts = [p.strip() for p in raw.split(";")]
+                self.assertIn("Secure", parts)
+                resp.read()
+        finally:
+            srv.close()
 
     def test_login_sets_cookie_and_status_accepts_it(self):
         resp = self.srv.request("POST", "/v1/auth/login", {"token": "tok"})
@@ -614,10 +664,21 @@ class TestTcpDropAndAuthStatus(unittest.TestCase):
         self.assertIn("tailscale", data["cookie_warning"])
 
     def test_no_cookie_warning_forwarded_https(self):
-        data = self._status(
-            {"Host": "100.64.1.2:8787", "X-Forwarded-Proto": "https"})
+        # X-Forwarded-Proto counts only under RELAY_TRUST_PROXY=1
+        # (agents-relay#42) — behind a declared proxy this suppresses
+        # the plain-HTTP warning as before.
+        with patch.dict(os.environ, {"RELAY_TRUST_PROXY": "1"}):
+            data = self._status(
+                {"Host": "100.64.1.2:8787", "X-Forwarded-Proto": "https"})
         self.assertTrue(data["secure_cookie"])
         self.assertEqual(data["cookie_warning"], "")
+
+    def test_cookie_warning_spoofed_forwarded_without_trust(self):
+        # Without the opt-in, a client-sent X-Forwarded-Proto must NOT
+        # silence the warning (agents-relay#42).
+        data = self._status(
+            {"Host": "100.64.1.2:8787", "X-Forwarded-Proto": "https"})
+        self.assertIn("tailscale", data["cookie_warning"])
 
     def test_no_cookie_warning_loopback(self):
         data = self._status({"Host": "127.0.0.1:8787"})
@@ -654,13 +715,16 @@ class TestTurnSurvivesClientDrop(unittest.TestCase):
     def _patches(self, script: str):
         import contextlib
         import subprocess
+        import sys
 
         from agents_relay import turn as turn_mod
 
         procs: list = []
 
         def spawn(argv, env=None, workspace="", workdir="", extra=None):
-            p = subprocess.Popen(["bash", "-c", script],
+            # python -c, not bash -c: 'bash' resolves to WSL on Windows
+            # hosts and dies instantly (agents-relay#41 test fix).
+            p = subprocess.Popen([sys.executable, "-c", script],
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             procs.append(p)
             return p, None
@@ -717,7 +781,8 @@ class TestTurnSurvivesClientDrop(unittest.TestCase):
 
         from agents_relay import web as web_mod
 
-        script = "echo working >&2; sleep 1.5; printf 'done'"
+        script = ("import sys, time; sys.stderr.write('working\\n'); "
+                  "sys.stderr.flush(); time.sleep(1.5); print('done', end='')")
         stack, procs = self._patches(script)
         with stack:
             web_mod.handle_chat_stream(self._dropping_handler(1),
@@ -745,7 +810,7 @@ class TestTurnSurvivesClientDrop(unittest.TestCase):
     def test_stop_still_cancels(self):
         from agents_relay import web as web_mod
 
-        stack, procs = self._patches("sleep 30")
+        stack, procs = self._patches("import time; time.sleep(30)")
         with stack:
             web_mod.handle_chat_stream(self._dropping_handler(0),
                                        {"text": "hi", "run": "stop1"})
@@ -767,7 +832,8 @@ class TestTurnSurvivesClientDrop(unittest.TestCase):
     def test_repost_same_run_follows_existing_turn(self):
         from agents_relay import web as web_mod
 
-        stack, procs = self._patches("sleep 1; printf ok")
+        stack, procs = self._patches(
+            "import time; time.sleep(1); print('ok', end='')")
         with stack:
             web_mod.handle_chat_stream(self._dropping_handler(0),
                                        {"text": "hi", "run": "same1"})

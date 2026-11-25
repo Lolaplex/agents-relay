@@ -54,48 +54,88 @@ def _store_hubs(rows: dict) -> None:
     write_json_atomic(_hubs_path(), {"hubs": rows})
 
 
-def redeem_device(hub_url: str, credential: str, *, label: str = "") -> dict:
-    """POST /v1/pair/redeem on the hub -> device credentials (agents-relay#40)."""
+def redeem_device(hub_url: str, credential: str, *, label: str = "",
+                  bearer: str = "") -> dict:
+    """POST /v1/pair/redeem on the hub -> device credentials (agents-relay#40).
+
+    ``bearer`` re-auths an already-paired device (grant reuse); ``label``
+    is forwarded so the minted device row is not anonymous
+    (agents-relay#44). A reuse response carries ``token == ""`` — the
+    existing vault entry stays authoritative (`reused: True`)."""
     base = hub_url.strip().rstrip("/")
     if not base.startswith(("http://", "https://")):
         raise ValueError("hub_url must be an http(s) origin")
+    headers = {"Content-Type": "application/json",
+               "User-Agent": "agents-relay/device"}
+    if bearer.strip():
+        headers["Authorization"] = f"Bearer {bearer.strip()}"
     req = urllib.request.Request(
         f"{base}/v1/pair/redeem",
-        data=json.dumps({"token": credential.strip(), "code": credential.strip()}).encode(),
-        headers={"Content-Type": "application/json", "User-Agent": "agents-relay/device"},
+        data=json.dumps({"token": credential.strip(),
+                         "code": credential.strip(),
+                         "label": label}).encode(),
+        headers=headers,
         method="POST",
     )
     try:
         resp = urllib.request.urlopen(req, timeout=30)
-        body = json.loads(resp.read())
+        try:
+            body = json.loads(resp.read())
+        finally:
+            resp.close()
     except urllib.error.HTTPError as e:
         detail = e.read()[:300].decode("utf-8", "replace")
+        e.close()
         raise RuntimeError(f"redeem failed: HTTP {e.code} {detail}") from e
-    if not body.get("ok") or body.get("mode") != "remote":
+    if not body.get("ok") or body.get("mode") not in ("remote", "ws"):
         raise RuntimeError(f"redeem refused: {body.get('error') or body}")
-    if not body.get("device_id") or not body.get("token"):
+    if not body.get("device_id"):
         raise RuntimeError("hub returned no device credentials")
+    if not body.get("token"):
+        # Grant reuse for an already-paired device — no fresh credential
+        # is issued (agents-relay#44).
+        body["reused"] = True
     return body
 
 
 def connect_hub(hub_url: str, credential: str, *, label: str = "") -> dict:
-    """Redeem + persist the hub record; returns the stored row."""
+    """Redeem + persist the hub record; returns the stored row.
+
+    Reconnecting a hub already linked in ``hubs.json`` re-sends the
+    existing Bearer token so the hub extends the grant in place —
+    ``token == ""`` reuse keeps the stored device_id/vault entry
+    instead of minting a second device (agents-relay#44)."""
     from agents_workspace import write_secret
 
-    res = redeem_device(hub_url, credential, label=label)
-    hub_id = str(res.get("host_id") or "").strip() or urllib.parse.urlparse(
-        hub_url).hostname or "hub"
+    base = hub_url.strip().rstrip("/")
     rows = _load_hubs()
+    prev_id, prev_row = "", {}
+    for hid, row in rows.items():
+        if str(row.get("hub_url") or "").rstrip("/") == base:
+            prev_id, prev_row = hid, row
+            break
+    res = redeem_device(base, credential, label=label,
+                        bearer=hub_token(prev_id) if prev_id else "")
+    hub_id = str(res.get("host_id") or "").strip() or urllib.parse.urlparse(
+        base).hostname or "hub"
+    if prev_id and prev_id != hub_id:
+        rows.pop(prev_id, None)  # migrate the stored link under the new id
+    device_id = str(res.get("device_id") or "") or str(
+        prev_row.get("device_id") or "")
     rows[hub_id] = {
-        "hub_url": hub_url.strip().rstrip("/"),
-        "device_id": res["device_id"],
-        "label": label or res.get("host_id") or hub_id,
-        "last_seq": 0,
+        "hub_url": base,
+        "device_id": device_id,
+        "label": label or str(prev_row.get("label") or "")
+                 or res.get("host_id") or hub_id,
+        "last_seq": int(prev_row.get("last_seq") or 0),
         "connected_at": int(time.time()),
     }
     _store_hubs(rows)
-    write_secret(_secret_key(hub_id), res["token"], scope="host")
-    return {"hub_id": hub_id, **rows[hub_id]}
+    token = str(res.get("token") or "")
+    if token:
+        write_secret(_secret_key(hub_id), token, scope="host")
+    return {"hub_id": hub_id, "ws": res.get("ws") or "",
+            "reused": not token, **rows[hub_id]}
 
 
 def disconnect_hub(hub_id: str) -> bool:
@@ -149,10 +189,14 @@ _STREAM_PATHS = ("/v1/chat/stream", "/v1/runs/stream", "/v1/stream", "/v1/events
 # request against its own loopback WITH ITS MASTER SECRET, so admin and
 # credential-bearing surfaces are never reachable through the channel —
 # regardless of who asked the hub to proxy. Anything under these prefixes
-# could mint credentials, manage devices, or rewrite policy.
+# could mint credentials, manage devices, rewrite policy, or pivot.
 _RPC_DENY_ALWAYS = (
-    "/v1/pair", "/v1/hub", "/v1/remotes", "/v1/discover",
-    "/v1/clients", "/v1/secrets", "/v1/vault",
+    "/v1/pair", "/v1/hub", "/v1/remotes", "/v1/remote", "/v1/discover",
+    "/v1/clients", "/v1/secrets", "/v1/vault", "/v1/ws/invite",
+    "/v1/approvals", "/v1/model", "/v1/auth", "/v1/klanker/routines",
+    "/v1/klanker/skills", "/v1/klanker/memory", "/v1/jobs",
+    "/v1/send", "/v1/inject", "/v1/favorites", "/v1/push",
+    "/v1/a2a", "/v1/webhook", "/v1/alert",
 )
 _RPC_DENY_WRITE = (
     "/v1/providers", "/v1/settings", "/v1/workspaces",
@@ -161,6 +205,10 @@ _RPC_DENY_WRITE = (
 
 def _rpc_denied(method: str, path: str) -> bool:
     if any(path.startswith(p) for p in _RPC_DENY_ALWAYS):
+        return True
+    # Provider probes spawn arbitrary manifest commands (ACP RCE) —
+    # denied on read verbs too (agents-relay#44).
+    if path.startswith("/v1/providers/") and path.endswith("/probe"):
         return True
     if method not in ("GET", "HEAD") and any(
             path.startswith(p) for p in _RPC_DENY_WRITE):
@@ -177,8 +225,12 @@ def _rpc_http(params: dict, cfg: RelayConfig) -> Iterator[dict]:
     from .remotes import _normalize_proxy_rest
 
     req = dict(params.get("req") or {})
+    raw_path = str(req.get("path") or "/")
+    # Deny+normalize decide on the path only — the query is reattached
+    # unchanged so it can never smuggle a denied prefix or be eaten.
+    path_only, sep, query = raw_path.partition("?")
     try:
-        path = _normalize_proxy_rest(str(req.get("path") or "/"))
+        path = _normalize_proxy_rest(path_only)
     except ValueError as exc:
         yield {"error": str(exc)}
         return
@@ -187,13 +239,23 @@ def _rpc_http(params: dict, cfg: RelayConfig) -> Iterator[dict]:
         yield {"error": f"channel http rpc denied: {method} {path}",
                "status": 403, "done": True}
         return
+    from .http_adapter import MAX_HTTP_BODY_BYTES
+
     data: bytes | None = None
     if req.get("body_b64"):
         import base64
 
-        data = base64.b64decode(str(req["body_b64"]))
+        try:
+            data = base64.b64decode(str(req["body_b64"]), validate=True)
+        except ValueError:
+            yield {"error": "invalid body_b64", "status": 400, "done": True}
+            return
     elif isinstance(req.get("body"), str) and req["body"]:
         data = str(req["body"]).encode("utf-8")
+    if data is not None and len(data) > MAX_HTTP_BODY_BYTES:
+        yield {"error": "request body too large", "status": 413,
+               "done": True}
+        return
     headers = {"User-Agent": "agents-relay/channel-rpc"}
     token = _resolve_loopback_secret()
     if token:
@@ -202,34 +264,65 @@ def _rpc_http(params: dict, cfg: RelayConfig) -> Iterator[dict]:
         headers["Content-Type"] = str(req["content_type"])
     if req.get("accept"):
         headers["Accept"] = str(req["accept"])
+    if req.get("x_klanker_hop"):
+        # hop-count survives the channel hop so a bounced dispatch on the
+        # target hits its loop guard instead of proxying again (klanker#148)
+        try:
+            headers["X-Klanker-Hop"] = str(int(req["x_klanker_hop"]))
+        except (TypeError, ValueError):
+            pass
 
-    url = f"http://127.0.0.1:{cfg.relay_port}{path}"
+    url = f"http://127.0.0.1:{cfg.relay_port}{path}{sep + query if sep else ''}"
     hreq = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         resp = urllib.request.urlopen(hreq, timeout=600)
     except urllib.error.HTTPError as e:
+        try:
+            err_body = e.read().decode("utf-8", "replace")
+        finally:
+            e.close()
         yield {"status": e.code, "content_type": "application/json",
-               "body": e.read().decode("utf-8", "replace"), "done": True}
+               "body": err_body, "done": True}
         return
     except (urllib.error.URLError, OSError) as exc:
         yield {"error": f"local relay unreachable: {exc}"}
         return
 
-    ctype = str(resp.headers.get("Content-Type") or "")
-    if path.startswith(_STREAM_PATHS):
-        yield {"status": resp.status, "content_type": ctype}
-        try:
-            while True:
-                chunk = resp.read(4096)
-                if not chunk:
-                    break
-                yield {"chunk": chunk.decode("utf-8", "replace")}
-        except OSError as exc:
-            yield {"error": str(exc)}
+    try:
+        ctype = str(resp.headers.get("Content-Type") or "")
+        if path.startswith(_STREAM_PATHS):
+            yield {"status": resp.status, "content_type": ctype}
+            import codecs
+
+            # Incremental decode: a multi-byte UTF-8 char may straddle a
+            # read1 boundary (agents-relay#44).
+            decoder = codecs.getincrementaldecoder("utf-8")("replace")
+            try:
+                while True:
+                    # read1 returns what the socket has NOW — read(4096)
+                    # stalls SSE frames under the buffer size
+                    # (klanker#148 / agents-relay#44).
+                    chunk = resp.read1(8192)
+                    if not chunk:
+                        break
+                    text = decoder.decode(chunk)
+                    if text:
+                        yield {"chunk": text}
+                tail = decoder.decode(b"", final=True)
+                if tail:
+                    yield {"chunk": tail}
+            except OSError as exc:
+                yield {"error": str(exc)}
+                return
+            yield {"done": True}
             return
-        yield {"done": True}
+        raw = resp.read(MAX_HTTP_BODY_BYTES + 1)
+    finally:
+        resp.close()
+    if len(raw) > MAX_HTTP_BODY_BYTES:
+        yield {"error": "response body too large", "status": 502,
+               "done": True}
         return
-    raw = resp.read()
     import base64
 
     yield {"status": resp.status, "content_type": ctype,
@@ -280,10 +373,14 @@ class ChannelClient:
         self.cfg = config or RelayConfig.from_env()
         self._outbox: "queue.Queue[dict]" = queue.Queue(maxsize=512)
         self._stop = threading.Event()
+        self.revoked = False  # set on HTTP 401 — permanent, no reconnect
         self._seq_dirty = 0
         self.on_op = None    # fn(payload) — wired by the sync layer
         self.on_ack = None   # fn(payload) — wired by the sync layer
+        self.on_ws = None    # fn(kind, payload) — ws-share control frames
         self.on_hello = None  # fn(payload) — reconnect catch-up trigger
+        self.on_approval = None  # fn(kind, payload) — approval mirror/decision
+        self.on_revoked = None  # fn() — fires once on hub-side revocation
 
     def _persist_seq(self, force: bool = False) -> None:
         """Flush the resume cursor so a restart replays only the tail."""
@@ -309,6 +406,18 @@ class ChannelClient:
             "User-Agent": "agents-relay/device",
         }
 
+    def _mark_revoked(self) -> None:
+        """Hub said 401: the credential is dead — stop permanently and
+        notify the wiring layer once (agents-relay#44)."""
+        self.revoked = True
+        self._stop.set()
+        fn = getattr(self, "on_revoked", None)
+        if fn is not None:
+            try:
+                fn()
+            except Exception:  # noqa: BLE001 - hook never kills the stop
+                log.exception("on_revoked hook failed")
+
     def _post_send(self, msgs: list[dict]) -> bool:
         req = urllib.request.Request(
             f"{self.hub_url}/v1/hub/send",
@@ -319,6 +428,16 @@ class ChannelClient:
         try:
             urllib.request.urlopen(req, timeout=15).read()
             return True
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                # Revoked device: retrying can never succeed — stop the
+                # client for good instead of hammering the hub
+                # (agents-relay#42).
+                log.error("hub send 401 — device revoked, stopping channel")
+                self._mark_revoked()
+                return False
+            log.warning("hub send failed: %s", exc)
+            return False
         except (urllib.error.URLError, OSError) as exc:
             log.warning("hub send failed: %s", exc)
             return False
@@ -379,24 +498,32 @@ class ChannelClient:
         # otherwise block read1 forever and look "connected" while dead.
         resp = urllib.request.urlopen(req, timeout=90)
         buf = b""
-        while not self._stop.is_set():
-            chunk = resp.read1(4096)  # incremental — read() would wait for a full buffer
-            if not chunk:
-                return
-            buf += chunk
-            while b"\n\n" in buf:
-                block, buf = buf.split(b"\n\n", 1)
-                if block.startswith(b":"):
-                    continue
-                data = b""
-                for line in block.split(b"\n"):
-                    if line.startswith(b"data: "):
-                        data += line[6:]
-                if data:
-                    try:
-                        yield json.loads(data.decode("utf-8"))
-                    except json.JSONDecodeError:
+        try:
+            while not self._stop.is_set():
+                chunk = resp.read1(4096)  # incremental — read() would wait for a full buffer
+                if not chunk:
+                    return
+                buf += chunk
+                while b"\n\n" in buf:
+                    block, buf = buf.split(b"\n\n", 1)
+                    if block.startswith(b":"):
                         continue
+                    data = b""
+                    for line in block.split(b"\n"):
+                        if line.startswith(b"data: "):
+                            data += line[6:]
+                    if data:
+                        try:
+                            yield json.loads(data.decode("utf-8"))
+                        except json.JSONDecodeError:
+                            continue
+        finally:
+            # Always release the socket — on _stop, on generator close,
+            # on reader exit (agents-relay#44).
+            try:
+                resp.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def run_forever(self) -> None:
         sender = threading.Thread(target=self._sender, daemon=True)
@@ -421,11 +548,23 @@ class ChannelClient:
                     elif kind == "ack":
                         if self.on_ack is not None:
                             self.on_ack(msg.get("payload") or {})
+                    elif kind in ("ws:announce", "ws:revoke"):
+                        if self.on_ws is not None:
+                            self.on_ws(kind, msg.get("payload") or {})
+                    elif kind in ("approval-req", "approval-res"):
+                        if self.on_approval is not None:
+                            self.on_approval(kind, msg.get("payload") or {})
                     elif kind == "resync":
                         self.last_seq = 0  # full resync handled by op-log layer
                     # hello/presence are informational only
                 self._persist_seq(force=True)
                 backoff = _RECONNECT_MIN
+            except urllib.error.HTTPError as exc:
+                if exc.code == 401:
+                    log.error("stream 401 — device revoked, stopping channel")
+                    self._mark_revoked()
+                    break
+                log.warning("channel disconnected: %s", exc)
             except (urllib.error.URLError, OSError, TimeoutError) as exc:
                 log.warning("channel disconnected: %s", exc)
             if self._stop.is_set():
