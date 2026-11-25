@@ -228,6 +228,8 @@ def list_public() -> list[dict]:
     return [
         {"id": did, "label": m["label"], "host_id": m["host_id"],
          "role": m["role"],
+         # ws-share pills need the allowlist client-side (agents-relay#45)
+         "allowlist": list(m.get("allowlist") or []),
          "created_at": m["created_at"], "last_seen": m["last_seen"],
          "has_token": bool(_read_secret(did))}
         for did, m in sorted(load_devices().items())

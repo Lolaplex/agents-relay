@@ -72,7 +72,15 @@ def workspace_row(ws: Workspace) -> dict:
 
 
 _PATCH_FIELDS = frozenset(
-    {"label", "workdir", "workdir_lock", "browser_profile", "approval_mode"}
+    {"label", "workdir", "workdir_lock", "browser_profile",
+     "approval_mode"}
+)
+
+# Ownership/share fields (agents-relay#43) — strict write validation
+# lives in Host.update_workspace; ws_member callers are refused one
+# layer up (http_adapter) before this function ever runs.
+_POLICY_FIELDS = frozenset(
+    {"sync_policy", "sync_hosts", "default_host", "repos", "execution"}
 )
 
 
@@ -84,7 +92,8 @@ def patch_workspace(ws_id: str, payload: dict) -> dict:
     """
     if not isinstance(payload, dict):
         raise ValueError("payload must be a JSON object")
-    unknown = sorted(str(k) for k in payload if k not in _PATCH_FIELDS)
+    unknown = sorted(str(k) for k in payload
+                     if k not in _PATCH_FIELDS | _POLICY_FIELDS)
     if unknown:
         raise ValueError(f"unknown workspace fields: {', '.join(unknown)}")
     from agents_workspace import update_workspace_config
@@ -101,13 +110,43 @@ def patch_workspace(ws_id: str, payload: dict) -> dict:
         kwargs["workdir_lock"] = bool(payload["workdir_lock"])
     if "browser_profile" in payload:
         kwargs["browser_profile"] = payload["browser_profile"]
+    # ownership fields pass through verbatim — update_workspace runs
+    # the strict validators and raises ValueError on anything off.
+    for f in _POLICY_FIELDS:
+        if f in payload:
+            kwargs[f] = payload[f]
     ws = host.update_workspace(ws_id, **kwargs)
     if "approval_mode" in payload:
         mode = payload["approval_mode"]
         update_workspace_config(
             ws, {"approval": {"mode": mode if mode not in ("", None) else None}}
         )
-    return workspace_row(host.workspace(ws_id))
+    row = workspace_row(host.workspace(ws_id))
+    # Single canonical workspace.changed emit per patch — the route
+    # must not re-emit with a different key shape (agents-relay#45).
+    try:
+        from .events import emit_event
+
+        emit_event("workspace.changed",
+                   {"action": "patch", "workspace": ws_id,
+                    "fields": sorted(set(payload)
+                                     & (_PATCH_FIELDS | _POLICY_FIELDS))},
+                   workspace=ws_id)
+    except Exception:  # noqa: BLE001
+        pass
+    if set(payload) & _POLICY_FIELDS:
+        fn = globals().get("ws_policy_changed_fn")
+        if fn is not None:
+            try:
+                fn(ws_id)
+            except Exception:  # noqa: BLE001
+                pass
+    return row
+
+
+# klanker serve wires share-reconcile here: fn(ws_id) runs announce/
+# revoke delivery after a sync_policy/sync_hosts mutation (agents-relay#43).
+ws_policy_changed_fn = None
 
 
 def list_personas(ws: Workspace) -> list[dict]:

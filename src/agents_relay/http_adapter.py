@@ -261,10 +261,12 @@ _WS_MEMBER_DENY_KEYS = frozenset({
 })
 
 
-def _ws_member_body_denied(ctx: dict, body: dict) -> bool:
-    """True when a ws_member body carries policy/exec keys."""
+def _ws_member_body_denied(ctx: dict, body: Any) -> bool:
+    """True when a ws_member body is non-object or carries policy/exec keys."""
     if ctx.get("role") != "ws_member":
         return False
+    if not isinstance(body, dict):
+        return True
     return bool(set(body or {}) & _WS_MEMBER_DENY_KEYS)
 
 
@@ -272,6 +274,30 @@ def _device_admin_denied(ctx: dict) -> bool:
     """Workspace/admin mutations are operator surface — host/client
     device tokens never reach them (agents-relay#44)."""
     return ctx.get("kind") == "device" and ctx.get("role") != "ws_member"
+
+
+def _workspace_owner_id(ws_id: str) -> str:
+    """execution.owner for ``ws_id``; unknown/corrupt workspaces fail closed."""
+    try:
+        from .workspaces import get_workspace
+
+        execution = getattr(get_workspace(ws_id), "execution", None) or {}
+    except (ImportError, KeyError, ValueError, OSError, TypeError):
+        return ""
+    if not isinstance(execution, dict):
+        return ""
+    return str(execution.get("owner") or "").strip()
+
+
+def _force_host_switch_allowed(ctx: dict, ws_id: str) -> bool:
+    """force=True is operator/workspace-owner only; everyone else fails closed."""
+    if ctx.get("kind") in ("admin", "cookie"):
+        return True
+    if ctx.get("kind") != "device":
+        return False
+    owner = _workspace_owner_id(ws_id)
+    did = str(ctx.get("device_id") or "")
+    return bool(owner and did) and hmac.compare_digest(owner, did)
 
 
 def _ws_member_gate(ctx: dict, method: str, path: str,
@@ -543,6 +569,132 @@ remote_query_dispatch = None
 # wires both for hub AND spoke executors (klanker#148, klanker#136).
 turn_lease_hook = None        # fn(handler, body, ctx) -> dict|None
 turn_lease_release_hook = None  # fn(body, ctx) -> None
+# Live management hooks (agents-relay#43): klanker serve wires the
+# device-identity layer — the relay stays free of hubs.json/vault I/O.
+hub_links_fn = None            # fn() -> {"links": [...]}
+hub_connect_fn = None          # fn(body) -> {"ok"|"error", ...}
+hub_disconnect_fn = None       # fn(hub_id) -> {"ok"|"error", ...}
+session_host_switch_fn = None  # fn(ws, sid, host, force) -> dict
+# Spoke->Hub /hosts relay (agents-relay#45): klanker wires
+# fn(ws_id) -> payload dict|None that fetches + caches the hub's own
+# /hosts map over the live ChannelClient; None = link down.
+spoke_hosts_fn = None
+
+
+def _ws_hosts_payload(ws, ctx: dict, spoke_hosts_fn=None) -> dict:
+    """GET /v1/workspaces/<ws>/hosts body (agents-relay#43, #45).
+
+    Members come from ws.sync_hosts (+ execution.owner + default_host);
+    ``online`` = live channel link on THIS hub process, ``presence`` the
+    last inbound presence frame, ``leases`` the ws rows of hub_leases.
+    The local caller ALWAYS gets a ``self`` row — admin Bearer/cookie
+    callers resolve to the local host id — and a disconnected member's
+    stale status is forced ``offline``. On a spoke with no inbound
+    links the hub's own map is relayed via ``spoke_hosts_fn``;
+    ``hub_offline`` is only true when this process genuinely cannot
+    reach a hub (spoke-configured with no live link/hook).
+    """
+    from .channel import hub as _channel_hub
+    from .devices import list_public
+    from .leases import hub_leases
+
+    ch = _channel_hub()
+    self_id = str(ctx.get("device_id") or "")
+    self_is_host = False
+    if not self_id:
+        try:
+            from agents_workspace import Host
+
+            self_id = str(Host.from_env().host_id() or "")
+            self_is_host = bool(self_id)
+        except Exception:  # noqa: BLE001 - no host dir: no self row id
+            self_id = ""
+    links = ch.connected_devices()
+    if not links and spoke_hosts_fn is not None:
+        # Spoke path: relay the hub's own /hosts map so the picker sees
+        # real presence instead of an empty member list.
+        try:
+            hub_map = spoke_hosts_fn(str(ws.id))
+        except Exception:  # noqa: BLE001 - relay failure falls through
+            hub_map = None
+        if isinstance(hub_map, dict) and hub_map:
+            out = dict(hub_map)
+            out.update({"ok": True, "workspace": ws.id,
+                        "hub_offline": False})
+            hs = [h for h in (out.get("hosts") or [])
+                  if isinstance(h, dict)]
+            for h in hs:
+                h["self"] = str(h.get("device_id") or "") == self_id
+            # the local caller still gets its own self row — it is not
+            # part of the hub's member map (agents-relay#45)
+            if self_id and not any(h["self"] for h in hs):
+                hs.append({
+                    "device_id": self_id,
+                    "label": self_id,
+                    "role": "host" if self_is_host else "member",
+                    "self": True, "online": True, "via": "local",
+                    "last_seen": 0, "status": "online", "leases": []})
+            out["hosts"] = hs
+            return out
+    members = {str(d) for d in (getattr(ws, "sync_hosts", None) or ())}
+    owner = str((getattr(ws, "execution", None) or {}).get("owner") or "")
+    default = str(getattr(ws, "default_host", "") or "")
+    if owner:
+        members.add(owner)
+    if default:
+        members.add(default)
+    if self_id:
+        members.add(self_id)
+    labels = {r["id"]: r.get("label") for r in list_public()}
+    leases: dict[str, list] = {}
+    for s in hub_leases().snapshot():
+        if s.get("ws") != ws.id:
+            continue
+        leases.setdefault(str(s.get("holder") or ""), []).append(
+            {"session": s.get("session"), "run_id": s.get("run_id"),
+             "fence": s.get("fence"),
+             "expires_in": s.get("expires_in")})
+    hosts = []
+    for did in sorted(members):
+        pres = ch.presence(did)
+        connected = bool(pres.get("connected"))
+        is_self = did == self_id
+        hosts.append({
+            "device_id": did,
+            "label": str(labels.get(did) or did),
+            "role": ("owner" if did == owner
+                     else "default" if did == default
+                     else "host" if is_self and self_is_host
+                     else "member"),
+            "self": is_self,
+            # the caller's own row is always online — it is literally
+            # serving/making this request (agents-relay#45)
+            "online": connected or is_self,
+            "via": "channel" if connected or did in labels else "local",
+            "last_seen": pres.get("ts") or 0,
+            # stale presence ("busy") must not survive a dropped link
+            "status": (pres.get("status") or "online")
+                      if connected or is_self else "offline",
+            "leases": leases.get(did) or [],
+        })
+    if links:
+        hub_offline = False  # this process is serving devices — it IS a hub
+    else:
+        try:
+            from .channel_client import _load_hubs
+
+            # spoke-configured but the relay above produced nothing:
+            # the hub is unreachable from here
+            hub_offline = bool(_load_hubs())
+        except Exception:  # noqa: BLE001 - no hubs.json: we are the hub
+            hub_offline = False
+    return {
+        "ok": True, "workspace": ws.id,
+        "sync_policy": str(getattr(ws, "sync_policy", "") or ""),
+        "owner": owner, "default_host": default,
+        "hub_offline": hub_offline,
+        "hosts": hosts,
+    }
 
 
 def _turn_lease_conflict(handler, body: dict) -> bool:
@@ -1269,6 +1421,95 @@ class TurnHandler(BaseHTTPRequestHandler):
                 self.send_error(401, "unauthorized")
                 return
             self._handle_persona_post(parts, query_params)
+            return
+
+        # POST /v1/workspaces/<ws>/sessions/<sid>/host — session host
+        # switch between prompts (klanker#148 / agents-relay#43):
+        # checkpoint -> rebind -> cleanup lives in the klanker hook.
+        if (len(parts) == 7 and parts[1] == "v1"
+                and parts[2] == "workspaces" and parts[4] == "sessions"
+                and parts[6] == "host"):
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            ws_id, sid = parts[3], parts[5]
+            if not valid_id(ws_id) or not valid_id(sid):
+                self.send_error(400, "invalid workspace/session id")
+                return
+            body = self._read_json()
+            if body is None:
+                return  # _read_json already sent 400/413 (agents-relay#45)
+            ctx = self._auth_ctx()
+            if _ws_member_body_denied(ctx, body):
+                self.send_error(403, "ws_member cannot set workdir/policy fields")
+                return
+            new_host = str(body.get("host") or "").strip()
+            if not new_host:
+                self.send_error(400, "host is required")
+                return
+            if not valid_id(new_host):
+                self.send_error(400, f"invalid host id: {new_host!r}")
+                return
+            force = bool(body.get("force"))
+            if force and not _force_host_switch_allowed(ctx, ws_id):
+                self.send_error(403, "force host switch requires workspace owner")
+                return
+            fn = getattr(self.server, "session_host_switch_fn", None) \
+                or session_host_switch_fn
+            if fn is None:
+                self._write_json(
+                    {"ok": False,
+                     "error": "host switch not configured"}, 501)
+                return
+            try:
+                out = fn(ws_id, sid, new_host, force=force)
+            except Exception as exc:  # noqa: BLE001
+                self.send_error(500, f"host switch failed: {exc}")
+                return
+            out = dict(out or {})
+            if out.get("error"):
+                self._write_json(
+                    {"ok": False, **out},
+                    int(out.get("status") or 409))
+                return
+            try:
+                from .events import emit_event
+
+                emit_event("session.bound", {
+                    "session": sid, "host": new_host}, workspace=ws_id)
+            except Exception:  # noqa: BLE001
+                pass
+            self._write_json({"ok": True, **out}, 200)
+            return
+
+        # POST /v1/hub/connect — live hub-link management (agents-relay#43):
+        # redeem invite + write hubs.json + vault + spawn ChannelClient —
+        # the klanker hook owns the lifecycle, no serve restart.
+        if path == "/v1/hub/connect":
+            if not _check_secret(self, self.relay_secret, query_params,
+                                 allow_device=False):
+                self.send_error(401, "unauthorized")
+                return
+            body = self._read_json()
+            if body is None:
+                return
+            fn = getattr(self.server, "hub_connect_fn", None) \
+                or hub_connect_fn
+            if fn is None:
+                self._write_json(
+                    {"ok": False,
+                     "error": "hub connect not configured"}, 501)
+                return
+            try:
+                out = fn(dict(body))
+            except Exception as exc:  # noqa: BLE001
+                self.send_error(500, f"hub connect failed: {exc}")
+                return
+            out = dict(out or {})
+            status = int(out.pop("status", 0) or 0)
+            if out.get("error") and not status:
+                status = 502
+            self._write_json(out, status or 200)
             return
 
         # POST /v1/approvals/request — turn-authenticated via Bearer AGENTS_APPROVAL_TOKEN
@@ -2753,6 +2994,69 @@ class TurnHandler(BaseHTTPRequestHandler):
                 and parts[2] == "approvals" and parts[4] == "wait"):
             self._handle_approval_wait(parts[3], query_params)
             return
+        # GET /v1/workspaces/<ws>/hosts — member presence + active
+        # leases for the host picker (agents-relay#43): on the hub this
+        # aggregates sync_hosts ∩ connected devices + hub_leases rows;
+        # a member device sees only its own allowlisted workspaces.
+        if (len(parts) == 5 and parts[1] == "v1"
+                and parts[2] == "workspaces" and parts[4] == "hosts"):
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            ws_ref = parts[3]
+            if not valid_id(ws_ref):
+                self.send_error(400, f"invalid workspace id: {ws_ref!r}")
+                return
+            ctx = self._auth_ctx()
+            if ctx.get("role") == "ws_member" \
+                    and not _ws_allowed(ctx, ws_ref):
+                self.send_error(403, "workspace not in allowlist")
+                return
+            from .workspaces import get_workspace
+
+            try:
+                ws = get_workspace(ws_ref)
+            except KeyError:
+                self.send_error(404, "unknown workspace")
+                return
+            if ctx.get("kind") == "device":
+                # EVERY device caller (host/client/ws_member) must be on
+                # the ws sync allowlist — membership in another ws's
+                # sync_hosts grants nothing here (agents-relay#45).
+                did = str(ctx.get("device_id") or "")
+                try:
+                    admitted = bool(ws.allows_device(did))
+                except Exception:  # noqa: BLE001 - fail closed
+                    admitted = False
+                if not admitted:
+                    self.send_error(
+                        403, "device not admitted to workspace")
+                    return
+            fn = getattr(self.server, "spoke_hosts_fn", None) \
+                or spoke_hosts_fn
+            self._write_json(
+                _ws_hosts_payload(ws, ctx, spoke_hosts_fn=fn), 200)
+            return
+        # GET /v1/hub/links — live paired-hub state for the link
+        # manager (agents-relay#43). Public metadata only, never tokens.
+        if path == "/v1/hub/links":
+            if not _check_secret(self, self.relay_secret, query_params,
+                                 allow_device=False):
+                self.send_error(401, "unauthorized")
+                return
+            fn = getattr(self.server, "hub_links_fn", None) \
+                or hub_links_fn
+            if fn is None:
+                self._write_json({"ok": True, "links": []}, 200)
+                return
+            try:
+                out = fn() or {}
+            except Exception as exc:  # noqa: BLE001
+                self.send_error(500, f"hub links failed: {exc}")
+                return
+            self._write_json({"ok": True, "links": out.get("links") or []},
+                             200)
+            return
         # GET /v1/workspaces/<ws>/inbox — team feed: counts + recent handoffs
         if (len(parts) == 5 and parts[1] == "v1"
                 and parts[2] == "workspaces" and parts[4] == "inbox"):
@@ -2914,7 +3218,8 @@ class TurnHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self.send_error(400, str(exc))
                 return
-            _emit_relay_event("workspace.changed", {"action": "patch", "workspace": ws_id}, workspace=ws_id)
+            # workspace.changed is emitted once inside patch_workspace
+            # (canonical "workspace" key — agents-relay#45).
             self._write_json({"ok": True, "workspace": row}, 200)
             return
         self.send_error(404)
@@ -2980,6 +3285,7 @@ class TurnHandler(BaseHTTPRequestHandler):
                     from .channel import hub
 
                     hub().disconnect(parts[4])  # drop any live stream too
+                    hub().drop_presence(parts[4])  # and its stale row
                     from .remotes import delete_remote
 
                     delete_remote(self._cfg(), f"dev-{parts[4]}")
@@ -2999,6 +3305,39 @@ class TurnHandler(BaseHTTPRequestHandler):
                 pass
             _emit_relay_event("device.changed", {"action": "revoke", "id": parts[4]})
             self._write_json({"ok": True, "device": parts[4]}, 200)
+            return
+        # DELETE /v1/hub/links/<hub_id> — stop the live ChannelClient,
+        # drop the hubs.json row + vault token (agents-relay#43).
+        if (len(parts) == 5 and parts[1] == "v1"
+                and parts[2] == "hub" and parts[3] == "links"
+                and parts[4]):
+            if not _check_secret(self, self.relay_secret, query_params,
+                                 allow_device=False):
+                self.send_error(401, "unauthorized")
+                return
+            if not valid_id(parts[4]):
+                self.send_error(
+                    400, f"invalid hub id: {parts[4]!r}")
+                return
+            fn = getattr(self.server, "hub_disconnect_fn", None) \
+                or hub_disconnect_fn
+            if fn is None:
+                self._write_json(
+                    {"ok": False,
+                     "error": "hub disconnect not configured"}, 501)
+                return
+            try:
+                out = fn(parts[4]) or {}
+            except Exception as exc:  # noqa: BLE001
+                self.send_error(500, f"hub disconnect failed: {exc}")
+                return
+            out = dict(out)
+            if out.get("error"):
+                self._write_json(
+                    {"ok": False, **out},
+                    int(out.get("status") or 502))
+                return
+            self._write_json({"ok": True, **out}, 200)
             return
         # DELETE /v1/remote/<id>/<upstream-path> — proxied mount.
         if path.startswith("/v1/remote/"):
