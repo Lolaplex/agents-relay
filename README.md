@@ -1,7 +1,7 @@
 <h1 align="center">agents-relay</h1>
 
 <p align="center">
-  <a href="https://github.com/Lolaplex/agents-relay/releases"><img src="https://img.shields.io/badge/version-0.1.0-blue.svg?style=flat-square" alt="Version 0.1.0"></a>
+  <a href="https://github.com/Lolaplex/agents-relay/releases"><img src="https://img.shields.io/badge/version-0.2.0-blue.svg?style=flat-square" alt="Version 0.2.0"></a>
   <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.10+-3776AB.svg?style=flat-square&logo=python&logoColor=white" alt="Python 3.10+"></a>
   <a href="https://pypi.org/project/agents-relay/"><img src="https://img.shields.io/pypi/v/agents-relay.svg?style=flat-square" alt="PyPI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg?style=flat-square" alt="License"></a>
@@ -9,8 +9,8 @@
 
 <p align="center">
   <strong>Stdlib HTTP and Telegram relay in front of agents-harness runner.loop.</strong><br>
-  One subprocess per turn. Trailer parsing for session metadata. No identity store, no traces, no writes under <code>~/.agents</code>.
-  Approval decisions and downloaded files live in the workspace relay dir (<code>AGENTS_RELAY_STATE</code>, default <code>&lt;ws&gt;/relay</code>).
+  One subprocess per turn. Trailer parsing for session metadata. No identity store, no traces — state stays in the workspace relay dir.
+  Approval decisions and downloaded files live in the workspace relay dir (<code>AGENTS_RELAY_DIR</code>, default <code>&lt;ws&gt;/relay</code>).
 </p>
 
 ---
@@ -41,9 +41,9 @@ Needs `runner.loop` on `PATH` (`LOOP_CMD`, default `python -m runner.loop`). Tha
 | **Web Surface** | Cookie login, static assets from `RELAY_STATIC_DIR`, `/v1/chat/stream` with status + deltas, `/v1/chat/stop` |
 
 - **Subprocess Isolation**: One `runner.loop` process per request. No in-process LLM logic.
-- **No harness state**: No identity storage, no traces, no writes under `~/.agents`. Relay files (approvals, inbox) stay in `AGENTS_RELAY_STATE`.
+- **No harness state**: No identity storage, no traces. Relay files (approvals, inbox) stay in `<ws>/relay` (`AGENTS_RELAY_DIR`).
 - **Streaming Status**: Throttled progress streaming and real-time status edits during long-running tool rounds.
-- **Zero Bloat**: Pure Python standard library (`http.server`, `urllib.request`, `subprocess`).
+- **Zero Bloat**: Python standard library (`http.server`, `urllib.request`, `subprocess`) plus `agents-workspace` for the Host/Workspace path contract.
 
 ---
 
@@ -60,17 +60,21 @@ Needs `runner.loop` on `PATH` (`LOOP_CMD`, default `python -m runner.loop`). Tha
 - [x] **Mobile Formatting**: Automatic Markdown table conversion to Telegram-readable bullet lists.
 - [x] **Trailer Parsing**: Extracts session, user ID, alias, and return code from harness stdout trailers.
 - [x] **Subprocess Isolation**: One `runner.loop` process per request. No in-process LLM state.
-- [x] **Zero Bloat Runtime**: Pure Python standard library only.
+- [x] **Zero Bloat Runtime**: Python standard library + `agents-workspace` only.
 - [x] **SSE Token Streaming (`/v1/stream`)**: Server-sent events (`delta` + `trailer`) for client web UIs.
 - [x] **Web Surface**: Cookie login, static assets from `RELAY_STATIC_DIR`, streamed status + answer, stop button. The UI itself lives in the Klanker repo, not here.
 - [x] **A2A Board Mailbox Proxy (`/v1/a2a/mail`, `GET /v1/a2a/peers`)**: Peer-to-peer agent relay for board instances.
 - [x] **Inbound Webhook Hub (`/v1/webhook/{source}`)**: Generic structured ingress for CI/CD and deployment alerts.
 - [x] **Client SDK (`agents_relay.client.GatewayClient`)**: `turn()`, `stream()`, `health()` with prefs persistence.
+- [x] **Hub channel & device pairing**: paired devices hold scoped bearer credentials (`host`/`client`/`ws_member` roles + ws allowlists); per-device SSE downlink (`/v1/hub/stream`), batched uplink (`/v1/hub/send`), replay/resume, device-bound `rpc-req`/`rpc-res`, and ws-share control frames (`ws:announce`/`ws:revoke`).
+- [x] **Session run-lock leases**: one live run per workspace+session across devices (TTL + fencing tokens, `/v1/hub/lease` + `/v1/hub/leases`).
+- [x] **Presence, hosts & live links**: `GET /v1/workspaces/<ws>/hosts` host-picker surface, ws-scoped invites (`/v1/ws/invite`), hub links (`/v1/hub/connect`, `/v1/hub/links`), session host switching, and the `/v1/events` SSE bus.
+- [x] **Web approvals**: `GET /v1/approvals` list + `POST /v1/approvals/<id>` decide + `approval.changed` SSE; inside turns, `POST /v1/approvals/request` + `GET /v1/approvals/<id>/wait` run on a per-turn `AGENTS_APPROVAL_TOKEN` (no relay secret needed) and mirror to connected devices.
+- [x] **Web Push**: VAPID key management (`/v1/push/vapid-key`), subscriptions (`/v1/push/subscribe`), and `/v1/push/send` (sending needs the optional `pywebpush`).
 
 ### Planned (Roadmap)
 
-- [ ] **Web approvals**: `/v1/approvals` list + decide + an `approval` SSE event, so a browser client can gate mutating tools without Telegram.
-- [ ] **Web inbox + push**: mirror `send` into a web inbox, `/v1/inbox`, Web Push (VAPID) for reminders while the app is closed.
+- [ ] **Web inbox**: mirror `send` into a browser-visible inbox (`/v1/inbox`).
 - [ ] **Server history**: `/v1/history?session=` from agents-traces instead of browser-only storage.
 - [ ] **Multi-Channel Adapters**: Signal / Discord gateway adapters alongside Telegram.
 
@@ -102,7 +106,7 @@ Telegram chats can send `/jobs`, `/stop`, and `/stop <id>` while `serve` is poll
 | `TELEGRAM_BOT_TOKEN` | Enables poll + `send` |
 | `TELEGRAM_ALLOWED_CHAT_IDS` | Comma-separated numeric IDs. Empty refuses the Telegram adapter unless `AGENTS_RELAY_ALLOW_ANYONE=1` |
 | `AGENTS_RELAY_ALLOW_ANYONE` | `1` opts in to an empty allowlist. Logs a loud warning. Anyone who can message the bot can run turns and approve tools |
-| `AGENTS_RELAY_STATE` | Relay files (default `<ws>/relay`, resolved per workspace). Approvals: `$AGENTS_RELAY_STATE/approvals/<id>.json`. Inbox: `.../inbox/` |
+| `AGENTS_RELAY_DIR` | Relay files (default `<ws>/relay`, resolved per workspace; legacy alias `AGENTS_RELAY_STATE`). Approvals: `$AGENTS_RELAY_DIR/approvals/<id>.json`. Inbox: `.../inbox/` |
 | `AGENTS_RELAY_APPROVER` | Chat id used by `approve` when `--user` is missing or not numeric (HTTP turns often pass `anonymous`) |
 | `AGENTS_RELAY_ATTACH_DIR` | Only local `/v1/turn` attachment paths under this directory are accepted (default: the relay state dir) |
 | `AGENTS_RELAY_VISION` | `auto` (default), `on`, or `off`. `auto` uses `AGENTS_VISION` if set, otherwise the provider manifest's `vision` / `capabilities`. `on` and `off` are passed to the child as `AGENTS_VISION` |
@@ -125,9 +129,9 @@ Image parts are decided by the harness from `AGENTS_VISION` and the provider man
 
 `approve --user` may be a non-numeric turn id (HTTP defaults to `anonymous`). Then the prompt goes to `AGENTS_RELAY_APPROVER`, or to the only entry in `TELEGRAM_ALLOWED_CHAT_IDS` when that list has exactly one chat. Otherwise approve exits 2 and prints `{"note":"..."}`. A numeric `--user` is used as given.
 
-`approve` and `serve` must share `AGENTS_RELAY_STATE` on the same host. The poll loop answers `callback_query` and writes the decision. Only allowlisted user ids can press Approve or Deny. In a private chat that id is the chat id. In a group, list both the group chat id and the approving user id.
+`approve` and `serve` must share `AGENTS_RELAY_DIR` on the same host. The poll loop answers `callback_query` and writes the decision. Only allowlisted user ids can press Approve or Deny. In a private chat that id is the chat id. In a group, list both the group chat id and the approving user id.
 
-HTTP secret headers supported: `X-Relay-Secret`, `Relay-Secret`, `X-Gateway-Secret`, `Gateway-Secret`. `Authorization: Bearer` and `?secret=`/`?token=` query params also work.
+HTTP secret headers supported: `X-Relay-Secret`, `Relay-Secret`, `X-Gateway-Secret`, `Gateway-Secret`; `Authorization: Bearer` works too. The relay secret is never read from query params (the one query-token exception is `GET /?token=<web_token>`, which mints the HttpOnly cookie and redirects — see [Web surface](#web-surface)). Paired-device bearer tokens (scoped, revocable via `DELETE /v1/hub/devices/<id>`) and the web `relay_web` cookie authorize the same agent-facing surface, while credential minting/management and admin routes stay operator-only.
 
 ---
 
@@ -150,6 +154,20 @@ HTTP secret headers supported: `X-Relay-Secret`, `Relay-Secret`, `X-Gateway-Secr
 | `/v1/webhook/{source}` | POST | Generic webhook ingress (`X-Webhook-Secret` header) |
 | `/v1/a2a/mail` | POST | Board mailbox proxy |
 | `/v1/a2a/peers` | GET | Board peers (`?project=slug`) |
+| `/v1/pair/create`, `/v1/pair/redeem` | POST | Ephemeral single-use device pair codes (modes `web`/`remote`/`ws`) |
+| `/v1/ws/invite` | POST | Mint a ws-scoped invite code (device-token auth + owner check) |
+| `/v1/hub/stream` | GET | Per-device SSE downlink (`?since=` resume) |
+| `/v1/hub/send` | POST | Batched upstream envelopes |
+| `/v1/hub/devices`, `/v1/hub/devices/<id>` | GET, DELETE | List / revoke paired devices |
+| `/v1/hub/lease`, `/v1/hub/leases` | POST, GET | Session run-lock acquire/renew/release + snapshot (one live run per ws+session) |
+| `/v1/hub/connect`, `/v1/hub/links`, `/v1/hub/links/<id>` | POST, GET, DELETE | Live hub-link management (admin-only, klanker hooks) |
+| `/v1/workspaces/<ws>/hosts` | GET | Member presence + active leases for the host picker |
+| `/v1/workspaces/<ws>/sessions/<sid>/host` | POST | Switch a session's host (`session_host_switch_fn` hook) |
+| `/v1/events` | GET | SSE bus (`?workspace=` filter): device/ws/lease/session/workspace changes |
+| `/v1/approvals` | GET | List host approval records (operator-only) |
+| `/v1/approvals/<id>` | POST | Decide a pending approval `{"allow": true|false}` |
+| `/v1/approvals/request`, `/v1/approvals/<id>/wait` | POST, GET | Turn-token approval round-trip (mirrored across devices via `approval-req`/`approval-res` frames) |
+| `/v1/remote/<id>/<path>` | any | Authenticated proxy into a paired device's local API (`/v1/remotes` manages mounts) |
 
 ### Web surface
 
@@ -173,7 +191,7 @@ agents-relay serve
 ```json
 {
   "channel": "overlay",
-  "user": "fabian",
+  "user": "user",
   "text": "hello",
   "session": "ses_…",
   "user_id": "u_…",
@@ -236,7 +254,7 @@ Deprecated `~/.client/` is migrated on first access (host + overlay only).
 
 ## Constraints
 
-- Python 3.10+, standard library only.
+- Python 3.10+, standard library + `agents-workspace` only.
 - Does not import harness internals. Strictly spawns `LOOP_CMD` per turn.
 - Klanker / host agents own identity and traces. This process is strictly I/O.
 
