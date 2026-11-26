@@ -273,11 +273,12 @@ class TestAcpProviderWiring(unittest.TestCase):
     def test_agent_cmd_suffix_and_fallback(self):
         from agents_relay.acp import acp_agent_cmd
 
-        self._env_save("AGENTS_ACP_CMD", "AGENTS_ACP_CMD_DEVIN",
-                       "AGENTS_HOST_DIR")
+        # Isolate the host providers dir: a real <host>/providers/acp.devin.json
+        # with a `command` field would win over the env under test.
+        self._env_save("AGENTS_HOST_DIR", "AGENTS_ACP_CMD", "AGENTS_ACP_CMD_DEVIN")
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        os.environ["AGENTS_HOST_DIR"] = tmp.name  # isolate provider manifests
+        os.environ["AGENTS_HOST_DIR"] = tmp.name
         os.environ["AGENTS_ACP_CMD"] = "devin acp"
         os.environ["AGENTS_ACP_CMD_DEVIN"] = "devin acp --model x"
         self.assertEqual(acp_agent_cmd("acp.devin"), "devin acp --model x")
@@ -319,6 +320,39 @@ class TestAcpProviderWiring(unittest.TestCase):
             ws = Host.from_env().workspace("demo")
             out = use("acp.devin", "swe-2-high", workspace=ws)
             self.assertEqual(out["provider"], "acp.devin")
+
+    def test_spawn_argv_wraps_cmd_shims_on_windows(self):
+        from unittest.mock import patch
+
+        from agents_relay.acp import _resolve_spawn_argv
+
+        with patch("agents_relay.acp.os.name", "nt"), patch(
+            "shutil.which", return_value="C:\\bin\\devin.cmd"
+        ):
+            argv = _resolve_spawn_argv(["devin", "acp"])
+            self.assertEqual(argv, ["cmd.exe", "/c", "C:\\bin\\devin.cmd", "acp"])
+        with patch("agents_relay.acp.os.name", "nt"), patch(
+            "shutil.which", return_value="C:\\bin\\devin.exe"
+        ):
+            self.assertEqual(
+                _resolve_spawn_argv(["devin", "acp"]),
+                ["C:\\bin\\devin.exe", "acp"],
+            )
+        with patch("agents_relay.acp.os.name", "nt"), patch(
+            "shutil.which", return_value=None
+        ):
+            self.assertRaises(FileNotFoundError, _resolve_spawn_argv, ["nope"])
+
+    def test_acp_api_key_per_name_over_shared(self):
+        from agents_relay.acp import acp_api_key
+
+        self._env_save("AGENTS_ACP_API_KEY", "AGENTS_ACP_API_KEY_DEVIN")
+        os.environ.pop("AGENTS_ACP_API_KEY", None)
+        os.environ["AGENTS_ACP_API_KEY_DEVIN"] = "sk-devin"
+        self.assertEqual(acp_api_key("acp.devin"), "sk-devin")
+        os.environ["AGENTS_ACP_API_KEY"] = "sk-shared"
+        self.assertEqual(acp_api_key("acp.devin"), "sk-devin")
+        self.assertEqual(acp_api_key("acp.other"), "sk-shared")
 
     def test_build_loop_argv_acp_spawn(self):
         from agents_relay.config import RelayConfig
