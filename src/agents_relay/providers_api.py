@@ -23,6 +23,29 @@ from typing import Any
 from .state import read_json, write_json_atomic
 
 _NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
+_SECRET_ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]{2,63}$")
+_FORBIDDEN_SECRET_PREFIXES = (
+    "DEVICE_",
+    "HUB_",
+    "REMOTE_",
+    "RELAY_",
+    "TELEGRAM_",
+    "AGENTS_APPROVAL_",
+    "GITHUB_",
+    "GH_",
+)
+_ALLOWED_PROVIDER_SECRET_KEYS = frozenset({
+    "LLM_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "MISTRAL_API_KEY",
+    "GROQ_API_KEY",
+    "XAI_API_KEY",
+    "AGENTS_ACP_API_KEY",
+})
 
 
 class ProviderError(ValueError):
@@ -69,8 +92,29 @@ def source_of(row: dict[str, Any]) -> str:
     return "file" if path is not None and path.is_file() else "env"
 
 
+def _is_key_configured(row: dict[str, Any]) -> bool:
+    """Return True if this provider has credentials or requires none (never returns secret)."""
+    kind = str(row.get("kind") or "")
+    name = str(row.get("name") or "")
+    if kind in ("echo", "scripted"):
+        return True
+    if kind == "acp-agent" or name.startswith("acp."):
+        from .acp import acp_api_key
+
+        return bool(acp_api_key(name))
+    key_env = str(row.get("key_env") or "LLM_API_KEY").strip() or "LLM_API_KEY"
+    if os.environ.get(key_env, "").strip():
+        return True
+    try:
+        from agents_workspace import resolve_secret
+
+        return bool(str(resolve_secret(key_env) or "").strip())
+    except Exception:
+        return False
+
+
 def provider_rows(config: Any = None, refresh: bool = False) -> list[dict[str, Any]]:
-    """Merged manifest + ACP rows annotated with ``source``/``configurable``."""
+    """Merged manifest + ACP rows annotated with ``source``/``configurable``/``key_configured``."""
     from runner.providers import list_providers
 
     rows: list[dict[str, Any]] = []
@@ -81,7 +125,14 @@ def provider_rows(config: Any = None, refresh: bool = False) -> list[dict[str, A
             "model": raw.get("model"),
             "when": raw.get("when"),
             "source": source_of(raw),
+            "key_configured": _is_key_configured(raw),
         }
+        if isinstance(raw.get("key_env"), str) and raw.get("key_env"):
+            row["key_env"] = raw["key_env"]
+        if isinstance(raw.get("url"), str) and raw.get("url"):
+            row["url"] = raw["url"]
+        if isinstance(raw.get("url_env"), str) and raw.get("url_env"):
+            row["url_env"] = raw["url_env"]
         if raw.get("kind") != "acp-agent" and isinstance(raw.get("models"), list):
             row["models"] = raw["models"]
         rows.append(row)
@@ -91,10 +142,38 @@ def provider_rows(config: Any = None, refresh: bool = False) -> list[dict[str, A
     for raw in acp_provider_rows(config, refresh=refresh):
         row = dict(raw)
         row["source"] = source_of(raw)
+        row["key_configured"] = _is_key_configured(row)
         rows.append(row)
     for row in rows:
         row["configurable"] = row.get("source") == "file"
     return rows
+
+
+def set_provider_secret(key_env: str, value: str) -> dict[str, Any]:
+    """Persist a provider API key into the host secret vault (never returns the value)."""
+    name = str(key_env or "").strip()
+    if not _SECRET_ENV_NAME.match(name):
+        raise ProviderError(400, f"invalid key_env name: {name!r}")
+    from agents_workspace.secrets import INFRA_SECRET_KEYS, write_secret
+
+    if name in INFRA_SECRET_KEYS or name.startswith(_FORBIDDEN_SECRET_PREFIXES):
+        raise ProviderError(403, f"cannot overwrite infrastructure secret: {name}")
+    known_key_envs = {
+        str(r.get("key_env") or "").strip()
+        for r in provider_rows()
+        if str(r.get("key_env") or "").strip()
+    }
+    if (
+        name not in _ALLOWED_PROVIDER_SECRET_KEYS
+        and not name.startswith("AGENTS_ACP_API_KEY_")
+        and name not in known_key_envs
+    ):
+        raise ProviderError(400, f"unrecognized provider secret env: {name}")
+    secret_val = str(value or "").strip()
+    if not secret_val:
+        raise ProviderError(400, "secret value is required")
+    write_secret(name, secret_val, scope="host")
+    return {"key_env": name, "configured": True}
 
 
 def create_provider(body: dict[str, Any]) -> dict[str, Any]:
