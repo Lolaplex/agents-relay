@@ -47,6 +47,72 @@ _TIMEOUT = "timeout"
 on_pending_fn = None   # fn(record) — freshly-pending local approval
 on_decided_fn = None   # fn(record) — terminal local decision to relay
 
+MAX_PREVIEW_BYTES = 65_536
+
+
+def _clean_allow_pattern(raw: Any) -> str:
+    text = str(raw or "").replace("\r", " ").replace("\n", " ").replace("\x00", "")
+    return " ".join(text.split()).strip()[:200]
+
+
+def sanitize_preview(raw: Any) -> dict[str, Any] | None:
+    """Validate and cap rich approval preview metadata (U02, never raises)."""
+    if not isinstance(raw, dict):
+        return None
+    kind = str(raw.get("kind") or "").strip()
+    if kind == "command":
+        raw_argv = raw.get("argv")
+        argv = [str(x)[:300] for x in raw_argv[:40]] if isinstance(raw_argv, (list, tuple)) else []
+        risk = str(raw.get("risk") or "medium").strip().lower()
+        if risk not in ("low", "medium", "high"):
+            risk = "medium"
+        out: dict[str, Any] = {
+            "kind": "command",
+            "argv": argv,
+            "cwd": str(raw.get("cwd") or "")[:500],
+            "risk": risk,
+        }
+    elif kind == "diff":
+        out = {
+            "kind": "diff",
+            "path": str(raw.get("path") or "")[:300],
+        }
+        if isinstance(raw.get("error"), str) and raw["error"].strip():
+            out["error"] = raw["error"].strip()[:200]
+        if raw.get("binary") is True:
+            out["binary"] = True
+        for key in ("old_text", "new_text", "unified"):
+            val = raw.get(key)
+            if isinstance(val, str):
+                out[key] = val[:16_000]
+        if "truncated" in raw:
+            out["truncated"] = bool(raw.get("truncated"))
+    else:
+        return None
+    while len(json.dumps(out, ensure_ascii=False).encode("utf-8")) > MAX_PREVIEW_BYTES:
+        if kind == "diff":
+            longest = max(("old_text", "new_text", "unified"), key=lambda k: len(str(out.get(k) or "")))
+            cur = str(out.get(longest) or "")
+            if len(cur) <= 256:
+                return None
+            out[longest] = cur[: len(cur) // 2]
+            out["truncated"] = True
+        elif kind == "command" and isinstance(out.get("argv"), list) and len(out["argv"]) > 1:
+            out["argv"] = out["argv"][:-1]
+        else:
+            return None
+    return out
+
+
+def _extract_opts(data: dict[str, Any], out_opts: dict[str, Any] | None) -> None:
+    if out_opts is None:
+        return
+    if data.get("remember") is True:
+        out_opts["remember"] = True
+    pat = _clean_allow_pattern(data.get("allow_pattern"))
+    if pat:
+        out_opts["allow_pattern"] = pat
+
 
 def approval_tokens_dir(config: RelayConfig | None = None) -> Path:
     return approval_dir(config) / "tokens"
@@ -213,6 +279,13 @@ def create_pending(
 ) -> dict:
     ident = str(request.get("id") or "")
     eff_ws = (workspace or str(request.get("workspace") or "")).strip()
+    stored_req = dict(request)
+    if "preview" in stored_req:
+        clean_prev = sanitize_preview(stored_req.get("preview"))
+        if clean_prev is not None:
+            stored_req["preview"] = clean_prev
+        else:
+            stored_req.pop("preview", None)
 
     def _apply(current: dict) -> dict | None:
         status = str(current.get("status") or "")
@@ -223,8 +296,8 @@ def create_pending(
             "status": _PENDING,
             "chat_id": int(chat_id),
             "workspace": eff_ws,
-            "request": request,
-            "request_hash": approval_request_hash(request),
+            "request": stored_req,
+            "request_hash": approval_request_hash(stored_req),
             "note": "",
             "decided_by": None,
             "created_at": time.time(),
@@ -238,7 +311,7 @@ def create_pending(
     if updated and updated.get("status") == _PENDING:
         from .push import notify_approval_pending
 
-        notify_approval_pending(config, {**request, "id": ident}, ws_ref=eff_ws)
+        notify_approval_pending(config, {**stored_req, "id": ident}, ws_ref=eff_ws)
         if not from_mirror and on_pending_fn is not None:
             try:
                 on_pending_fn(updated)
@@ -256,9 +329,13 @@ def record_decision(
     decided_by: int | None,
     expected_chat_id: int | None = None,
     from_mirror: bool = False,
+    remember: bool = False,
+    allow_pattern: str = "",
 ) -> dict | None:
     """Write a terminal status if the record is still pending. None if rejected."""
     changed = False
+    clean_pat = _clean_allow_pattern(allow_pattern) if (status == _APPROVED and not from_mirror) else ""
+    allow_remember = bool(remember and status == _APPROVED and not from_mirror)
 
     def _apply(current: dict) -> dict | None:
         nonlocal changed
@@ -272,6 +349,10 @@ def record_decision(
         current["note"] = note
         current["decided_by"] = decided_by
         current["decided_at"] = time.time()
+        if allow_remember:
+            current["remember"] = True
+        if clean_pat:
+            current["allow_pattern"] = clean_pat
         changed = True
         return current
 
@@ -322,6 +403,7 @@ def wait_for_decision(
     timeout: float,
     *,
     poll_interval: float = 0.2,
+    out_opts: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     """Block until approved/denied, or mark timeout. Returns `(status, note)`."""
     deadline = time.monotonic() + max(0.0, timeout)
@@ -331,6 +413,8 @@ def wait_for_decision(
         data = read_json(path) or {}
         status = str(data.get("status") or "")
         if status in (_APPROVED, _DENIED):
+            if status == _APPROVED:
+                _extract_opts(data, out_opts)
             return status, str(data.get("note") or status)
         if time.monotonic() >= deadline:
             break
@@ -339,6 +423,8 @@ def wait_for_decision(
     updated = expire_pending(config, ident)
     status = str(updated.get("status") or _TIMEOUT)
     if status in (_APPROVED, _DENIED):
+        if status == _APPROVED:
+            _extract_opts(updated, out_opts)
         return status, str(updated.get("note") or status)
     return _TIMEOUT, "timeout"
 
@@ -393,6 +479,7 @@ def run_local_approve(
     timeout: float,
     *,
     poll_interval: float = 0.2,
+    out_opts: dict[str, Any] | None = None,
 ) -> tuple[int, str]:
     """Write the pending file and block. No Telegram. Exit 0, 1, or 2."""
     ident = str(request.get("id") or "").strip()
@@ -412,6 +499,7 @@ def run_local_approve(
                 ex_hash, approval_request_hash(request)):
             return 2, "approval request changed"
         if existing.get("status") == _APPROVED:
+            _extract_opts(existing, out_opts)
             return 0, str(existing.get("note") or "approved")
         return 1, str(existing.get("note") or "denied")
     create_pending(config, 0, request)
@@ -420,11 +508,19 @@ def run_local_approve(
         ident,
         float(timeout),
         poll_interval=poll_interval,
+        out_opts=out_opts,
     )
     return status_exit_code(status), note or status
 
 
-def decide_approval(config: RelayConfig, ident: str, *, allow: bool) -> tuple[int, str]:
+def decide_approval(
+    config: RelayConfig,
+    ident: str,
+    *,
+    allow: bool,
+    remember: bool = False,
+    allow_pattern: str = "",
+) -> tuple[int, str]:
     """Write one decision. 0 when the file was pending, 2 when it was not."""
     ident = (ident or "").strip()
     if not APPROVAL_ID_RE.match(ident):
@@ -437,6 +533,8 @@ def decide_approval(config: RelayConfig, ident: str, *, allow: bool) -> tuple[in
         note=status,
         decided_by=None,
         expected_chat_id=None,
+        remember=bool(allow and remember),
+        allow_pattern=allow_pattern if allow else "",
     )
     if updated is None:
         return 2, "not pending"
@@ -473,6 +571,7 @@ def run_http_approve(
     user: str = "",
     workspace: str = "",
     poll_slice: float = 25.0,
+    out_opts: dict[str, Any] | None = None,
 ) -> tuple[int, str]:
     """Submit an approval via relay HTTP using Bearer AGENTS_APPROVAL_TOKEN and wait."""
     ident = str(request.get("id") or "").strip()
@@ -502,6 +601,8 @@ def run_http_approve(
 
     status = str(created.get("status") or "")
     if status in (_APPROVED, _DENIED):
+        if status == _APPROVED:
+            _extract_opts(created, out_opts)
         return status_exit_code(status), str(created.get("note") or status)
 
     slice_sec = max(0.05, float(poll_slice or 25.0))
@@ -526,6 +627,8 @@ def run_http_approve(
         status = str(res.get("status") or "")
         note = str(res.get("note") or status)
         if status in (_APPROVED, _DENIED, _TIMEOUT):
+            if status == _APPROVED:
+                _extract_opts(res, out_opts)
             return status_exit_code(status), note or status
         if time.monotonic() >= deadline:
             return 2, "timeout"
