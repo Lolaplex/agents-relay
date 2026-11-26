@@ -2373,6 +2373,7 @@ class TurnHandler(BaseHTTPRequestHandler):
             format_approval_html,
             read_approval,
             resolve_approver_chat,
+            sanitize_preview,
         )
 
         ident = str(req_obj.get("id") or body.get("id") or "").strip()
@@ -2406,16 +2407,20 @@ class TurnHandler(BaseHTTPRequestHandler):
             if (ex_ws or tok_ws) and ex_ws != tok_ws:
                 self._write_json({"ok": False, "error": "workspace mismatch"}, 403)
                 return
-            self._write_json(
-                {
-                    "ok": True,
-                    "id": ident,
-                    "status": str(existing.get("status") or "pending"),
-                    "note": str(existing.get("note") or ""),
-                    "workspace": ex_ws or tok_ws,
-                },
-                200,
-            )
+            out: dict[str, Any] = {
+                "ok": True,
+                "id": ident,
+                "status": str(existing.get("status") or "pending"),
+                "note": str(existing.get("note") or ""),
+                "workspace": ex_ws or tok_ws,
+            }
+            if out["status"] == "approved":
+                if existing.get("remember"):
+                    out["remember"] = True
+                ap = str(existing.get("allow_pattern") or "").strip()
+                if ap:
+                    out["allow_pattern"] = ap
+            self._write_json(out, 200)
             return
 
         # cfg.approver pins the decision target — a caller-supplied
@@ -2440,6 +2445,12 @@ class TurnHandler(BaseHTTPRequestHandler):
         req_payload["id"] = ident
         if tok_ws:
             req_payload["workspace"] = tok_ws
+        if "preview" in req_payload:
+            clean_prev = sanitize_preview(req_payload.get("preview"))
+            if clean_prev is not None:
+                req_payload["preview"] = clean_prev
+            else:
+                req_payload.pop("preview", None)
         rec = create_pending(
             cfg,
             tg_chat,
@@ -2522,15 +2533,19 @@ class TurnHandler(BaseHTTPRequestHandler):
             cur = read_approval(cfg, ident) or {}
             status = str(cur.get("status") or "")
             if status in ("approved", "denied", "timeout"):
-                self._write_json(
-                    {
-                        "ok": True,
-                        "id": ident,
-                        "status": status,
-                        "note": str(cur.get("note") or status),
-                    },
-                    200,
-                )
+                out_wait: dict[str, Any] = {
+                    "ok": True,
+                    "id": ident,
+                    "status": status,
+                    "note": str(cur.get("note") or status),
+                }
+                if status == "approved":
+                    if cur.get("remember") is True:
+                        out_wait["remember"] = True
+                    pat = str(cur.get("allow_pattern") or "").strip()
+                    if pat:
+                        out_wait["allow_pattern"] = pat
+                self._write_json(out_wait, 200)
                 return
             if verify_approval_token(bearer) is None:
                 self._write_json(
@@ -2604,6 +2619,8 @@ class TurnHandler(BaseHTTPRequestHandler):
                 }
                 if rec_ws:
                     row["workspace"] = rec_ws
+                if isinstance(req.get("preview"), dict):
+                    row["preview"] = req["preview"]
                 pending.append((created, row))
         rows = [row for _, row in sorted(pending, key=lambda item: item[0])]
         self._write_json({"ok": True, "approvals": rows}, 200)
@@ -2633,6 +2650,8 @@ class TurnHandler(BaseHTTPRequestHandler):
         if not isinstance(allow, bool):
             self.send_error(400, "allow must be true or false")
             return
+        remember = bool(body.get("remember")) if allow else False
+        allow_pattern = str(body.get("allow_pattern") or "").strip()[:200] if allow else ""
         cfg = self._cfg()
         ws_ref = str(query_params.get("workspace") or "").strip()
         if ws_ref:
@@ -2661,7 +2680,13 @@ class TurnHandler(BaseHTTPRequestHandler):
                 self.send_error(403, "workspace not in allowlist")
                 return
         try:
-            code, note = decide_approval(cfg, ident, allow=allow)
+            code, note = decide_approval(
+                cfg,
+                ident,
+                allow=allow,
+                remember=remember,
+                allow_pattern=allow_pattern,
+            )
         except ValueError as exc:
             self.send_error(400, str(exc))
             return
@@ -2672,8 +2697,15 @@ class TurnHandler(BaseHTTPRequestHandler):
         if code != 0:
             self.send_error(400 if note == "invalid approval id" else 404, note)
             return
-        _emit_relay_event("approval.changed", {"action": "decide", "id": ident, "allow": allow}, workspace=rec_ws or ws_ref)
-        self._write_json({"ok": True, "id": ident, "status": note}, 200)
+        _emit_relay_event(
+            "approval.changed",
+            {"action": "decide", "id": ident, "allow": allow, "remember": remember},
+            workspace=rec_ws or ws_ref,
+        )
+        resp_body: dict[str, Any] = {"ok": True, "id": ident, "status": note, "remember": remember}
+        if allow_pattern:
+            resp_body["allow_pattern"] = allow_pattern
+        self._write_json(resp_body, 200)
 
     def _handle_stream(self, body: dict) -> None:
         params = turn_params_from_body(body)

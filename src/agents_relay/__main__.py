@@ -93,7 +93,12 @@ def _cmd_approve(args: argparse.Namespace) -> int:
             print(json.dumps({"note": note}, ensure_ascii=False))
             print(f"Error: {note}", file=sys.stderr)
             return 2
-        code, note = decide_approval(config, decide_id, allow=bool(args.allow))
+        code, note = decide_approval(
+            config,
+            decide_id,
+            allow=bool(args.allow),
+            remember=bool(getattr(args, "remember", False)),
+        )
         print(json.dumps({"note": note}, ensure_ascii=False))
         if code != 0:
             print(f"Error: {note}", file=sys.stderr)
@@ -107,9 +112,10 @@ def _cmd_approve(args: argparse.Namespace) -> int:
     if not isinstance(request, dict):
         print("Error: approval request must be a JSON object", file=sys.stderr)
         return 2
+    opts: dict[str, Any] = {}
     if getattr(args, "local", False):
-        code, note = run_local_approve(config, request, float(args.timeout))
-        print(json.dumps({"note": note}, ensure_ascii=False))
+        code, note = run_local_approve(config, request, float(args.timeout), out_opts=opts)
+        print(json.dumps({"note": note, **opts}, ensure_ascii=False))
         return code
     raw_user = str(getattr(args, "user", "") or getattr(args, "chat_id", "") or "")
     relay_url = os.environ.get("AGENTS_RELAY_URL", "").strip() or (config.relay_url or "").strip()
@@ -123,8 +129,9 @@ def _cmd_approve(args: argparse.Namespace) -> int:
             float(args.timeout),
             user=raw_user,
             workspace=ws_id,
+            out_opts=opts,
         )
-        print(json.dumps({"note": note}, ensure_ascii=False))
+        print(json.dumps({"note": note, **opts}, ensure_ascii=False))
         return code
     if not config.telegram_bot_token:
         ident = str(request.get("id") or "").strip()
@@ -134,8 +141,8 @@ def _cmd_approve(args: argparse.Namespace) -> int:
                 f"agents-relay approve --decide {ident} --allow",
                 file=sys.stderr,
             )
-        code, note = run_local_approve(config, request, float(args.timeout))
-        print(json.dumps({"note": note}, ensure_ascii=False))
+        code, note = run_local_approve(config, request, float(args.timeout), out_opts=opts)
+        print(json.dumps({"note": note, **opts}, ensure_ascii=False))
         return code
     chat_id, why = resolve_approver_chat(
         raw_user,
@@ -221,6 +228,7 @@ def build_parser() -> argparse.ArgumentParser:
     approve_p.add_argument("--decide", default="", help="Resolve this pending id and exit")
     approve_p.add_argument("--allow", action="store_true", help="With --decide, allow the tool")
     approve_p.add_argument("--deny", action="store_true", help="With --decide, deny the tool")
+    approve_p.add_argument("--remember", action="store_true", help="With --decide --allow, persist allow rule")
     sub.add_parser(
         "acp-serve",
         help="Run as an ACP agent over stdio (Zed/ACP clients spawn this)",
