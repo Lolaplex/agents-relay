@@ -600,12 +600,17 @@ def _ws_hosts_payload(ws, ctx: dict, spoke_hosts_fn=None) -> dict:
 
     ch = _channel_hub()
     self_id = str(ctx.get("device_id") or "")
+    self_label = ""
     self_is_host = False
     if not self_id:
         try:
             from agents_workspace import Host
 
-            self_id = str(Host.from_env().host_id() or "")
+            host_obj = Host.from_env()
+            self_id = str(host_obj.host_id() or "")
+            lbl_fn = getattr(host_obj, "host_label", None)
+            if callable(lbl_fn):
+                self_label = str(lbl_fn() or "").strip()
             self_is_host = bool(self_id)
         except Exception:  # noqa: BLE001 - no host dir: no self row id
             self_id = ""
@@ -630,7 +635,7 @@ def _ws_hosts_payload(ws, ctx: dict, spoke_hosts_fn=None) -> dict:
             if self_id and not any(h["self"] for h in hs):
                 hs.append({
                     "device_id": self_id,
-                    "label": self_id,
+                    "label": self_label or self_id,
                     "role": "host" if self_is_host else "member",
                     "self": True, "online": True, "via": "local",
                     "last_seen": 0, "status": "online", "leases": []})
@@ -661,7 +666,11 @@ def _ws_hosts_payload(ws, ctx: dict, spoke_hosts_fn=None) -> dict:
         is_self = did == self_id
         hosts.append({
             "device_id": did,
-            "label": str(labels.get(did) or did),
+            "label": (
+                self_label
+                if is_self and self_label and not labels.get(did)
+                else str(labels.get(did) or did)
+            ),
             "role": ("owner" if did == owner
                      else "default" if did == default
                      else "host" if is_self and self_is_host
@@ -1640,6 +1649,31 @@ class TurnHandler(BaseHTTPRequestHandler):
                 return
             _emit_relay_event("provider.changed", {"action": "create", "provider": row["name"]})
             self._write_json({"ok": True, "provider": row}, 200)
+            return
+
+        if path == "/v1/providers/secret":
+            if not _check_secret(self, self.relay_secret, query_params,
+                                 allow_device=False):
+                self.send_error(401, "unauthorized")
+                return
+            body = self._read_json()
+            if body is None:
+                return
+            from .providers_api import ProviderError, set_provider_secret
+
+            try:
+                out = set_provider_secret(
+                    str(body.get("key_env") or ""),
+                    str(body.get("value") or ""),
+                )
+            except ProviderError as exc:
+                self.send_error(exc.status, exc.message)
+                return
+            except Exception as exc:
+                self.send_error(500, f"provider secret write failed: {exc}")
+                return
+            _emit_relay_event("provider.changed", {"action": "secret", "key_env": out["key_env"]})
+            self._write_json({"ok": True, **out}, 200)
             return
 
         if path == "/v1/favorites":
@@ -2825,6 +2859,23 @@ class TurnHandler(BaseHTTPRequestHandler):
                 return
             self._write_json({"ok": True, "providers": rows}, 200)
             return
+        if path == "/v1/host":
+            if not _check_secret(self, self.relay_secret, query_params,
+                                 allow_device=False):
+                self.send_error(401, "unauthorized")
+                return
+            try:
+                from agents_workspace import Host
+
+                host_obj = Host.from_env()
+                hid = str(host_obj.host_id() or "")
+                lbl_fn = getattr(host_obj, "host_label", None)
+                hlbl = str(lbl_fn() if callable(lbl_fn) else "") or hid
+            except Exception as exc:
+                self.send_error(500, f"host info unavailable: {exc}")
+                return
+            self._write_json({"ok": True, "host_id": hid, "host_label": hlbl}, 200)
+            return
         probe_parts = path.split("/")
         if (len(probe_parts) == 5 and probe_parts[1] == "v1"
                 and probe_parts[2] == "providers" and probe_parts[4] == "probe"):
@@ -3170,7 +3221,11 @@ class TurnHandler(BaseHTTPRequestHandler):
                 try:
                     from agents_workspace import Host
 
-                    body["host_id"] = Host.from_env().host_id()
+                    host_obj = Host.from_env()
+                    body["host_id"] = host_obj.host_id()
+                    lbl_fn = getattr(host_obj, "host_label", None)
+                    if callable(lbl_fn):
+                        body["host_label"] = lbl_fn()
                 except Exception:
                     pass
                 klanker_version = getattr(self, "klanker_version", "") or getattr(
@@ -3229,6 +3284,36 @@ class TurnHandler(BaseHTTPRequestHandler):
             # workspace.changed is emitted once inside patch_workspace
             # (canonical "workspace" key — agents-relay#45).
             self._write_json({"ok": True, "workspace": row}, 200)
+            return
+        if path == "/v1/host":
+            if not _check_secret(self, self.relay_secret, query_params,
+                                 allow_device=False):
+                self.send_error(401, "unauthorized")
+                return
+            body = self._read_json()
+            if body is None:
+                return
+            if not isinstance(body.get("label"), str):
+                self.send_error(400, "label string is required")
+                return
+            try:
+                from agents_workspace import Host
+
+                host_obj = Host.from_env()
+                set_fn = getattr(host_obj, "set_host_label", None)
+                if not callable(set_fn):
+                    self.send_error(501, "host_label unsupported by agents-workspace")
+                    return
+                clean = set_fn(body["label"])
+                hid = str(host_obj.host_id() or "")
+            except ValueError as exc:
+                self.send_error(400, str(exc))
+                return
+            except Exception as exc:
+                self.send_error(500, f"host label update failed: {exc}")
+                return
+            _emit_relay_event("host.changed", {"host_id": hid, "host_label": clean})
+            self._write_json({"ok": True, "host_id": hid, "host_label": clean}, 200)
             return
         self.send_error(404)
 

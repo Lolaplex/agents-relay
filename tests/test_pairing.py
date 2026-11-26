@@ -67,8 +67,15 @@ class _Srv:
 class TestPairing(unittest.TestCase):
     def setUp(self) -> None:
         pairing.clear_pairs()
+        self.td = tempfile.TemporaryDirectory()
+        host_dir = Path(self.td.name)
+        (host_dir / "workspaces" / "default").mkdir(parents=True)
+        self.env = patch.dict(os.environ, {"AGENTS_HOST_DIR": str(host_dir)})
+        self.env.start()
 
     def tearDown(self) -> None:
+        self.env.stop()
+        self.td.cleanup()
         pairing.clear_pairs()
 
     def test_create_requires_auth_and_clamps_ttl(self):

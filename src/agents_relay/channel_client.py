@@ -197,6 +197,7 @@ _RPC_DENY_ALWAYS = (
     "/v1/klanker/skills", "/v1/klanker/memory", "/v1/jobs",
     "/v1/send", "/v1/inject", "/v1/favorites", "/v1/push",
     "/v1/a2a", "/v1/webhook", "/v1/alert",
+    "/v1/host", "/v1/providers/secret",
 )
 _RPC_DENY_WRITE = (
     "/v1/providers", "/v1/settings", "/v1/workspaces",
