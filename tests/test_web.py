@@ -556,18 +556,19 @@ class TestPush(unittest.TestCase):
             os.chdir(old_cwd)
             blank_srv.close()
 
-    def test_push_send_501_without_pywebpush(self):
-        resp = self.srv.request(
-            "POST",
-            "/v1/push/send",
-            {"payload": {"type": "test"}},
-            headers={"X-Relay-Secret": "expected"},
-        )
-        try:
-            import pywebpush  # noqa: F401
-        except ImportError:
+    def test_push_send_501_without_any_send_backend(self):
+        from agents_relay import push as push_mod
+
+        with patch.object(push_mod, "_import_pywebpush", return_value=None), \
+                patch.object(push_mod, "_cryptography_available", return_value=False):
+            resp = self.srv.request(
+                "POST",
+                "/v1/push/send",
+                {"payload": {"type": "test"}},
+                headers={"X-Relay-Secret": "expected"},
+            )
             self.assertEqual(resp.status, 501)
-        resp.read()
+            resp.read()
 
     def test_subscribe_rejects_bad_endpoint(self):
         resp = self.srv.request(

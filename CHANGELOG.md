@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Native Web Push delivery when `pywebpush` is absent but `cryptography` is installed: `POST /v1/push/send` now performs RFC 8291 single-record `aes128gcm` encryption and RFC 8292 VAPID ES256 signing over stdlib urllib, pruning dead 404/410 subscriptions the same way as the `pywebpush` path. `GET /v1/push/key` (alias for `/v1/push/vapid-key`) advertises `push_capable` and `backend`, and the optional `agents-relay[push]` extra installs `pywebpush`; the base install keeps `agents-workspace` as its only dependency.
 - Web session steering on `POST /v1/inject`: `{session_id|session, text}` payloads addressed at a browser turn now append to that active run's steer queue and fan out a typed `steer` SSE event to its subscribers. Idle or unknown sessions answer a loud 409, while numeric Telegram `chat_id` injection remains unchanged.
 - Hub session run-lock leases (`POST /v1/hub/lease` acquire/renew/release, device-token auth; admin `GET /v1/hub/leases` snapshot): one live run per (ws, session), TTL 45s with ~15s renew, fencing token per grant. Re-acquire by the same (holder, run_id) is idempotent (same fence, TTL extended). The fence high-water mark persists in `<host>/clients/hub_leases.json` (seeded from wall-clock ms when absent) so fences stay monotonic across hub restarts. Malformed or non-positive `fence` on renew/release returns 400.
 

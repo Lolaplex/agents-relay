@@ -3351,7 +3351,7 @@ class TurnHandler(BaseHTTPRequestHandler):
                 self, query_params,
                 tag=str(rctx.get("device_id") or ""))
             return
-        if path == "/v1/push/vapid-key":
+        if path in ("/v1/push/vapid-key", "/v1/push/key"):
             if not _check_secret(self, self.relay_secret, query_params):
                 self.send_error(401, "unauthorized")
                 return

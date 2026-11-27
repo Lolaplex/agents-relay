@@ -1253,6 +1253,9 @@ class TestDashboardApi(unittest.TestCase):
             rec = read_json(ap_file)
             self.assertEqual(rec["workspace"], "demo")
             self.assertEqual(rec["token_hash"], hash_approval_token(token))
+            deadline = time.time() + 3
+            while time.time() < deadline and not tg_sent.called:
+                time.sleep(0.02)
             tg_sent.assert_called()
 
             # Different turn's token cannot wait on this approval id -> 403

@@ -11,16 +11,22 @@ Subscriptions (PushSubscription JSON from the web app) live in
 ``endpoint`` so a re-subscribe replaces, never appends. A 1-release fallback
 reads legacy ``<ws>/relay/{vapid.json,push.json}`` when host files are absent.
 
-Sending needs ``pywebpush`` (lazy import): it signs the VAPID JWT and does
-the aes128gcm payload encryption. Absent → :class:`PushUnavailable`; the
+Sending prefers ``pywebpush`` when installed (lazy import). Otherwise a
+native sender uses lazy-imported ``cryptography`` for the RFC 8291 aes128gcm
+payload encryption and the RFC 8292 VAPID ES256 JWT over stdlib urllib. When
+neither is importable, sending raises :class:`PushUnavailable`; the
 key/subscription endpoints keep working regardless.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import secrets
+import struct
 import time
+import urllib.parse
+import urllib.request
 import warnings
 from pathlib import Path
 from typing import Any
@@ -68,9 +74,11 @@ def _scalar_mul(k: int, point=_G):
 
 
 def _b64url(raw: bytes) -> str:
-    import base64
-
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
 
 def _public_key_b64(priv: int) -> str:
@@ -124,13 +132,24 @@ def vapid_keypair(config=None) -> dict[str, str]:
 
 
 def handle_vapid_key(handler, config) -> None:
-    """``GET /v1/push/vapid-key`` → the relay's VAPID public key."""
+    """``GET /v1/push/vapid-key``/``/v1/push/key`` → the VAPID public key."""
     try:
         pair = vapid_keypair(config)
     except Exception as exc:
         handler._write_json({"ok": False, "error": f"vapid unavailable: {exc}"}, 503)  # type: ignore[attr-defined]
         return
-    handler._write_json({"ok": True, "key": pair["public"]}, 200)  # type: ignore[attr-defined]
+    backend = push_send_backend()
+    handler._write_json(  # type: ignore[attr-defined]
+        {
+            "ok": True,
+            "key": pair["public"],
+            "public_key": pair["public"],
+            "publicKey": pair["public"],
+            "push_capable": bool(backend),
+            "backend": backend,
+        },
+        200,
+    )
 
 
 # --- subscription store --------------------------------------------------------
@@ -219,21 +238,224 @@ def handle_push_subscribe(handler, config, body: dict, query: dict[str, Any]) ->
     handler._write_json({"ok": True, "subscriptions": len(rows)}, 200)  # type: ignore[attr-defined]
 
 
-# --- send (pywebpush, lazy) ----------------------------------------------------
+# --- send (pywebpush first, native cryptography fallback) ---------------------
 
 class PushUnavailable(RuntimeError):
-    """``pywebpush`` is not installed — storage endpoints stay live anyway."""
+    """Neither ``pywebpush`` nor ``cryptography`` can send web pushes."""
+
+
+def _import_pywebpush():
+    try:
+        from pywebpush import webpush  # type: ignore
+
+        return webpush
+    except ImportError:
+        try:
+            from webpush import webpush  # type: ignore
+
+            return webpush
+        except ImportError:
+            return None
+
+
+def _crypto_primitives():
+    try:
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    except ImportError as exc:
+        raise PushUnavailable("cryptography not installed") from exc
+    return hashes, serialization, ec, decode_dss_signature, AESGCM, HKDF
+
+
+def _cryptography_available() -> bool:
+    try:
+        _crypto_primitives()
+    except PushUnavailable:
+        return False
+    return True
+
+
+def push_send_backend() -> str | None:
+    """Return the available push delivery backend, in preference order."""
+    if _import_pywebpush() is not None:
+        return "pywebpush"
+    if _cryptography_available():
+        return "cryptography"
+    return None
+
+
+def _encrypt_aes128gcm(
+    plaintext: bytes,
+    ua_public_b64: str,
+    auth_b64: str,
+    *,
+    server_private_key: Any = None,
+    salt: bytes | None = None,
+    record_size: int = 4096,
+) -> bytes:
+    """Encrypt one single-record RFC 8291 ``aes128gcm`` push payload."""
+    hashes, serialization, ec, _decode_dss_signature, AESGCM, HKDF = _crypto_primitives()
+    ua_public_raw = _b64url_decode(ua_public_b64)
+    auth_secret = _b64url_decode(auth_b64)
+    if len(ua_public_raw) != 65 or ua_public_raw[0] != 4:
+        raise ValueError("subscription keys.p256dh must be an uncompressed P-256 point")
+    if len(auth_secret) != 16:
+        raise ValueError("subscription keys.auth must decode to 16 bytes")
+    if record_size < 18:
+        raise ValueError("aes128gcm record size must be at least 18 bytes")
+    max_plaintext = min(record_size - 17, 3993)
+    if len(plaintext) > max_plaintext:
+        raise ValueError("push payload exceeds the 3993-byte aes128gcm limit")
+
+    ua_public_key = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), ua_public_raw)
+    if server_private_key is None:
+        server_private_key = ec.generate_private_key(ec.SECP256R1())
+    server_public_raw = server_private_key.public_key().public_bytes(
+        serialization.Encoding.X962,
+        serialization.PublicFormat.UncompressedPoint,
+    )
+    salt = secrets.token_bytes(16) if salt is None else salt
+    if len(salt) != 16:
+        raise ValueError("aes128gcm salt must be 16 bytes")
+
+    # RFC 8291 §3.3/§3.4: combine ECDH and auth secret, then RFC 8188 CEK/nonce.
+    ecdh_secret = server_private_key.exchange(ec.ECDH(), ua_public_key)
+    key_info = b"WebPush: info\x00" + ua_public_raw + server_public_raw
+    ikm = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=auth_secret,
+        info=key_info,
+    ).derive(ecdh_secret)
+    cek = HKDF(
+        algorithm=hashes.SHA256(),
+        length=16,
+        salt=salt,
+        info=b"Content-Encoding: aes128gcm\x00",
+    ).derive(ikm)
+    nonce = HKDF(
+        algorithm=hashes.SHA256(),
+        length=12,
+        salt=salt,
+        info=b"Content-Encoding: nonce\x00",
+    ).derive(ikm)
+
+    ciphertext = AESGCM(cek).encrypt(nonce, plaintext + b"\x02", b"")
+    return (
+        salt
+        + struct.pack("!I", record_size)
+        + bytes([len(server_public_raw)])
+        + server_public_raw
+        + ciphertext
+    )
+
+
+def _endpoint_origin(endpoint: str) -> str:
+    parts = urllib.parse.urlsplit(endpoint)
+    if not parts.scheme or not parts.hostname:
+        raise ValueError("push endpoint must be an absolute URL")
+    scheme = parts.scheme.lower()
+    host = parts.hostname.lower()
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    default_port = {"http": 80, "https": 443}.get(scheme)
+    port = parts.port
+    if port is not None and port != default_port:
+        host = f"{host}:{port}"
+    return f"{scheme}://{host}"
+
+
+def _vapid_authorization(endpoint: str, pair: dict[str, str], now: int | None = None) -> str:
+    """Build the RFC 8292 ``Authorization: vapid t=<JWT>, k=<pub>`` value."""
+    hashes, _serialization, ec, decode_dss_signature, _AESGCM, _HKDF = _crypto_primitives()
+    now = int(time.time()) if now is None else int(now)
+    header = {"typ": "JWT", "alg": "ES256"}
+    claims = {
+        "aud": _endpoint_origin(endpoint),
+        "exp": now + 12 * 60 * 60,
+        "sub": "mailto:relay@localhost",
+    }
+    header_b64 = _b64url(json.dumps(header, separators=(",", ":")).encode("utf-8"))
+    claims_b64 = _b64url(json.dumps(claims, separators=(",", ":")).encode("utf-8"))
+    signing_input = f"{header_b64}.{claims_b64}"
+    private_key = ec.derive_private_key(int(pair["private"], 16), ec.SECP256R1())
+    der_sig = private_key.sign(signing_input.encode("ascii"), ec.ECDSA(hashes.SHA256()))
+    r, s = decode_dss_signature(der_sig)
+    signature = r.to_bytes(32, "big") + s.to_bytes(32, "big")
+    token = f"{signing_input}.{_b64url(signature)}"
+    return f"vapid t={token}, k={pair['public']}"
+
+
+def _send_native(subscription: dict[str, Any], data: str, pair: dict[str, str]) -> int:
+    keys = subscription.get("keys") or {}
+    body = _encrypt_aes128gcm(
+        data.encode("utf-8"),
+        str(keys.get("p256dh") or ""),
+        str(keys.get("auth") or ""),
+    )
+    endpoint = str(subscription["endpoint"])
+    request = urllib.request.Request(
+        endpoint,
+        data=body,
+        headers={
+            "Authorization": _vapid_authorization(endpoint, pair),
+            "Content-Encoding": "aes128gcm",
+            "Content-Type": "application/octet-stream",
+            "TTL": "0",
+        },
+        method="POST",
+    )
+    response = None
+    try:
+        response = urllib.request.urlopen(request, timeout=15)
+        status = getattr(response, "status", None)
+        if status is None:
+            status = response.getcode()
+        return int(status or 0)
+    finally:
+        close = getattr(response, "close", None)
+        if close is not None:
+            close()
+
+
+def _pywebpush_private_key(private: str) -> str:
+    """pywebpush wants the raw scalar base64url-encoded; host storage is hex."""
+    try:
+        raw = bytes.fromhex(private)
+    except ValueError:
+        return private
+    return _b64url(raw) if len(raw) == 32 else private
+
+
+def _exception_status(exc: Exception) -> int:
+    for attr in ("code", "status", "status_code"):
+        try:
+            status = int(getattr(exc, attr, 0) or 0)
+        except Exception:
+            status = 0
+        if status:
+            return status
+    try:
+        response = getattr(exc, "response", None)
+    except Exception:
+        response = None
+    try:
+        return int(getattr(response, "status_code", 0) or 0)
+    except Exception:
+        return 0
 
 
 def send_push_all(config, payload: dict[str, Any], ws_ref: str = "") -> int:
     """Push ``payload`` to every stored subscription. Returns delivered count."""
-    try:
-        from pywebpush import webpush  # type: ignore
-    except ImportError:
-        try:
-            from webpush import webpush  # type: ignore
-        except ImportError:
-            raise PushUnavailable("pywebpush not installed") from None
+    webpush = _import_pywebpush()
+    backend = "pywebpush" if webpush is not None else (
+        "cryptography" if _cryptography_available() else ""
+    )
+    if not backend:
+        raise PushUnavailable("pywebpush or cryptography not installed")
     ws_ref = (ws_ref or "").strip()
     if ws_ref:
         from .turn import resolve_workspace_id
@@ -246,23 +468,30 @@ def send_push_all(config, payload: dict[str, Any], ws_ref: str = "") -> int:
         for sub in all_rows
         if not ws_ref or str(sub.get("workspace") or "") in ("", ws_ref)
     ]
+    data = json.dumps(payload)
     sent = 0
     dead: list[str] = []
     for sub in targets:
         try:
-            webpush(
-                subscription_info={
-                    "endpoint": sub["endpoint"],
-                    "keys": sub.get("keys") or {},
-                },
-                data=json.dumps(payload),
-                vapid_private_key=pair["private"],
-                vapid_claims={"sub": "mailto:relay@localhost"},
-            )
-            sent += 1
-        except Exception as exc:
-            status = getattr(getattr(exc, "response", None), "status_code", 0)
+            if backend == "pywebpush":
+                webpush(
+                    subscription_info={
+                        "endpoint": sub["endpoint"],
+                        "keys": sub.get("keys") or {},
+                    },
+                    data=data,
+                    vapid_private_key=_pywebpush_private_key(pair["private"]),
+                    vapid_claims={"sub": "mailto:relay@localhost"},
+                )
+                sent += 1
+                continue
+            status = _send_native(sub, data, pair)
             if status in (404, 410):
+                dead.append(str(sub.get("endpoint")))
+            elif 200 <= status < 300:
+                sent += 1
+        except Exception as exc:
+            if _exception_status(exc) in (404, 410):
                 dead.append(str(sub.get("endpoint")))
     if dead:
         rows = [r for r in load_subscriptions(config=config) if r.get("endpoint") not in dead]
