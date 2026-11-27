@@ -185,15 +185,28 @@ def get_persona(ws: Workspace, persona_id: str) -> dict | None:
 
 
 def create_persona(ws: Workspace, persona_id: str, body: dict | None = None) -> dict:
-    """Mint an equal persona: <ws>/personas/<id>/persona.json."""
+    """Mint or update an equal persona: <ws>/personas/<id>/persona.json."""
     _valid_id(persona_id)
     pdir = Path(ws.personas) / persona_id
     manifest = pdir / "persona.json"
     raw = body if isinstance(body, dict) else {}
-    data = {k: v for k, v in raw.items() if k in WS_PERSONA_FIELDS}
-    data["id"] = persona_id
+    updates = {k: v for k, v in raw.items() if k in WS_PERSONA_FIELDS and k != "id"}
     if manifest.is_file():
-        return data
+        try:
+            existing = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+        if not isinstance(existing, dict):
+            existing = {}
+        existing["id"] = persona_id
+        if not updates:
+            return existing
+        existing.update(updates)
+        manifest.write_text(
+            json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return existing
+    data = dict(updates)
+    data["id"] = persona_id
     pdir.mkdir(parents=True, exist_ok=True)
     manifest.write_text(
         json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")

@@ -487,6 +487,59 @@ class TestWorkspaceRoutes(unittest.TestCase):
         )
         self.assertNotIn("allowed_kinds", ops_disk)
 
+    def test_upsert_persona_updates_existing_manifest_and_preserves_empty_post(self):
+        ws = create_workspace("demo")
+        resp1 = self.srv.request(
+            "POST",
+            "/v1/workspaces/demo/personas",
+            {"id": "nova", "name": "Nova", "role": "research", "system_append": "be terse"},
+        )
+        self.assertEqual(resp1.status, 201)
+
+        # Updating an existing persona persists allowlisted fields and strips disallowed keys.
+        resp2 = self.srv.request(
+            "POST",
+            "/v1/workspaces/demo/personas",
+            {
+                "id": "nova",
+                "name": "Nova v2",
+                "role": "reviewer",
+                "system_append": "be crisp",
+                "allowed_kinds": ["admin"],
+                "caps_ref": "root",
+            },
+        )
+        self.assertEqual(resp2.status, 201)
+        body2 = json.loads(resp2.read().decode())
+        self.assertEqual(body2["persona"]["name"], "Nova v2")
+        self.assertEqual(body2["persona"]["role"], "reviewer")
+        self.assertEqual(body2["persona"]["system_append"], "be crisp")
+        self.assertNotIn("allowed_kinds", body2["persona"])
+        self.assertNotIn("caps_ref", body2["persona"])
+
+        on_disk = json.loads(
+            (ws.personas / "nova" / "persona.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(on_disk["name"], "Nova v2")
+        self.assertEqual(on_disk["role"], "reviewer")
+        self.assertEqual(on_disk["system_append"], "be crisp")
+        self.assertNotIn("allowed_kinds", on_disk)
+        self.assertNotIn("caps_ref", on_disk)
+
+        # Idempotent bare {id} POST leaves existing metadata intact.
+        resp3 = self.srv.request("POST", "/v1/workspaces/demo/personas", {"id": "nova"})
+        self.assertEqual(resp3.status, 201)
+        body3 = json.loads(resp3.read().decode())
+        self.assertEqual(body3["persona"]["name"], "Nova v2")
+
+        # GET /v1/personas reads back updated fields.
+        resp4 = self.srv.request("GET", "/v1/personas?workspace=demo")
+        self.assertEqual(resp4.status, 200)
+        listed = {p["id"]: p for p in json.loads(resp4.read().decode())["personas"]}
+        self.assertEqual(listed["nova"]["name"], "Nova v2")
+        self.assertEqual(listed["nova"]["role"], "reviewer")
+        self.assertEqual(listed["nova"]["system_append"], "be crisp")
+
     def test_get_persona_rejects_invalid_id(self):
         from agents_relay.workspaces import get_persona
 
