@@ -26,6 +26,9 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
+[project.optional-dependencies]
+push = ["pywebpush>=2.0"]
+
 [project.urls]
 Homepage = "https://github.com/Lolaplex/agents-relay"
 Repository = "https://github.com/Lolaplex/agents-relay"

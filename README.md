@@ -70,7 +70,7 @@ Needs `runner.loop` on `PATH` (`LOOP_CMD`, default `python -m runner.loop`). Tha
 - [x] **Session run-lock leases**: one live run per workspace+session across devices (TTL + fencing tokens, `/v1/hub/lease` + `/v1/hub/leases`).
 - [x] **Presence, hosts & live links**: `GET /v1/workspaces/<ws>/hosts` host-picker surface, ws-scoped invites (`/v1/ws/invite`), hub links (`/v1/hub/connect`, `/v1/hub/links`), session host switching, and the `/v1/events` SSE bus.
 - [x] **Web approvals**: `GET /v1/approvals` list + `POST /v1/approvals/<id>` decide + `approval.changed` SSE; inside turns, `POST /v1/approvals/request` + `GET /v1/approvals/<id>/wait` run on a per-turn `AGENTS_APPROVAL_TOKEN` (no relay secret needed) and mirror to connected devices.
-- [x] **Web Push**: VAPID key management (`/v1/push/vapid-key`), subscriptions (`/v1/push/subscribe`), and `/v1/push/send` (sending needs the optional `pywebpush`).
+- [x] **Web Push**: VAPID key management (`/v1/push/vapid-key`, alias `/v1/push/key`), subscriptions (`/v1/push/subscribe`), and `/v1/push/send` (optional `pywebpush`, otherwise native `cryptography` RFC 8291/8292 delivery).
 
 ### Planned (Roadmap)
 
