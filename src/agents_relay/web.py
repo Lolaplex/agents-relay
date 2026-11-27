@@ -59,6 +59,11 @@ _ACTIVE_LOCK = threading.Lock()
 # (klanker#148). entry["meta"] carries session/workspace.
 run_done_hook = None
 
+# fn(run_id, entry, text): optional host-app mirror for steer text (for
+# example workspace inbox/traces). Failures are logged and never break the
+# running turn or the SSE steer signal.
+steer_record_hook = None
+
 # Event buffer cap per run: deltas are small but long turns are not bounded;
 # an attach that starts mid-run replays only the tail. Trailer/start/meta are
 # always kept (replayed first, marked replayed).
@@ -71,6 +76,7 @@ def _new_run_entry() -> dict[str, Any]:
         "cond": threading.Condition(),
         "meta": {},
         "events": [],
+        "steer_queue": [],
         "done": False,
     }
 
@@ -107,6 +113,69 @@ def _find_run(run: str = "", session: str = "", workspace: str = "", persona: st
                 continue
             return rid, entry
     return "", None
+
+
+def _write_steer_pipe(entry: dict[str, Any], text: str) -> None:
+    """Best-effort stdin steer for runtimes that expose a writable pipe.
+
+    Current runner-loop children do not expose one. A future embedder may
+    attach ``entry["stdin"]``; closed or unsupported pipes degrade to a log
+    line, never a failed turn or failed inject request.
+    """
+    pipe = entry.get("stdin")
+    if pipe is None:
+        return
+    try:
+        writable = getattr(pipe, "writable", None)
+        if callable(writable) and not writable():
+            return
+        try:
+            pipe.write(text + "\n")
+        except TypeError:
+            pipe.write((text + "\n").encode("utf-8"))
+        flush = getattr(pipe, "flush", None)
+        if callable(flush):
+            flush()
+    except (BrokenPipeError, ConnectionResetError, OSError, ValueError, TypeError):
+        log.info("steer stdin unavailable for active run")
+
+
+def steer_active(session: str, text: str, *, workspace: str = "",
+                 persona: str = "") -> tuple[str, dict[str, Any] | None]:
+    """Append steer text to the active run and fan it out as typed SSE.
+
+    Returns ``(run_id, entry)``; ``entry`` is None when no matching run is
+    currently executing. Finished runs lingering for re-attach are not
+    steerable.
+    """
+    clean_session = (session or "").strip()
+    clean_text = (text or "").strip()
+    if not clean_session or not clean_text:
+        return "", None
+    run_id, entry = _find_run(
+        session=clean_session, workspace=workspace, persona=persona)
+    if entry is None:
+        return run_id, None
+    cond = entry["cond"]
+    with cond:
+        if entry.get("done"):
+            return run_id, None
+        entry.setdefault("steer_queue", []).append({
+            "text": clean_text,
+            "session": clean_session,
+            "workspace": workspace,
+            "persona": persona,
+            "ts": time.time(),
+        })
+    payload = {"type": "steer", "text": clean_text, "session": clean_session}
+    _publish(entry, payload)
+    _write_steer_pipe(entry, clean_text)
+    if steer_record_hook is not None:
+        try:
+            steer_record_hook(run_id, entry, clean_text)
+        except Exception as exc:  # noqa: BLE001 - recording is best-effort
+            log.warning("steer record hook failed for run %s: %s", run_id, exc)
+    return run_id, entry
 
 
 # Revocation teardown (agents-relay#44): device-tagged stream attaches

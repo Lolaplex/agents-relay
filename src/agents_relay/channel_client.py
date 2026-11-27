@@ -28,6 +28,42 @@ _RECONNECT_MIN = 1.0
 _RECONNECT_MAX = 60.0
 
 
+def _normalize_hub_url(url: str) -> str:
+    """Canonical hub origin for link matching.
+
+    Case, root trailing slashes, default ports and the localhost/127.0.0.1
+    spelling do not make distinct hubs. Paths (already outside the origin
+    contract) are preserved except for trailing slashes.
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parts = urllib.parse.urlsplit(raw)
+    except ValueError:
+        return raw.rstrip("/").lower()
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https") or not parts.netloc:
+        return raw.rstrip("/")
+    host = (parts.hostname or "").lower()
+    if not host:
+        return raw.rstrip("/")
+    if host == "localhost":
+        host = "127.0.0.1"
+    try:
+        port = parts.port
+    except ValueError:
+        return raw.rstrip("/").lower()
+    default_port = 80 if scheme == "http" else 443
+    show_port = port if port is not None and port != default_port else None
+    host_part = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    netloc = f"{host_part}:{show_port}" if show_port is not None else host_part
+    path = parts.path.rstrip("/")
+    if path == "/":
+        path = ""
+    return urllib.parse.urlunsplit((scheme, netloc, path, "", ""))
+
+
 def _secret_key(hub_id: str) -> str:
     import re
 
@@ -107,11 +143,11 @@ def connect_hub(hub_url: str, credential: str, *, label: str = "") -> dict:
     instead of minting a second device (agents-relay#44)."""
     from agents_workspace import write_secret
 
-    base = hub_url.strip().rstrip("/")
+    base = _normalize_hub_url(hub_url)
     rows = _load_hubs()
     prev_id, prev_row = "", {}
     for hid, row in rows.items():
-        if str(row.get("hub_url") or "").rstrip("/") == base:
+        if _normalize_hub_url(str(row.get("hub_url") or "")) == base:
             prev_id, prev_row = hid, row
             break
     res = redeem_device(base, credential, label=label,

@@ -152,6 +152,35 @@ def mint_device(device_id: str = "", *, label: str = "", host_id: str = "",
             "created_at": rows[did]["created_at"]}
 
 
+def update_device(device_id: str, *, label: str = "", host_id: str = "",
+                  role: str = "", allowlist: list[str] | None = None) -> dict | None:
+    """Update device meta in place without rotating its vault token."""
+    did = (device_id or "").strip()
+    if role and role not in ("host", "client", "ws_member"):
+        raise ValueError(f"invalid device role: {role!r}")
+    with _LOCK:
+        rows = load_devices()
+        meta = rows.get(did)
+        if meta is None:
+            return None
+        next_role = role or str(meta.get("role") or "host")
+        next_allowlist = (
+            list(allowlist) if allowlist is not None
+            else list(meta.get("allowlist") or [])
+        )
+        if next_role == "ws_member" and not next_allowlist:
+            raise ValueError("ws_member devices need a non-empty allowlist")
+        if label:
+            meta["label"] = label
+        if host_id:
+            meta["host_id"] = host_id
+        meta["role"] = next_role
+        meta["allowlist"] = next_allowlist
+        rows[did] = meta
+        _store(rows)
+        return {**meta, "allowlist": list(next_allowlist)}
+
+
 def verify_device(device_id: str, token: str) -> bool:
     """Constant-time check of a presented device token."""
     import hmac

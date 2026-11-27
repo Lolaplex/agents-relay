@@ -4,10 +4,13 @@
 from __future__ import annotations
 
 import hmac
+import ipaddress
 import json
 import logging
 import os
 import re
+import socket
+import subprocess
 import tempfile
 import time
 import urllib.parse
@@ -48,6 +51,7 @@ _ENVELOPE_KEYS = frozenset({
     "text",
     "message",
     "session",
+    "session_id",
     "user_id",
     "new_session",
     "notify",
@@ -662,19 +666,30 @@ def _clean_host(raw: str) -> str:
     return "" if not h or _HOST_BAD_RE.search(h) else h
 
 
-def _request_base_url(handler, cfg) -> str:
-    """Absolute base for self-links (pair URLs).
+def _request_base_url_info(handler, cfg) -> tuple[str, bool]:
+    """Absolute self-link base plus whether it was explicitly configured.
 
-    Order: explicit ``AGENTS_RELAY_URL`` > proxy headers > request ``Host``
-    > auto-bound URL. ``serve_http`` backfills ``relay_url`` with the bound
-    socket address (often loopback) — that value is a fallback, not a
-    user choice, so a real request Host beats it. Scheme falls back to
-    http on loopback/private hosts and https elsewhere.
+    Order: ``AGENTS_RELAY_PUBLIC_URL`` / ``AGENTS_RELAY_URL`` > trusted
+    proxy headers > request ``Host`` > auto-bound URL. ``serve_http``
+    backfills ``relay_url`` with the bound socket address (often loopback) —
+    that value is a fallback, not a user choice, so a real request Host
+    beats it. The CLI also exports that bound URL as ``AGENTS_RELAY_URL``
+    for child turns; equality with the server-bound URL is explicit only
+    when the original config already carried a relay URL. Scheme falls
+    back to http on loopback/private hosts and https elsewhere.
     """
+    server = getattr(handler, "server", None)
+    auto_bound = str(getattr(server, "relay_url", "") or "").strip().rstrip("/")
+    public = (os.environ.get("AGENTS_RELAY_PUBLIC_URL", "") or "").strip().strip("'\"").strip().rstrip("/")
+    if public:
+        return public, True
+    configured_explicit = bool(getattr(server, "relay_url_explicit", False))
+    relay_env = (os.environ.get("AGENTS_RELAY_URL", "") or "").strip().strip("'\"").strip().rstrip("/")
+    if relay_env and (configured_explicit or relay_env != auto_bound):
+        return relay_env, True
     configured = str(getattr(cfg, "relay_url", "") or "").strip().rstrip("/")
-    auto_bound = str(getattr(getattr(handler, "server", None), "relay_url", "") or "").strip().rstrip("/")
-    if configured and configured != auto_bound:
-        return configured
+    if configured and (configured_explicit or configured != auto_bound):
+        return configured, True
     if _trust_proxy():
         proto = (handler.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
         host = _clean_host(
@@ -686,8 +701,158 @@ def _request_base_url(handler, cfg) -> str:
     if host:
         if proto not in ("http", "https"):
             proto = "http" if _is_private_host(host) else "https"
-        return f"{proto}://{host}"
-    return configured
+        return f"{proto}://{host}", False
+    return configured, False
+
+
+def _request_base_url(handler, cfg) -> str:
+    """Absolute base for self-links (pair URLs)."""
+    return _request_base_url_info(handler, cfg)[0]
+
+
+def _clean_non_loopback_ipv4(raw: str) -> str:
+    try:
+        ip = ipaddress.ip_address(str(raw or "").strip())
+    except ValueError:
+        return ""
+    if ip.version != 4 or ip.is_loopback or ip.is_unspecified \
+            or ip.is_multicast or ip.is_link_local:
+        return ""
+    return str(ip)
+
+
+def _is_tailscale_ipv4(raw: str) -> bool:
+    clean = _clean_non_loopback_ipv4(raw)
+    if not clean:
+        return False
+    return ipaddress.ip_address(clean) in ipaddress.ip_network("100.64.0.0/10")
+
+
+def _tailscale_ipv4(timeout_sec: float = 1.5) -> str:
+    """Tailscale CGNAT IPv4, if the local daemon answers quickly."""
+    try:
+        proc = subprocess.run(
+            ["tailscale", "ip", "-4"],
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    for token in (proc.stdout or "").split():
+        if _is_tailscale_ipv4(token):
+            return str(ipaddress.ip_address(token.strip()))
+    return ""
+
+
+def _default_route_ipv4() -> str:
+    """Default-route LAN IPv4 via UDP connect; no packet is sent."""
+    for target in ("8.8.8.8", "1.1.1.1"):
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.connect((target, 80))
+            found = _clean_non_loopback_ipv4(sock.getsockname()[0])
+            if found:
+                return found
+        except OSError:
+            pass
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+    return ""
+
+
+def detect_non_loopback_ipv4(*, tailscale_probe=None, route_probe=None) -> str:
+    """Reachable non-loopback IPv4: Tailscale CGNAT first, LAN fallback.
+
+    Probes are injectable so tests and embedders never depend on the host
+    network shape. Probe failures degrade to the next probe, never into
+    pair minting itself.
+    """
+    ts_probe = tailscale_probe or _tailscale_ipv4
+    lan_probe = route_probe or _default_route_ipv4
+    try:
+        ts = ts_probe()
+    except Exception as exc:  # noqa: BLE001 - detector failure must not block pairing
+        log.warning("tailscale address probe failed: %s", exc)
+        ts = ""
+    if _is_tailscale_ipv4(ts):
+        return str(ipaddress.ip_address(str(ts).strip()))
+    try:
+        lan = lan_probe()
+    except Exception as exc:  # noqa: BLE001 - detector failure must not block pairing
+        log.warning("default-route address probe failed: %s", exc)
+        lan = ""
+    return _clean_non_loopback_ipv4(lan)
+
+
+def _is_loopback_host(host: str) -> bool:
+    h = (host or "").strip().lower().rstrip(".")
+    if h.startswith("[") and h.endswith("]"):
+        h = h[1:-1]
+    if h == "localhost":
+        return True
+    try:
+        ip = ipaddress.ip_address(h)
+    except ValueError:
+        return False
+    return bool(ip.is_loopback or ip.is_unspecified)
+
+
+def _pair_advertisement(handler, cfg, mode: str, *, detector=None) -> tuple[str, dict[str, Any]]:
+    """Pair-link base plus loopback substitution metadata.
+
+    Explicit public URLs always win. Cross-device pairs minted through a
+    loopback UI are rewritten to the best non-loopback interface; when no
+    such interface exists the original URL stays and ``loopback_warning``
+    tells the UI that the link is same-machine only.
+    """
+    base, explicit = _request_base_url_info(handler, cfg)
+    advertised = base
+    warning = False
+    substituted = False
+    if mode in ("remote", "ws") and not explicit:
+        try:
+            parts = urllib.parse.urlsplit(base)
+            host = parts.hostname or ""
+        except ValueError:
+            parts = None
+            host = ""
+        if host and _is_loopback_host(host):
+            probe = detector or detect_non_loopback_ipv4
+            try:
+                found = probe()
+            except Exception as exc:  # noqa: BLE001 - never kill a pair mint on network detection
+                log.warning("non-loopback address detection failed: %s", exc)
+                found = ""
+            found = _clean_non_loopback_ipv4(found)
+            if found:
+                scheme = (parts.scheme if parts is not None else "") or "http"
+                try:
+                    port = int(handler.server.server_address[1])
+                except (AttributeError, IndexError, TypeError, ValueError):
+                    try:
+                        port = int(parts.port if parts is not None else 0) or int(
+                            getattr(cfg, "relay_port", 0) or 0)
+                    except (TypeError, ValueError):
+                        port = 0
+                netloc = f"{found}:{port}" if port else found
+                advertised = urllib.parse.urlunsplit((scheme, netloc, "", "", ""))
+                substituted = advertised != base
+            else:
+                warning = True
+    return advertised, {
+        "advertised_url": advertised,
+        "loopback_warning": warning,
+        "loopback_substituted": substituted,
+    }
 
 
 def _emit_relay_event(kind: str, payload: dict[str, Any] | None = None, *, workspace: str = "") -> None:
@@ -1017,6 +1182,44 @@ class TurnHandler(BaseHTTPRequestHandler):
             return
         qp = query_params or {}
         cfg = self._cfg()
+        web_session = str(body.get("session_id") or "").strip() or str(
+            body.get("session") or "").strip()
+        raw_chat = str(body.get("chat_id") or qp.get("chat_id") or "").strip()
+        raw_user = str(body.get("user") or qp.get("user") or "").strip()
+
+        def _numeric(raw: str) -> bool:
+            try:
+                int(raw)
+                return bool(raw)
+            except (TypeError, ValueError):
+                return False
+
+        if web_session and not (_numeric(raw_chat) or _numeric(raw_user)):
+            text = str(body.get("text") or body.get("message") or "").strip()
+            if not text:
+                self.send_error(400, "text is required")
+                return
+            from .web import steer_active
+
+            _run_id, active = steer_active(
+                web_session,
+                text,
+                workspace=_body_ws(body),
+                persona=str(body.get("persona") or "").strip(),
+            )
+            if active is None:
+                self._write_json(
+                    {"error": "no active run for session",
+                     "session": web_session, "active": False},
+                    409,
+                )
+                return
+            self._write_json(
+                {"ok": True, "steered": True,
+                 "session": web_session, "active": True},
+                200,
+            )
+            return
         raw_id = str(
             body.get("chat_id")
             or body.get("user")
@@ -1146,17 +1349,22 @@ class TurnHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
             cfg = self._cfg()
+            pair_base, pair_meta = _pair_advertisement(self, cfg, mode)
             try:
                 res = create_pair(
                     mode=mode,
                     ttl_sec=ttl,
                     host_id=host_id,
-                    base_url=_request_base_url(self, cfg),
+                    base_url=pair_base,
+                    granted_by="__admin__",
                 )
             except ValueError as exc:
                 self.send_error(400, str(exc))
                 return
-            self._write_json({"ok": True, **res}, 200)
+            payload = {"ok": True, **res}
+            if mode in ("remote", "ws"):
+                payload.update(pair_meta)
+            self._write_json(payload, 200)
             return
 
         if path == "/v1/ws/invite":
@@ -1202,11 +1410,12 @@ class TurnHandler(BaseHTTPRequestHandler):
                     host_id = str(hid_fn() or "")
             except Exception:
                 pass
+            pair_base, pair_meta = _pair_advertisement(self, cfg, "ws")
             res = create_pair(
                 mode="ws", ws=ws_id, granted_by=device_id,
                 host_id=host_id, ttl_sec=body.get("ttl_sec", 60),
-                base_url=_request_base_url(self, cfg))
-            self._write_json({"ok": True, **res}, 200)
+                base_url=pair_base)
+            self._write_json({"ok": True, **res, **pair_meta}, 200)
             return
 
         if path == "/v1/pair/redeem":
@@ -1290,6 +1499,62 @@ class TurnHandler(BaseHTTPRequestHandler):
                          "host_id": entry.get("host_id", ""),
                          "granted_by": granted_by,
                          "device_id": did, "token": "",
+                         "reused": True,
+                         "hub": {
+                             "stream": "/v1/hub/stream",
+                             "send": "/v1/hub/send",
+                             "devices": "/v1/hub/devices",
+                             "lease": "/v1/hub/lease",
+                         }},
+                        200,
+                    )
+                    return
+            if entry["mode"] == "remote":
+                # Re-linking an already-paired device must reuse its row in
+                # place. The existing vault token stays authoritative; the
+                # response intentionally carries token="".
+                ctx = self._auth_ctx()
+                if ctx.get("kind") == "device" and ctx.get("device_id"):
+                    did = str(ctx["device_id"])
+                    from .devices import load_devices, update_device
+
+                    meta = load_devices().get(did)
+                    if meta is None:
+                        self._write_json(
+                            {"ok": False,
+                             "error": "device credential no longer valid"}, 403)
+                        return
+                    current_role = str(meta.get("role") or "host")
+                    admin_grant = granted_by == "__admin__"
+                    if current_role == "ws_member" and not admin_grant:
+                        self._write_json(
+                            {"ok": False,
+                             "error": "remote pair cannot upgrade ws_member"}, 403)
+                        return
+                    try:
+                        updated = update_device(
+                            did,
+                            label=label,
+                            host_id=str(entry.get("host_id") or ""),
+                            role="host" if current_role == "ws_member" else "",
+                            allowlist=[] if current_role == "ws_member" else None,
+                        )
+                    except ValueError as exc:
+                        self._write_json(
+                            {"ok": False, "error": f"device reuse failed: {exc}"}, 500)
+                        return
+                    if updated is None:
+                        self._write_json(
+                            {"ok": False,
+                             "error": "device credential no longer valid"}, 403)
+                        return
+                    self._write_json(
+                        {"ok": True, "mode": "remote", "ws": "",
+                         "host_id": entry.get("host_id", ""),
+                         "granted_by": granted_by,
+                         "device_id": did, "token": "",
+                         "reused": True,
+                         "role": updated.get("role") or current_role,
                          "hub": {
                              "stream": "/v1/hub/stream",
                              "send": "/v1/hub/send",
@@ -3899,6 +4164,7 @@ def serve_http(config: RelayConfig, *, on_turn: Callable[..., LoopTurnResult] | 
     effective_cfg = config if config.relay_url else replace(config, relay_url=bound_url)
     handler.config = effective_cfg
     server.relay_url = bound_url  # type: ignore[attr-defined]
+    server.relay_url_explicit = bool(config.relay_url)  # type: ignore[attr-defined]
     try:
         from .wake import replay_all
 

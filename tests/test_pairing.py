@@ -150,13 +150,19 @@ class TestPairing(unittest.TestCase):
     def test_remote_redeem_returns_token_once(self):
         srv = _Srv(_cfg())
         try:
-            st, _, created = srv.req(
-                "POST",
-                "/v1/pair/create",
-                {"mode": "remote", "ttl_sec": 5},
-                headers={"Authorization": "Bearer expected"},
-            )
+            with patch.dict(os.environ, {
+                    "AGENTS_RELAY_PUBLIC_URL": "",
+                    "AGENTS_RELAY_URL": ""}), \
+                    patch("agents_relay.http_adapter.detect_non_loopback_ipv4",
+                          return_value=""):
+                st, _, created = srv.req(
+                    "POST",
+                    "/v1/pair/create",
+                    {"mode": "remote", "ttl_sec": 5},
+                    headers={"Authorization": "Bearer expected"},
+                )
             self.assertEqual(st, 200)
+            self.assertTrue(created["loopback_warning"])
             # Remote pairs declare their kind in the link shape —
             # redeem branches on the stored mode AND the URL marker.
             self.assertTrue(
