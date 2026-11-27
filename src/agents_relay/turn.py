@@ -12,12 +12,14 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterable, Iterator
 
 from .config import RelayConfig
 
 LOOP_TRAILER_MARKER = "---agents-loop-trailer---"
+SIDEBAND_PREFIX = "__KLANKER_EVT__ "
+STRUCTURED_EVENT_TYPES = frozenset({"thought", "tool_start", "tool_end", "usage"})
 _STREAM_READ = 4096
 _BATCH_MAX = 256
 _BATCH_WAIT = 0.03
@@ -88,6 +90,7 @@ class StreamEvent:
     user_id: str = ""
     alias: str = ""
     returncode: int = 0
+    data: dict[str, Any] = field(default_factory=dict)
 
 
 def parse_loop_stdout(stdout: str) -> dict[str, Any]:
@@ -813,6 +816,20 @@ def iter_loop_stream_live(
                         yield StreamEvent(type="delta", text=piece)
                     line = data.strip()
                     if line:
+                        if line.startswith(SIDEBAND_PREFIX):
+                            raw_evt = line[len(SIDEBAND_PREFIX) :].strip()
+                            try:
+                                obj = json.loads(raw_evt)
+                            except json.JSONDecodeError:
+                                obj = None
+                            if isinstance(obj, dict) and obj.get("type") in STRUCTURED_EVENT_TYPES:
+                                last_emit = time.monotonic()
+                                yield StreamEvent(
+                                    type=str(obj["type"]),
+                                    text=str(obj.get("text") or ""),
+                                    data=obj,
+                                )
+                            continue
                         last_emit = time.monotonic()
                         yield StreamEvent(type="status", text=line)
                     continue
