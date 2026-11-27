@@ -194,9 +194,11 @@ _RPC_DENY_ALWAYS = (
     "/v1/pair", "/v1/hub", "/v1/remotes", "/v1/remote", "/v1/discover",
     "/v1/clients", "/v1/secrets", "/v1/vault", "/v1/ws/invite",
     "/v1/approvals", "/v1/model", "/v1/auth", "/v1/klanker/routines",
-    "/v1/klanker/skills", "/v1/klanker/memory", "/v1/jobs",
+    "/v1/klanker/skills", "/v1/klanker/memory", "/v1/klanker/doctor",
+    "/v1/klanker/bg", "/v1/klanker/files", "/v1/klanker/stats",
+    "/v1/klanker/sessions/fork", "/v1/jobs",
     "/v1/send", "/v1/inject", "/v1/favorites", "/v1/push",
-    "/v1/a2a", "/v1/webhook", "/v1/alert",
+    "/v1/voice", "/v1/a2a", "/v1/webhook", "/v1/alert",
     "/v1/host", "/v1/providers/secret",
 )
 _RPC_DENY_WRITE = (
@@ -341,6 +343,12 @@ def _rpc_turn_stream(params: dict, cfg: RelayConfig) -> Iterator[dict]:
             yield {"delta": evt.text}
         elif evt.type == "status":
             yield {"status": evt.text}
+        elif evt.type in ("thought", "tool_start", "tool_end", "usage"):
+            d = dict(getattr(evt, "data", None) or {})
+            d.setdefault("type", evt.type)
+            if evt.text and "text" not in d:
+                d["text"] = evt.text
+            yield d
         elif evt.type == "trailer":
             yield {"done": True, "session": evt.session,
                    "returncode": evt.returncode}

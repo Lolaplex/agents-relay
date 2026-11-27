@@ -314,6 +314,10 @@ def _run_prompt(
             continue
         if event.type == "delta" and event.text:
             _chunk(writer, session.session_id, event.text)
+        elif event.type == "thought" and event.text:
+            _chunk(writer, session.session_id, event.text, thought=True)
+        elif event.type in ("tool_start", "tool_end", "usage"):
+            continue
         elif event.type == "status" and event.text:
             if _STATUS_NOISE.search(event.text):
                 continue

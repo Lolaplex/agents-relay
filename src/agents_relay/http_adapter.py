@@ -6,7 +6,9 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import os
 import re
+import tempfile
 import time
 import urllib.parse
 from collections import deque
@@ -423,6 +425,151 @@ class _TurnHook:
 
 
 MAX_HTTP_BODY_BYTES = 16 * 1024 * 1024
+MAX_VOICE_UPLOAD_BYTES = 10 * 1024 * 1024
+
+_AUDIO_EXT_BY_MIME = {
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/ogg": ".ogg",
+    "audio/mp4": ".m4a",
+    "audio/m4a": ".m4a",
+    "audio/webm": ".webm",
+}
+
+
+def _resolve_opt_workspace(query_params: dict) -> tuple[Any, str, tuple[int, str] | None]:
+    ws_id = str((query_params.get("workspace") or [""])[0] or "").strip()
+    if not ws_id:
+        return None, "", None
+    try:
+        from agents_workspace import Host
+
+        ws = Host.from_env().workspace(ws_id)
+        return ws, str(getattr(ws, "id", "") or ws_id), None
+    except Exception:
+        return None, "", (404, f"unknown workspace: {ws_id}")
+
+
+def _allowlist_fallback_files(ws: Any) -> list[Path]:
+    raw_env = os.environ.get("AGENTS_APPROVAL_ALLOWLIST", "").strip()
+    if raw_env.lower() in ("0", "off", "none", "false", "no"):
+        return []
+    if raw_env:
+        return [Path(raw_env).expanduser()]
+    files: list[Path] = []
+    try:
+        from agents_workspace import Host
+
+        host_dir = Path(Host.from_env().dir)
+    except Exception:
+        host_dir = Path(os.environ.get("AGENTS_HOST_DIR") or Path.home() / ".agents")
+    if ws is not None and getattr(ws, "id", None):
+        files.append(host_dir / "approvals" / f"ws-{ws.id}.allowlist.json")
+    legacy = host_dir / "approval-allowlist.json"
+    if legacy not in files:
+        files.append(legacy)
+    return files
+
+
+def _read_allowlist_file(path: Path) -> list[str]:
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if isinstance(data, dict):
+        data = data.get("patterns") or []
+    if not isinstance(data, list):
+        return []
+    return [str(p).strip() for p in data if str(p).strip()]
+
+
+def _write_allowlist_file(path: Path, patterns: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=".allowlist_", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"patterns": patterns}, indent=2, ensure_ascii=False))
+        try:
+            os.chmod(tmp_name, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _load_allowlist_patterns(ws: Any) -> list[str]:
+    try:
+        from runner.approval_allowlist import load_patterns
+
+        return list(load_patterns(workspace=ws))
+    except ImportError:
+        out: list[str] = []
+        for path in _allowlist_fallback_files(ws):
+            for pat in _read_allowlist_file(path):
+                if pat not in out:
+                    out.append(pat)
+        return out
+
+
+def _remove_allowlist_pattern(pattern: str, ws: Any) -> bool:
+    pat = (pattern or "").strip()
+    if not pat:
+        return False
+    try:
+        from runner import approval_allowlist
+
+        fn = getattr(approval_allowlist, "remove_pattern", None)
+        if callable(fn):
+            return bool(fn(pat, workspace=ws))
+    except ImportError:
+        pass
+    removed = False
+    for path in _allowlist_fallback_files(ws):
+        existing = _read_allowlist_file(path)
+        if pat in existing:
+            _write_allowlist_file(path, [p for p in existing if p != pat])
+            removed = True
+    return removed
+
+
+def _extract_voice_audio(content_type: str, raw: bytes) -> tuple[bytes, str]:
+    ctype = (content_type or "").split(";", 1)[0].strip().lower()
+    if ctype == "multipart/form-data":
+        from email.parser import BytesParser
+
+        msg = BytesParser().parsebytes(
+            f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("latin-1", errors="replace") + raw
+        )
+        if msg.is_multipart():
+            parts = list(msg.walk())
+            chosen = None
+            for part in parts:
+                if part.is_multipart():
+                    continue
+                name = part.get_param("name", header="content-disposition")
+                if name in ("file", "audio") or part.get_filename():
+                    chosen = part
+                    if name in ("file", "audio"):
+                        break
+            if chosen is not None:
+                payload = chosen.get_payload(decode=True) or b""
+                fname = chosen.get_filename() or ""
+                ext = Path(fname).suffix.lower() if fname else ""
+                if not ext or not re.fullmatch(r"\.[a-z0-9]{1,8}", ext):
+                    part_ct = (chosen.get_content_type() or "").lower()
+                    ext = _AUDIO_EXT_BY_MIME.get(part_ct, ".webm")
+                return payload, ext
+        return b"", ".webm"
+    return raw, _AUDIO_EXT_BY_MIME.get(ctype, ".webm")
 
 
 def _read_json_body(handler: BaseHTTPRequestHandler) -> tuple[dict, bytes]:
@@ -1519,6 +1666,78 @@ class TurnHandler(BaseHTTPRequestHandler):
             if out.get("error") and not status:
                 status = 502
             self._write_json(out, status or 200)
+            return
+
+        if path == "/v1/voice/transcribe":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            cfg = self._cfg()
+            if not (cfg.groq_api_key or "").strip():
+                self.send_error(503, "voice transcription not configured (missing GROQ_API_KEY)")
+                return
+            raw_len = (self.headers.get("Content-Length") or "0").strip()
+            try:
+                length = int(raw_len)
+            except ValueError:
+                self.send_error(400, "invalid Content-Length")
+                return
+            if length < 0:
+                self.send_error(400, "invalid Content-Length")
+                return
+            if length > MAX_VOICE_UPLOAD_BYTES:
+                self.send_error(413, "voice upload too large")
+                return
+            raw = self.rfile.read(length) if length else b""
+            audio_bytes, ext = _extract_voice_audio(self.headers.get("Content-Type") or "", raw)
+            if not audio_bytes:
+                self.send_error(400, "audio body is required")
+                return
+            from .voice import transcribe_audio
+
+            with tempfile.TemporaryDirectory(prefix="relay_voice_") as tmp_dir:
+                audio_path = Path(tmp_dir) / f"audio{ext}"
+                audio_path.write_bytes(audio_bytes)
+                text = transcribe_audio(audio_path, cfg.groq_api_key)
+            if not text:
+                self.send_error(502, "voice transcription failed")
+                return
+            self._write_json({"ok": True, "text": text}, 200)
+            return
+
+        if path == "/v1/voice/speak":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            cfg = self._cfg()
+            if not (cfg.groq_api_key or "").strip():
+                self.send_error(503, "voice synthesis not configured (missing GROQ_API_KEY)")
+                return
+            body = self._read_json()
+            if body is None:
+                return
+            text = str(body.get("text") or "").strip()
+            if not text:
+                self.send_error(400, "text is required")
+                return
+            voice_name = str(body.get("voice") or cfg.tts_voice or "").strip()
+            model_name = str(body.get("model") or cfg.tts_model or "").strip()
+            from .voice import synthesize_speech
+
+            audio = synthesize_speech(
+                text,
+                cfg.groq_api_key,
+                model=model_name or "playai-tts",
+                voice=voice_name or "Fritz-PlayAI",
+            )
+            if not audio:
+                self.send_error(502, "voice synthesis failed")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/mpeg")
+            self.send_header("Content-Length", str(len(audio)))
+            self.end_headers()
+            self.wfile.write(audio)
             return
 
         # POST /v1/approvals/request — turn-authenticated via Bearer AGENTS_APPROVAL_TOKEN
@@ -2873,6 +3092,20 @@ class TurnHandler(BaseHTTPRequestHandler):
                 return
             handle_vapid_key(self, self._cfg())
             return
+        if path == "/v1/approvals/allowlist":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            if self._auth_ctx().get("kind") == "device":
+                self.send_error(403, "allowlist management is admin-only")
+                return
+            ws, ws_id, err = _resolve_opt_workspace(query_params)
+            if err is not None:
+                self.send_error(err[0], err[1])
+                return
+            patterns = _load_allowlist_patterns(ws)
+            self._write_json({"ok": True, "patterns": patterns, "workspace": ws_id}, 200)
+            return
         if path == "/v1/approvals":
             if not _check_secret(self, self.relay_secret, query_params):
                 self.send_error(401, "unauthorized")
@@ -3354,6 +3587,38 @@ class TurnHandler(BaseHTTPRequestHandler):
         if self._gate_ws_member("DELETE", path, query_params):
             return
         parts = path.split("/")
+        if path == "/v1/approvals/allowlist":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            if self._auth_ctx().get("kind") == "device":
+                self.send_error(403, "allowlist management is admin-only")
+                return
+            raw_len = (self.headers.get("Content-Length") or "0").strip()
+            body: dict = {}
+            if raw_len and raw_len != "0":
+                parsed = self._read_json()
+                if parsed is None:
+                    return
+                body = parsed
+            pattern = str(body.get("pattern") or (query_params.get("pattern") or [""])[0] or "").strip()
+            if not pattern:
+                self.send_error(400, "pattern is required")
+                return
+            ws_from_body = str(body.get("workspace") or "").strip()
+            qp = dict(query_params)
+            if ws_from_body and not qp.get("workspace"):
+                qp["workspace"] = [ws_from_body]
+            ws, ws_id, err = _resolve_opt_workspace(qp)
+            if err is not None:
+                self.send_error(err[0], err[1])
+                return
+            if not _remove_allowlist_pattern(pattern, ws):
+                self.send_error(404, "pattern not found")
+                return
+            remaining = _load_allowlist_patterns(ws)
+            self._write_json({"ok": True, "removed": pattern, "patterns": remaining, "workspace": ws_id}, 200)
+            return
         # DELETE /v1/providers/<name> — file-managed manifests only.
         if (len(parts) == 4 and parts[1] == "v1"
                 and parts[2] == "providers" and parts[3]):

@@ -658,6 +658,38 @@ def _event_payload(entry: dict[str, Any], event: Any) -> dict[str, Any] | None:
     if event.type == "status":
         line = _status_text(event.text)
         return {"type": "status", "text": line} if line else None
+    if event.type == "thought":
+        d = getattr(event, "data", None) or {}
+        txt = event.text or str(d.get("text") or "")
+        return {"type": "thought", "text": txt} if txt else None
+    if event.type == "tool_start":
+        d = getattr(event, "data", None) or {}
+        return {
+            "type": "tool_start",
+            "id": str(d.get("id") or ""),
+            "tool": str(d.get("tool") or ""),
+            "args_preview": str(d.get("args_preview") or ""),
+        }
+    if event.type == "tool_end":
+        d = getattr(event, "data", None) or {}
+        return {
+            "type": "tool_end",
+            "id": str(d.get("id") or ""),
+            "tool": str(d.get("tool") or ""),
+            "ok": bool(d.get("ok", True)),
+            "duration_ms": d.get("duration_ms"),
+            "result_preview": str(d.get("result_preview") or ""),
+            "error": d.get("error"),
+        }
+    if event.type == "usage":
+        d = getattr(event, "data", None) or {}
+        return {
+            "type": "usage",
+            "tokens_in": d.get("tokens_in"),
+            "tokens_out": d.get("tokens_out"),
+            "est_cost_usd": d.get("est_cost_usd"),
+            "model": str(d.get("model") or ""),
+        }
     if event.type == "delta":
         return {"type": "delta", "text": event.text}
     if event.type == "trailer":
