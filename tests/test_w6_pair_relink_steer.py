@@ -589,7 +589,8 @@ class TestWebSessionSteer(_W6Base):
         try:
             with patch("agents_relay.telegram_adapter.send_message",
                        return_value={"result": {"message_id": 1}}), \
-                    patch("agents_relay.telegram_adapter.edit_message"):
+                    patch("agents_relay.telegram_adapter.edit_message"), \
+                    patch("agents_relay.telegram_adapter.delete_message"):
                 st, body = srv.req(
                     "POST", "/v1/inject",
                     {"chat_id": 12345, "text": "hi",

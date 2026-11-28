@@ -886,7 +886,8 @@ class TestInject(unittest.TestCase):
                 "agents_relay.telegram_adapter.send_message",
                 return_value={"result": {"message_id": 1}},
             ):
-                with patch("agents_relay.telegram_adapter.edit_message"):
+                with patch("agents_relay.telegram_adapter.edit_message"), \
+                        patch("agents_relay.telegram_adapter.delete_message"):
                     # 1. Query secret + omitted chat_id (falls back to primary allowlisted chat) + structured webhook JSON
                     conn = HTTPConnection(host, port, timeout=5)
                     webhook_body = json.dumps({
