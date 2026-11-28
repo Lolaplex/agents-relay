@@ -924,10 +924,32 @@ _ACP_INFO_TTL = 24 * 3600
 
 
 def acp_models_cache_path(provider: str, config: RelayConfig | None = None) -> Path:
-    """``<state>/acp_models/<name>.json`` for provider ``acp.<name>``."""
+    """``<state>/acp_models/<name>.json`` for provider ``acp.<name>``.
+
+    Explicit relay state keeps the legacy per-workspace location; without it
+    the cache belongs to the host cache, never to the process CWD.
+    """
     name = provider.split(".", 1)[1] if provider.startswith("acp.") else provider
-    base = Path(getattr(config, "state_dir", "") or ".")
+    state_dir = str(getattr(config, "state_dir", "") or "").strip()
+    if state_dir:
+        base = Path(state_dir).expanduser()
+    else:
+        from agents_workspace import Host
+
+        base = Host.from_env().cache
     return base / "acp_models" / f"{name}.json"
+
+
+def _read_acp_models_cache(path: Path) -> dict[str, Any]:
+    """Read a probe cache, treating persisted errors as stale misses."""
+    cached = read_json(path) or {}
+    if "error" not in cached:
+        return cached
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    return {}
 
 
 def acp_agent_info(
@@ -937,7 +959,7 @@ def acp_agent_info(
     name = provider.split(".", 1)[1] if provider.startswith("acp.") else ""
     name = name or acp_provider_name().split(".", 1)[1]
     path = acp_models_cache_path(f"acp.{name}", config)
-    cached = read_json(path) or {}
+    cached = _read_acp_models_cache(path)
     if cached.get("models") and not refresh and (
         time.time() - float(cached.get("ts") or 0) < _ACP_INFO_TTL
     ):
@@ -952,22 +974,12 @@ def acp_agent_info(
             shlex.split(cmd, posix=(os.name != "nt")), provider=provider
         )
         data["ts"] = time.time()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        write_json_atomic(path, data)
+        if "error" not in data:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_json_atomic(path, data)
         return data
     except Exception as exc:
-        # Cache the failure briefly too — an unreachable agent would
-        # otherwise re-spawn on every probe request.
-        err = {"error": str(exc), "model": "", "models": [], "ts": time.time()}
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            write_json_atomic(path, err)
-        except Exception:
-            pass
-        if cached:
-            cached["error"] = str(exc)
-            return cached
-        return err
+        return {"error": str(exc), "model": "", "models": [], "ts": time.time()}
 
 
 def acp_provider_rows(config: RelayConfig, refresh: bool = False) -> list[dict[str, Any]]:
@@ -994,17 +1006,24 @@ def acp_provider_rows(config: RelayConfig, refresh: bool = False) -> list[dict[s
             row["label"] = raw["label"].strip()
         if str(raw.get("command") or "").strip():
             row["command"] = str(raw["command"]).strip()
-        if not acp_agent_cmd(name):
+        cmd = acp_agent_cmd(name)
+        if not cmd:
             row["error"] = "no agent command configured"
             rows.append(row)
             continue
+        import shlex
+
+        argv = shlex.split(cmd, posix=(os.name != "nt"))
+        exe = argv[0] if argv else ""
+        if not exe or not resolve_agent_exe(exe):
+            row["error"] = f"agent command not on PATH: {exe or cmd.strip()}"
         # Plain listing must not spawn the agent — a slow ``ssh box`` probe
         # would hang every /v1/providers read. Probing happens on refresh=1
         # and the dedicated probe endpoint; here we surface the cache only.
         if refresh:
             info = acp_agent_info(config, name, refresh=True)
         else:
-            info = read_json(acp_models_cache_path(name, config)) or {}
+            info = _read_acp_models_cache(acp_models_cache_path(name, config))
         for key in ("model", "models", "mode", "modes", "error",
                     "auth_methods", "auth_required"):
             if info.get(key):
@@ -1098,11 +1117,11 @@ def run_acp_turn(
                 sys.stderr.write(f"acp authenticate failed: {res['error']}\n")
                 return 1
         # No key: proceed anyway — the agent may already be authenticated
-        # out-of-band (`devin auth login` creds, SSH, etc.). If not, the
-        # session request below fails loudly instead of a speculative
-        # refusal here. Point at the key path when the agent wants auth.
+        # out-of-band (`devin auth login` creds, SSH, etc.). Keep the auth
+        # guidance local and emit it only when session creation actually fails.
+        auth_hint = ""
         if auth_methods and not api_key:
-            sys.stderr.write(
+            auth_hint = (
                 f"acp agent requests auth ({', '.join(str(m.get('id')) for m in auth_methods)}) — "
                 "set AGENTS_ACP_API_KEY or the per-provider variant in env/host vault\n"
             )
@@ -1121,10 +1140,14 @@ def run_acp_turn(
             )
             if "error" in res:
                 sys.stderr.write(f"acp session/new failed: {res['error']}\n")
+                if auth_hint:
+                    sys.stderr.write(auth_hint)
                 return 1
             acp_sid = str((res.get("result") or {}).get("sessionId") or "")
             if not acp_sid:
                 sys.stderr.write("acp session/new returned no sessionId\n")
+                if auth_hint:
+                    sys.stderr.write(auth_hint)
                 return 1
             stored["acpSessionId"] = acp_sid
             write_json_atomic(state_path, stored)

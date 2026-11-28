@@ -313,7 +313,7 @@ def set_provider_secret(key_env: str, value: str) -> dict[str, Any]:
     return {"key_env": name, "configured": True}
 
 
-def create_provider(body: dict[str, Any]) -> dict[str, Any]:
+def create_provider(body: dict[str, Any], config: Any = None) -> dict[str, Any]:
     """Write ``<host>/providers/<name>.json``.
 
     Shadowing env-sourced rows is the edit path: a file manifest outranks
@@ -380,7 +380,7 @@ def create_provider(body: dict[str, Any]) -> dict[str, Any]:
     write_json_atomic(path, manifest)
     from .acp import acp_models_cache_path
 
-    cache = acp_models_cache_path(name) if kind == "acp-agent" else None
+    cache = acp_models_cache_path(name, config) if kind == "acp-agent" else None
     if cache is not None and cache.is_file():
         cache.unlink()
     row = dict(manifest)
@@ -391,7 +391,7 @@ def create_provider(body: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
-def delete_provider(name: str) -> None:
+def delete_provider(name: str, config: Any = None) -> None:
     row = _find(name)
     if row is None:
         raise ProviderError(404, f"unknown provider: {name}")
@@ -402,17 +402,17 @@ def delete_provider(name: str) -> None:
     path.unlink()
     from .acp import acp_models_cache_path
 
-    cache = acp_models_cache_path(name)
+    cache = acp_models_cache_path(name, config)
     if cache.is_file():
         cache.unlink()
     relay_read_cache.invalidate("providers")
     relay_read_cache.invalidate("provider-agent-exe")
 
 
-def acp_models_cache_clear(name: str) -> None:
+def acp_models_cache_clear(name: str, config: Any = None) -> None:
     from .acp import acp_models_cache_path
 
-    cache = acp_models_cache_path(name)
+    cache = acp_models_cache_path(name, config)
     if cache.is_file():
         cache.unlink()
 
