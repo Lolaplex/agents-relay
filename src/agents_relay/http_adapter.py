@@ -2170,7 +2170,7 @@ class TurnHandler(BaseHTTPRequestHandler):
             from .providers_api import ProviderError, create_provider
 
             try:
-                row = create_provider(body)
+                row = create_provider(body, config=self._cfg())
             except ProviderError as exc:
                 self.send_error(exc.status, exc.message)
                 return
@@ -4052,7 +4052,7 @@ class TurnHandler(BaseHTTPRequestHandler):
             from .providers_api import ProviderError, delete_provider
 
             try:
-                delete_provider(parts[3])
+                delete_provider(parts[3], config=self._cfg())
             except ProviderError as exc:
                 self.send_error(exc.status, exc.message)
                 return
