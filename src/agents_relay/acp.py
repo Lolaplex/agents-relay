@@ -990,6 +990,8 @@ def acp_provider_rows(config: RelayConfig, refresh: bool = False) -> list[dict[s
             "name": name, "kind": "acp-agent",
             "model": raw.get("model"), "when": raw.get("when"),
         }
+        if isinstance(raw.get("label"), str) and raw["label"].strip():
+            row["label"] = raw["label"].strip()
         if str(raw.get("command") or "").strip():
             row["command"] = str(raw["command"]).strip()
         if not acp_agent_cmd(name):

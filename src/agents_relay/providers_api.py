@@ -70,6 +70,60 @@ def _manifest_path(name: str) -> Path | None:
     return base / f"{name}.json" if base is not None else None
 
 
+def _hidden_path() -> Path | None:
+    try:
+        from agents_workspace import Host
+
+        return Host.from_env().dir / "clients" / "hidden_providers.json"
+    except Exception:
+        return None
+
+
+def hidden_providers() -> list[str]:
+    """Host-scoped list of hidden (typically built-in/env) provider names."""
+    path = _hidden_path()
+    if path is None or not path.is_file():
+        return []
+    raw = read_json(path)
+    items = raw.get("hidden") if isinstance(raw, dict) else raw
+    if not isinstance(items, list):
+        return []
+    return sorted({str(x).strip() for x in items if isinstance(x, str) and x.strip()})
+
+
+def set_provider_hidden(name: str, hidden: bool) -> list[str]:
+    """Hide or unhide a provider name without altering read-only env manifests."""
+    clean = str(name or "").strip()
+    if not _NAME.match(clean):
+        raise ProviderError(400, f"invalid provider name: {clean!r}")
+    path = _hidden_path()
+    if path is None:
+        raise ProviderError(500, "host providers dir unavailable")
+    cur = set(hidden_providers())
+    if hidden:
+        cur.add(clean)
+    else:
+        cur.discard(clean)
+    out = sorted(cur)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(path, {"hidden": out})
+    relay_read_cache.invalidate("providers")
+    relay_read_cache.invalidate("provider-agent-exe")
+    return out
+
+
+def restore_hidden_providers() -> list[str]:
+    """Unhide every previously hidden provider on this host."""
+    path = _hidden_path()
+    if path is None:
+        raise ProviderError(500, "host providers dir unavailable")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(path, {"hidden": []})
+    relay_read_cache.invalidate("providers")
+    relay_read_cache.invalidate("provider-agent-exe")
+    return []
+
+
 def _find(name: str) -> dict[str, Any] | None:
     try:
         from runner.providers import find_provider
@@ -114,10 +168,15 @@ def _is_key_configured(row: dict[str, Any]) -> bool:
         return False
 
 
-def provider_rows(config: Any = None, refresh: bool = False) -> list[dict[str, Any]]:
+def provider_rows(
+    config: Any = None,
+    refresh: bool = False,
+    include_hidden: bool = False,
+) -> list[dict[str, Any]]:
     """Merged manifest + ACP rows annotated with ``source``/``configurable``/``key_configured``."""
     from runner.providers import list_providers
 
+    hidden_set = set(hidden_providers())
     rows: list[dict[str, Any]] = []
     for raw in list_providers():
         row = {
@@ -128,6 +187,8 @@ def provider_rows(config: Any = None, refresh: bool = False) -> list[dict[str, A
             "source": source_of(raw),
             "key_configured": _is_key_configured(raw),
         }
+        if isinstance(raw.get("label"), str) and raw["label"].strip():
+            row["label"] = raw["label"].strip()
         if isinstance(raw.get("key_env"), str) and raw.get("key_env"):
             row["key_env"] = raw["key_env"]
         if isinstance(raw.get("url"), str) and raw.get("url"):
@@ -145,9 +206,16 @@ def provider_rows(config: Any = None, refresh: bool = False) -> list[dict[str, A
         row["source"] = source_of(raw)
         row["key_configured"] = _is_key_configured(row)
         rows.append(row)
+    out: list[dict[str, Any]] = []
     for row in rows:
         row["configurable"] = row.get("source") == "file"
-    return rows
+        is_hidden = str(row.get("name") or "") in hidden_set
+        if is_hidden and not include_hidden:
+            continue
+        if include_hidden:
+            row["hidden"] = is_hidden
+        out.append(row)
+    return out
 
 
 _ACP_AGENT_CANDIDATES = (
@@ -284,15 +352,30 @@ def create_provider(body: dict[str, Any]) -> dict[str, Any]:
         if url_env:
             manifest["url_env"] = url_env
         manifest["key_env"] = str(body.get("key_env") or "LLM_API_KEY").strip()
+    path = _manifest_path(name)
+    if path is None:
+        raise ProviderError(500, "host providers dir unavailable")
+    existing = read_json(path) if path.is_file() else None
+    existing_dict = existing if isinstance(existing, dict) else {}
+    label_raw = body.get("label")
+    if isinstance(label_raw, str):
+        clean_label = label_raw.strip()[:80]
+        if clean_label:
+            manifest["label"] = clean_label
+    elif isinstance(existing_dict.get("label"), str) and existing_dict["label"].strip():
+        manifest["label"] = existing_dict["label"].strip()[:80]
     model = str(body.get("model") or "").strip()
     if model:
         manifest["model"] = model
     models = body.get("models")
     if isinstance(models, list):
-        manifest["models"] = [str(m).strip() for m in models if str(m).strip()]
-    path = _manifest_path(name)
-    if path is None:
-        raise ProviderError(500, "host providers dir unavailable")
+        cleaned_models = [str(m).strip() for m in models if str(m).strip()]
+        if cleaned_models:
+            manifest["models"] = cleaned_models
+    elif models is None and isinstance(existing_dict.get("models"), list):
+        manifest["models"] = [str(m).strip() for m in existing_dict["models"] if str(m).strip()]
+    if isinstance(existing_dict.get("reasoning"), dict) and "reasoning" not in body:
+        manifest["reasoning"] = existing_dict["reasoning"]
     path.parent.mkdir(parents=True, exist_ok=True)
     write_json_atomic(path, manifest)
     from .acp import acp_models_cache_path
