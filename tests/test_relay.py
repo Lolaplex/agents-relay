@@ -668,7 +668,8 @@ class TestTelegramAdapterResilience(unittest.TestCase):
             return LoopTurnResult(reply="Answer", session="s", user_id="u", alias="a", returncode=0, stderr="")
 
         with patch("agents_relay.telegram_adapter.send_message", return_value={"result": {"message_id": 99}}):
-            with patch("agents_relay.telegram_adapter.edit_message"):
+            with patch("agents_relay.telegram_adapter.edit_message"), \
+                    patch("agents_relay.telegram_adapter.delete_message"):
                 process_update(fake_update, config=cfg, on_turn=fake_turn)
 
         self.assertEqual(received_msg, ["Photo caption question"])
@@ -789,7 +790,8 @@ class TestInject(unittest.TestCase):
                 "agents_relay.telegram_adapter.send_message",
                 return_value={"result": {"message_id": 1}},
             ):
-                with patch("agents_relay.telegram_adapter.edit_message"):
+                with patch("agents_relay.telegram_adapter.edit_message"), \
+                        patch("agents_relay.telegram_adapter.delete_message"):
                     conn = HTTPConnection(host, port, timeout=5)
                     body = json.dumps({"user": 12345, "text": "hi"})
                     conn.request("POST", "/v1/inject", body=body, headers={"Content-Type": "application/json"})
@@ -886,7 +888,8 @@ class TestInject(unittest.TestCase):
                 "agents_relay.telegram_adapter.send_message",
                 return_value={"result": {"message_id": 1}},
             ):
-                with patch("agents_relay.telegram_adapter.edit_message"):
+                with patch("agents_relay.telegram_adapter.edit_message"), \
+                        patch("agents_relay.telegram_adapter.delete_message"):
                     # 1. Query secret + omitted chat_id (falls back to primary allowlisted chat) + structured webhook JSON
                     conn = HTTPConnection(host, port, timeout=5)
                     webhook_body = json.dumps({

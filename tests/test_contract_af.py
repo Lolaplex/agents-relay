@@ -240,7 +240,8 @@ class TestApproval(unittest.TestCase):
 
                     with patch("agents_relay.telegram_adapter.send_message", return_value={"ok": True}) as sent:
                         with patch("agents_relay.telegram_adapter._post_json") as posted:
-                            with patch("agents_relay.telegram_adapter.edit_message", return_value={"ok": True}):
+                            with patch("agents_relay.telegram_adapter.edit_message", return_value={"ok": True}), \
+                                    patch("agents_relay.telegram_adapter.delete_message"):
                                 thread = threading.Thread(target=_run)
                                 thread.start()
                                 deadline = time.time() + 2
@@ -561,7 +562,8 @@ class TestConcurrency(unittest.TestCase):
                 return _result(kwargs["message"])
 
             with patch("agents_relay.telegram_adapter.send_message", return_value={"result": {"message_id": 1}}):
-                with patch("agents_relay.telegram_adapter.edit_message", return_value={"ok": True}):
+                with patch("agents_relay.telegram_adapter.edit_message", return_value={"ok": True}), \
+                        patch("agents_relay.telegram_adapter.delete_message"):
                     began = time.monotonic()
                     dispatch_update(_message(1, "slow"), config=cfg, on_turn=turn, registry=registry)
                     self.assertLess(time.monotonic() - began, 0.5)
@@ -587,7 +589,8 @@ class TestConcurrency(unittest.TestCase):
                 return _result()
 
             with patch("agents_relay.telegram_adapter.send_message", return_value={"result": {"message_id": 1}}):
-                with patch("agents_relay.telegram_adapter.edit_message", return_value={"ok": True}):
+                with patch("agents_relay.telegram_adapter.edit_message", return_value={"ok": True}), \
+                        patch("agents_relay.telegram_adapter.delete_message"):
                     for index in range(3):
                         dispatch_update(_message(7, f"m{index}"), config=cfg, on_turn=turn, registry=registry)
                     deadline = time.time() + 2
@@ -628,7 +631,8 @@ class TestConcurrency(unittest.TestCase):
                 return {"result": {"message_id": 1}}
 
             with patch("agents_relay.telegram_adapter.send_message", side_effect=fake_send):
-                with patch("agents_relay.telegram_adapter.edit_message", return_value={"ok": True}):
+                with patch("agents_relay.telegram_adapter.edit_message", return_value={"ok": True}), \
+                        patch("agents_relay.telegram_adapter.delete_message"):
                     with patch("agents_relay.jobs.kill_process_tree") as killer:
                         dispatch_update(_message(5, "work"), config=cfg, on_turn=turn, registry=registry)
                         self.assertTrue(running.wait(2))
@@ -658,7 +662,8 @@ class TestConcurrency(unittest.TestCase):
                 return _result()
 
             with patch("agents_relay.telegram_adapter.send_message", return_value={"result": {"message_id": 1}}) as sent:
-                with patch("agents_relay.telegram_adapter.edit_message", return_value={"ok": True}):
+                with patch("agents_relay.telegram_adapter.edit_message", return_value={"ok": True}), \
+                        patch("agents_relay.telegram_adapter.delete_message"):
                     dispatch_update(_message(5, "/jobs@klanker_bot"), config=cfg, on_turn=turn, registry=registry)
                     dispatch_update(_message(5, "/stop"), config=cfg, on_turn=turn, registry=registry)
             self.assertEqual(called, [])
@@ -686,7 +691,8 @@ class TestConcurrency(unittest.TestCase):
                 return _result(kwargs["message"])
 
             with patch("agents_relay.telegram_adapter.send_message", return_value={"result": {"message_id": 1}}):
-                with patch("agents_relay.telegram_adapter.edit_message", return_value={"ok": True}):
+                with patch("agents_relay.telegram_adapter.edit_message", return_value={"ok": True}), \
+                        patch("agents_relay.telegram_adapter.delete_message"):
                     with patch("agents_relay.jobs.kill_process_tree") as killer:
                         dispatch_update(_message(5, "old"), config=cfg, on_turn=turn, registry=registry)
                         self.assertTrue(running.wait(2))
@@ -755,7 +761,8 @@ class TestConcurrency(unittest.TestCase):
                 return _result()
 
             with patch("agents_relay.telegram_adapter.send_message", return_value={"result": {"message_id": 1}}):
-                with patch("agents_relay.telegram_adapter.edit_message", return_value={"ok": True}):
+                with patch("agents_relay.telegram_adapter.edit_message", return_value={"ok": True}), \
+                        patch("agents_relay.telegram_adapter.delete_message"):
                     with patch("agents_relay.telegram_adapter._post_json") as posted:
                         dispatch_update(_message(5, "slow"), config=cfg, on_turn=turn, registry=registry)
                         began = time.monotonic()
@@ -890,7 +897,8 @@ class TestAttachmentsAndKill(unittest.TestCase):
 
             with patch("agents_relay.telegram_adapter._download_telegram_file", side_effect=fake_download):
                 with patch("agents_relay.telegram_adapter.send_message", return_value={"result": {"message_id": 1}}):
-                    with patch("agents_relay.telegram_adapter.edit_message", return_value={"ok": True}):
+                    with patch("agents_relay.telegram_adapter.edit_message", return_value={"ok": True}), \
+                            patch("agents_relay.telegram_adapter.delete_message"):
                         process_update(photo, config=cfg, on_turn=turn)
             self.assertEqual(seen["user"], "12345")
             self.assertEqual(seen["message"], "what is this?")
@@ -1115,7 +1123,8 @@ class TestAttachmentsAndKill(unittest.TestCase):
                 return _result("A" * 5000)
 
             with patch("agents_relay.telegram_adapter.send_message", side_effect=fake_send):
-                with patch("agents_relay.telegram_adapter.edit_message", side_effect=fake_edit):
+                with patch("agents_relay.telegram_adapter.edit_message", side_effect=fake_edit), \
+                        patch("agents_relay.telegram_adapter.delete_message"):
                     handle_inbound_text(chat_id=12345, text="go", config=cfg, on_turn=turn)
             bodies = [re.sub(r"<[^>]+>", "", piece) for piece in pieces]
             self.assertEqual("".join(bodies).count("A"), 5000)

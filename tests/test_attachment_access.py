@@ -254,7 +254,7 @@ class TestVision(unittest.TestCase):
                     )
             argv = run.call_args.args[0]
             attached = argv[argv.index("--attach") + 1]
-            self.assertTrue(attached.startswith(str(work)))
+            self.assertTrue(os.path.normcase(attached).startswith(os.path.normcase(str(work))))
             self.assertIn(MIRROR_DIRNAME, attached)
             self.assertEqual(Path(attached).read_bytes(), b"png-bytes")
             self.assertIn(IMAGE_UNAVAILABLE_PREFIX, result.reply)
