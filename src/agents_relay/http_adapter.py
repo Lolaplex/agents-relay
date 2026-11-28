@@ -3243,6 +3243,9 @@ class TurnHandler(BaseHTTPRequestHandler):
                 payload = {"type": event.type}
                 if event.type == "delta":
                     payload["text"] = event.text
+                elif event.type == "error":
+                    payload["text"] = event.text
+                    payload["error"] = event.text
                 else:
                     payload.update(
                         {
@@ -3252,6 +3255,9 @@ class TurnHandler(BaseHTTPRequestHandler):
                             "returncode": event.returncode,
                         }
                     )
+                    error = str((getattr(event, "data", None) or {}).get("error") or "")
+                    if error:
+                        payload["error"] = error
                 self.wfile.write(_sse_event(payload))
                 self.wfile.flush()
         except BrokenPipeError:
@@ -3376,6 +3382,22 @@ class TurnHandler(BaseHTTPRequestHandler):
                 self.send_error(401, "unauthorized")
                 return
             self._handle_approvals_get(query_params)
+            return
+        if path == "/v1/providers/agents":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            if self._auth_ctx().get("kind") == "device":
+                self.send_error(403, "agent detection is admin-only")
+                return
+            try:
+                from .providers_api import acp_agent_candidates
+
+                rows = acp_agent_candidates()
+            except Exception as exc:
+                self.send_error(500, f"agent detection failed: {exc}")
+                return
+            self._write_json({"ok": True, "agents": rows}, 200)
             return
         if path == "/v1/providers":
             if not _check_secret(self, self.relay_secret, query_params):

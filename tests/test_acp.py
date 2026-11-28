@@ -358,6 +358,8 @@ class TestAcpProviderWiring(unittest.TestCase):
         from agents_relay.config import RelayConfig
         from agents_relay.turn import TurnParams, build_loop_argv
 
+        self._env_save("AGENTS_ACP_CMD_DEVIN")
+        os.environ["AGENTS_ACP_CMD_DEVIN"] = "devin acp"
         cfg = RelayConfig.from_env()
         params = TurnParams(provider="acp.devin", model="swe-2-high")
         argv = build_loop_argv(params, cfg)
@@ -370,9 +372,10 @@ class TestAcpProviderWiring(unittest.TestCase):
         from agents_relay.config import RelayConfig
         from agents_relay.turn import TurnParams, build_loop_argv
 
-        self._env_save("AGENTS_HOST_DIR")
+        self._env_save("AGENTS_HOST_DIR", "AGENTS_ACP_CMD_DEVIN")
         with tempfile.TemporaryDirectory() as tmp:
             os.environ["AGENTS_HOST_DIR"] = tmp
+            os.environ["AGENTS_ACP_CMD_DEVIN"] = "devin acp"
             ws_dir = Path(tmp) / "workspaces" / "demo"
             ws_dir.mkdir(parents=True)
             (ws_dir / "workspace.json").write_text("{}")

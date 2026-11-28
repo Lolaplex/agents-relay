@@ -149,6 +149,59 @@ def provider_rows(config: Any = None, refresh: bool = False) -> list[dict[str, A
     return rows
 
 
+_ACP_AGENT_CANDIDATES = (
+    {
+        "id": "devin",
+        "provider_name": "acp.devin",
+        "label": "Devin CLI",
+        "command": "devin acp",
+        "binary": "devin",
+        "description": "Local Devin CLI over ACP (uses your devin auth login)",
+    },
+    {
+        "id": "claude",
+        "provider_name": "acp.claude",
+        "label": "Claude Code (ACP)",
+        "command": "claude-code-acp",
+        "binary": "claude-code-acp",
+        "description": "Claude Code ACP adapter",
+    },
+    {
+        "id": "codex",
+        "provider_name": "acp.codex",
+        "label": "Codex CLI (ACP)",
+        "command": "codex acp",
+        "binary": "codex",
+        "description": "OpenAI Codex CLI over ACP",
+    },
+)
+
+
+def acp_agent_candidates() -> list[dict[str, Any]]:
+    """Curated ACP CLI detection rows; read-only and secret-free."""
+    from .acp import resolve_agent_exe
+
+    try:
+        from runner.providers import list_providers
+
+        configured = {
+            str(row.get("name") or "")
+            for row in list_providers()
+            if row.get("name")
+        }
+    except Exception:
+        configured = set()
+    rows: list[dict[str, Any]] = []
+    for spec in _ACP_AGENT_CANDIDATES:
+        row = dict(spec)
+        resolved = resolve_agent_exe(str(spec["binary"]))
+        row["installed"] = bool(resolved)
+        row["resolved_path"] = resolved
+        row["configured"] = str(spec["provider_name"]) in configured
+        rows.append(row)
+    return rows
+
+
 def set_provider_secret(key_env: str, value: str) -> dict[str, Any]:
     """Persist a provider API key into the host secret vault (never returns the value)."""
     name = str(key_env or "").strip()

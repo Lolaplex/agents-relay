@@ -235,7 +235,7 @@ _RPC_DENY_ALWAYS = (
     "/v1/klanker/sessions/fork", "/v1/jobs",
     "/v1/send", "/v1/inject", "/v1/favorites", "/v1/push",
     "/v1/voice", "/v1/a2a", "/v1/webhook", "/v1/alert",
-    "/v1/host", "/v1/providers/secret",
+    "/v1/host", "/v1/providers/secret", "/v1/providers/agents",
 )
 _RPC_DENY_WRITE = (
     "/v1/providers", "/v1/settings", "/v1/workspaces",
@@ -386,12 +386,17 @@ def _rpc_turn_stream(params: dict, cfg: RelayConfig) -> Iterator[dict]:
                 d["text"] = evt.text
             yield d
         elif evt.type == "trailer":
-            yield {"done": True, "session": evt.session,
-                   "returncode": evt.returncode}
+            frame = {"done": True, "session": evt.session,
+                     "returncode": evt.returncode}
+            error = str((getattr(evt, "data", None) or {}).get("error") or "")
+            if error:
+                frame["error"] = error
+            yield frame
             return
         elif evt.type == "error":
             yield {"error": evt.text}
-            return
+            if not (getattr(evt, "data", None) or {}).get("error"):
+                return
     yield {"done": True}
 
 
