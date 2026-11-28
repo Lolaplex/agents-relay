@@ -1,4 +1,4 @@
-"""CLI: serve HTTP relay, optional Telegram poll, ops commands, client smoke tests."""
+"""CLI: serve HTTP relay, optional Telegram/Discord adapters, ops commands, client smoke tests."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import signal
 import sys
 import threading
 from dataclasses import replace
+from typing import Any
 
 from . import __version__
 from .approvals import (
@@ -20,6 +21,11 @@ from .approvals import (
 )
 from .client import GatewayClient
 from .config import RelayConfig
+from .discord_adapter import inbound_payload as discord_inbound_payload
+from .discord_adapter import inject_text as discord_inject_text
+from .discord_adapter import run_approve as run_discord_approve
+from .discord_adapter import send_to_user as send_discord_to_user
+from .discord_adapter import start_discord_thread
 from .http_adapter import serve_http
 from .jobs import shutdown_jobs
 from .telegram_adapter import inbound_payload, inject_text, run_approve, send_to_user, start_telegram_thread
@@ -84,6 +90,93 @@ def _cmd_inject(args: argparse.Namespace) -> int:
     return 0 if result.returncode == 0 else 1
 
 
+def _cmd_discord_send(args: argparse.Namespace) -> int:
+    channel_id = _chat_id_from_args(args)
+    if channel_id is None:
+        return 2
+    config = RelayConfig.from_env()
+    try:
+        send_discord_to_user(
+            token=config.discord_bot_token,
+            channel_id=channel_id,
+            text=str(args.text),
+            allowed=config.discord_allowed_channel_ids,
+            allow_anyone=config.allow_anyone,
+        )
+    except (PermissionError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"Error: discord send failed ({exc})", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _cmd_discord_inject(args: argparse.Namespace) -> int:
+    channel_id = _chat_id_from_args(args)
+    if channel_id is None:
+        return 2
+    config = RelayConfig.from_env()
+    try:
+        result = discord_inject_text(channel_id=channel_id, text=str(args.text), config=config)
+    except (PermissionError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"Error: discord inject failed ({exc})", file=sys.stderr)
+        return 1
+    print(json.dumps(discord_inbound_payload(result), ensure_ascii=False))
+    return 0 if result.returncode == 0 else 1
+
+
+def _resolve_discord_approver_channel(
+    raw_user: str,
+    config: RelayConfig,
+) -> tuple[int | None, str]:
+    text = (raw_user or "").strip()
+    if text:
+        try:
+            return int(text), ""
+        except ValueError:
+            pass
+    configured = (config.discord_approver or config.approver or "").strip()
+    if configured:
+        try:
+            return int(configured), ""
+        except ValueError:
+            return None, "DISCORD_APPROVER/AGENTS_RELAY_APPROVER is not a numeric Discord channel id"
+    if len(config.discord_allowed_channel_ids) == 1:
+        return int(config.discord_allowed_channel_ids[0]), ""
+    return None, (
+        "no numeric Discord approver channel; set DISCORD_APPROVER "
+        "or allow exactly one channel in DISCORD_ALLOWED_CHANNEL_IDS"
+    )
+
+
+def _approve_route(raw_user: str, config: RelayConfig, explicit: str = "") -> str:
+    if explicit in {"telegram", "discord"}:
+        return explicit
+    has_telegram = bool(config.telegram_bot_token)
+    has_discord = bool(config.discord_bot_token)
+    if has_discord and not has_telegram:
+        return "discord"
+    if has_telegram and not has_discord:
+        return "telegram"
+    if has_telegram and has_discord:
+        try:
+            numeric = int((raw_user or "").strip())
+        except (TypeError, ValueError):
+            numeric = 0
+        if numeric:
+            in_discord = numeric in config.discord_allowed_channel_ids
+            in_telegram = numeric in config.telegram_allowed_chat_ids
+            if in_discord and not in_telegram:
+                return "discord"
+            if in_telegram and not in_discord:
+                return "telegram"
+    return "telegram"
+
+
 def _cmd_approve(args: argparse.Namespace) -> int:
     config = RelayConfig.from_env()
     decide_id = str(getattr(args, "decide", "") or "").strip()
@@ -133,6 +226,26 @@ def _cmd_approve(args: argparse.Namespace) -> int:
         )
         print(json.dumps({"note": note, **opts}, ensure_ascii=False))
         return code
+    explicit = "discord" if getattr(args, "discord", False) else "telegram" if getattr(args, "telegram", False) else ""
+    route = _approve_route(raw_user, config, explicit)
+    if route == "discord":
+        if not config.discord_bot_token:
+            print(json.dumps({"note": "discord token not set"}, ensure_ascii=False))
+            print("Error: discord token not set", file=sys.stderr)
+            return 2
+        channel_id, why = _resolve_discord_approver_channel(raw_user, config)
+        if channel_id is None:
+            print(json.dumps({"note": why}, ensure_ascii=False))
+            print(f"Error: {why}", file=sys.stderr)
+            return 2
+        code, note = run_discord_approve(
+            channel_id=channel_id,
+            timeout=float(args.timeout),
+            request=request,
+            config=config,
+        )
+        print(json.dumps({"note": note}, ensure_ascii=False))
+        return code
     if not config.telegram_bot_token:
         ident = str(request.get("id") or "").strip()
         if ident:
@@ -168,7 +281,7 @@ def _help_json() -> dict:
         "name": "agents-relay",
         "version": __version__,
         "commands": {
-            "serve": {"description": "Start HTTP /v1/turn, /v1/stream, /v1/inject, /v1/alert, /v1/webhook/*, /v1/a2a/* and optional Telegram polling"},
+            "serve": {"description": "Start HTTP /v1/turn, /v1/stream, /v1/inject, /v1/alert, /v1/webhook/*, /v1/a2a/* plus optional Telegram polling and Discord gateway"},
             "send": {
                 "description": "Send one Telegram message to an allowlisted chat id",
                 "flags": ["--user", "--chat-id", "--text"],
@@ -177,9 +290,17 @@ def _help_json() -> dict:
                 "description": "Run one turn as an allowlisted Telegram chat (thinking edits + JSON reply)",
                 "flags": ["--user", "--chat-id", "--text"],
             },
+            "discord-send": {
+                "description": "Send one Discord message to an allowlisted channel id",
+                "flags": ["--user", "--chat-id", "--text"],
+            },
+            "discord-inject": {
+                "description": "Run one turn as an allowlisted Discord channel (thinking edits + JSON reply)",
+                "flags": ["--user", "--chat-id", "--text"],
+            },
             "approve": {
                 "description": "Block until a tool call is approved or denied (JSON on stdin). --local waits on the approval file. --decide writes one decision.",
-                "flags": ["--user", "--chat-id", "--timeout", "--local", "--decide", "--allow", "--deny"],
+                "flags": ["--user", "--chat-id", "--timeout", "--local", "--telegram", "--discord", "--decide", "--allow", "--deny"],
             },
             "acp-serve": {
                 "description": "Run as an ACP agent over stdio (Zed/ACP clients spawn this; prompts drive runner.loop)",
@@ -213,6 +334,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command")
     serve_p = sub.add_parser("serve", help="Run relay")
     serve_p.add_argument("--no-telegram", action="store_true", help="Disable Telegram polling")
+    serve_p.add_argument("--no-discord", action="store_true", help="Disable Discord gateway")
     send_p = sub.add_parser("send", help="Send one Telegram message to an allowlisted chat id")
     _add_chat_text_flags(send_p)
     inject_p = sub.add_parser(
@@ -220,11 +342,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run one turn as an allowlisted Telegram chat (thinking edits + JSON reply)",
     )
     _add_chat_text_flags(inject_p)
+    discord_send_p = sub.add_parser("discord-send", help="Send one Discord message to an allowlisted channel id")
+    _add_chat_text_flags(discord_send_p)
+    discord_inject_p = sub.add_parser(
+        "discord-inject",
+        help="Run one turn as an allowlisted Discord channel (thinking edits + JSON reply)",
+    )
+    _add_chat_text_flags(discord_inject_p)
     approve_p = sub.add_parser("approve", help="Block until an approval file is decided")
     approve_p.add_argument("--user", dest="user", default="", help="Target chat id")
     approve_p.add_argument("--chat-id", dest="chat_id", default="", help="Alias for --user")
     approve_p.add_argument("--timeout", type=float, default=300, help="Seconds to wait (default 300)")
-    approve_p.add_argument("--local", action="store_true", help="Wait on the approval file without Telegram")
+    approve_p.add_argument("--local", action="store_true", help="Wait on the approval file without a chat adapter")
+    route_group = approve_p.add_mutually_exclusive_group()
+    route_group.add_argument("--telegram", action="store_true", help="Send the approval prompt through Telegram")
+    route_group.add_argument("--discord", action="store_true", help="Send the approval prompt through Discord")
     approve_p.add_argument("--decide", default="", help="Resolve this pending id and exit")
     approve_p.add_argument("--allow", action="store_true", help="With --decide, allow the tool")
     approve_p.add_argument("--deny", action="store_true", help="With --decide, deny the tool")
@@ -389,6 +521,10 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_send(args)
     if args.command == "inject":
         return _cmd_inject(args)
+    if args.command == "discord-send":
+        return _cmd_discord_send(args)
+    if args.command == "discord-inject":
+        return _cmd_discord_inject(args)
     if args.command == "approve":
         return _cmd_approve(args)
     if args.command != "serve":
@@ -404,8 +540,12 @@ def main(argv: list[str] | None = None) -> int:
         os.environ.setdefault("AGENTS_RELAY_URL", bound_url)
     tg_thread = None
     tg_stop = None
+    discord_thread = None
+    discord_stop = None
     if not args.no_telegram and config.telegram_bot_token:
         tg_thread, tg_stop = start_telegram_thread(config)
+    if not args.no_discord and config.discord_bot_token:
+        discord_thread, discord_stop = start_discord_thread(config)
 
     # Outbound persistent channels to paired hubs (agents-relay#40).
     hub_clients: list = []
@@ -425,6 +565,8 @@ def main(argv: list[str] | None = None) -> int:
         log.info("shutting down")
         if tg_stop is not None:
             tg_stop.set()
+        if discord_stop is not None:
+            discord_stop.set()
         shutdown_jobs()
         # Signal handlers run on the main thread, which is inside serve_forever().
         # server.shutdown() waits for serve_forever() to return, so calling it here
@@ -445,6 +587,8 @@ def main(argv: list[str] | None = None) -> int:
             c.stop()
         if tg_thread is not None:
             tg_thread.join(timeout=2)
+        if discord_thread is not None:
+            discord_thread.join(timeout=2)
     return 0
 
 

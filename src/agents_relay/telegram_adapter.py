@@ -22,6 +22,7 @@ from .approvals import (
     APPROVAL_ID_RE,
     approval_keyboard,
     create_pending,
+    decision_matches_request,
     format_approval_html,
     parse_callback_data,
     read_approval,
@@ -30,6 +31,8 @@ from .approvals import (
     wait_for_decision,
 )
 from .attachments import MAX_ATTACHMENT_BYTES, read_capped, safe_filename
+from .chat_control import jobs_text as _jobs_text
+from .chat_control import parse_control_command
 from .config import RelayConfig
 from .jobs import Job, JobRegistry, get_registry
 from .loop_client import LoopTurnResult, run_loop_turn
@@ -46,7 +49,6 @@ from .telegram_format import (
 log = logging.getLogger("agents_relay.telegram")
 
 API_BASE = "https://api.telegram.org"
-_CONTROL_COMMANDS = {"jobs", "stop", "persona", "workspace", "model"}
 
 
 def _prefs_path(config: RelayConfig | None = None) -> Path:
@@ -736,30 +738,6 @@ def process_update(
     )
 
 
-def parse_control_command(text: str) -> tuple[str, str] | None:
-    raw = (text or "").strip()
-    if not raw.startswith("/"):
-        return None
-    head, _, rest = raw.partition(" ")
-    name = head[1:]
-    if "@" in name:
-        name = name.split("@", 1)[0]
-    name = name.lower()
-    if name not in _CONTROL_COMMANDS:
-        return None
-    return name, rest.strip()
-
-
-def _jobs_text(jobs: list[Job]) -> str:
-    if not jobs:
-        return "No running jobs."
-    lines = [f"Jobs ({len(jobs)}):"]
-    for job in jobs:
-        state = "queued" if not job.running else f"pid {job.pid or '?'}"
-        preview = job.preview or ""
-        lines.append(f"• {job.id} {state} — {preview}")
-    return "\n".join(lines)
-
 
 def _persona_text(chat_id: int, arg: str, config: RelayConfig) -> str:
     """/persona [<id>] — show or switch the per-chat persona (in this chat's ws)."""
@@ -1075,9 +1053,11 @@ def run_approve(
     if not chat_allowed(chat_id, config):
         return 2, "chat not allowlisted"
     existing = read_approval(config, ident)
-    if existing and existing.get("status") == "approved":
-        return 0, str(existing.get("note") or "approved")
-    if existing and existing.get("status") == "denied":
+    if existing and existing.get("status") in {"approved", "denied"}:
+        if not decision_matches_request(existing, request):
+            return 2, "approval request changed"
+        if existing.get("status") == "approved":
+            return 0, str(existing.get("note") or "approved")
         return 1, str(existing.get("note") or "denied")
     try:
         create_pending(config, chat_id, request)

@@ -136,6 +136,11 @@ class RelayConfig:
     tts_voice: str = ""
     tts_model: str = ""
     relay_url: str = ""
+    discord_bot_token: str = ""
+    discord_allowed_channel_ids: tuple[int, ...] = ()
+    discord_allowed_user_ids: tuple[int, ...] = ()
+    discord_require_mention: bool = False
+    discord_approver: str = ""
 
     @classmethod
     def from_env(cls) -> "RelayConfig":
@@ -184,6 +189,11 @@ class RelayConfig:
             tts_voice=_clean(os.environ.get("AGENTS_RELAY_TTS_VOICE", "")),
             tts_model=_clean(os.environ.get("AGENTS_RELAY_TTS_MODEL", "")),
             relay_url=_clean(os.environ.get("AGENTS_RELAY_URL", "")).rstrip("/"),
+            discord_bot_token=_clean(_secret("DISCORD_BOT_TOKEN")),
+            discord_allowed_channel_ids=_int_list(os.environ.get("DISCORD_ALLOWED_CHANNEL_IDS", "")),
+            discord_allowed_user_ids=_int_list(os.environ.get("DISCORD_ALLOWED_USER_IDS", "")),
+            discord_require_mention=_flag(os.environ.get("DISCORD_REQUIRE_MENTION", "")),
+            discord_approver=_clean(os.environ.get("DISCORD_APPROVER", "")),
         )
 
 
