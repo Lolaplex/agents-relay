@@ -248,10 +248,29 @@ def _provider_key_env(provider: str, ws: "Workspace | None" = None) -> str:
     return ""
 
 
+def _is_acp_agent_provider(provider: str) -> bool:
+    """True only for real acp-agent rows or env-configured ACP commands."""
+    if not provider.startswith("acp."):
+        return False
+    try:
+        from runner.providers import find_provider
+
+        manifest = find_provider(provider)
+    except Exception:
+        manifest = None
+    if isinstance(manifest, dict) and manifest.get("kind") == "acp-agent":
+        return True
+    suffix = provider.split(".", 1)[1].upper()
+    return bool(
+        os.environ.get(f"AGENTS_ACP_CMD_{suffix}", "").strip()
+        or os.environ.get("AGENTS_ACP_CMD", "").strip()
+    )
+
+
 def build_loop_argv(params: TurnParams, config: RelayConfig) -> list[str]:
     provider, model = _resolve_provider_and_model(params, config)
     argv = list(config.loop_cmd)
-    if provider.startswith("acp."):
+    if _is_acp_agent_provider(provider):
         # Foreign ACP agent drives the turn; model maps to a config option.
         argv = [sys.executable, "-m", "agents_relay", "acp-run"]
     argv.extend(
@@ -582,12 +601,65 @@ def _spawn_stream(argv: list[str], env: dict[str, str] | None, workspace: str, w
     ), ws
 
 
+def _remember_stderr_line(lines: list[str], text: str) -> None:
+    line = " ".join(str(text).split())
+    if not line or line.startswith(SIDEBAND_PREFIX):
+        return
+    lines.append(line)
+    del lines[:-20]
+
+
+def _drain_stderr_lines(stream, lines: list[str]) -> None:
+    try:
+        if stream is None:
+            return
+        read = _pipe_reader(stream)
+        dec = _utf8_decoder()
+        buf = ""
+        while True:
+            try:
+                block = read()
+            except OSError:
+                break
+            if not block:
+                break
+            buf += _decode(dec, block)
+            while "\n" in buf:
+                line, buf = buf.split("\n", 1)
+                _remember_stderr_line(lines, line)
+        buf += dec.decode(b"", final=True)
+        if buf:
+            _remember_stderr_line(lines, buf)
+    except Exception:
+        pass
+
+
+def _last_stderr_line(lines: Iterable[str]) -> str:
+    for line in reversed(list(lines)):
+        clean = " ".join(str(line).split())
+        if clean:
+            return clean
+    return ""
+
+
+def _stream_failure_reason(
+    returncode: int, body: str, stderr_lines: Iterable[str]
+) -> str:
+    if not returncode or (body or "").strip():
+        return ""
+    detail = _last_stderr_line(stderr_lines)
+    if detail:
+        return detail
+    return f"turn subprocess exited {returncode} with no reply"
+
+
 def _finish_stream(
     pending: str,
     emitted: int,
     notes: list[str],
     meta: dict[str, Any] | None,
     returncode: int,
+    stderr_lines: Iterable[str] = (),
 ) -> Iterator[StreamEvent]:
     """Tail delta + attachment notes + trailer — shared by both iterators."""
     marker = LOOP_TRAILER_MARKER
@@ -605,12 +677,16 @@ def _finish_stream(
             "alias": parsed["alias"],
         }
     yield from _note_deltas(notes, body)
+    error = _stream_failure_reason(returncode, body, stderr_lines)
+    if error:
+        yield StreamEvent(type="error", text=error, data={"error": error})
     yield StreamEvent(
         type="trailer",
         session=str(meta.get("session") or ""),
         user_id=str(meta.get("user_id") or ""),
         alias=str(meta.get("alias") or ""),
         returncode=returncode,
+        data={"error": error} if error else {},
     )
 
 
@@ -631,6 +707,13 @@ def iter_loop_stream(
             argv, env=None, workspace=params.workspace, workdir=params.workdir, extra=merged_extra
         )
         assert proc.stdout is not None
+        stderr_lines: list[str] = []
+        stderr_thread = threading.Thread(
+            target=_drain_stderr_lines,
+            args=(proc.stderr, stderr_lines),
+            daemon=True,
+        )
+        stderr_thread.start()
         read = _pipe_reader(proc.stdout)
         dec = _utf8_decoder()
         marker = LOOP_TRAILER_MARKER
@@ -654,7 +737,8 @@ def iter_loop_stream(
                         yield StreamEvent(type="delta", text=tail)
                     emitted = len(body)
                     rc = int(proc.wait(timeout=timeout_sec))
-                    yield from _finish_stream(pending, emitted, notes, meta, rc)
+                    stderr_thread.join(timeout=1)
+                    yield from _finish_stream(pending, emitted, notes, meta, rc, stderr_lines)
                     return
                 safe = len(pending) - len(marker)
                 if safe > emitted:
@@ -662,7 +746,8 @@ def iter_loop_stream(
                     emitted = safe
                     yield StreamEvent(type="delta", text=piece)
             rc = int(proc.wait(timeout=timeout_sec))
-            yield from _finish_stream(pending, emitted, notes, None, rc)
+            stderr_thread.join(timeout=1)
+            yield from _finish_stream(pending, emitted, notes, None, rc, stderr_lines)
         finally:
             if proc.poll() is None:
                 proc.kill()
@@ -729,6 +814,7 @@ def iter_loop_stream_live(
                 pass
 
         events: "queue.Queue[tuple[str, str]]" = queue.Queue()
+        stderr_lines: list[str] = []
 
         def _pump(stream, tag: str) -> None:
             """OS-chunk pipe reads + incremental UTF-8 decode.
@@ -754,11 +840,13 @@ def iter_loop_stream_live(
                         buf += text
                         while "\n" in buf:
                             line, buf = buf.split("\n", 1)
+                            _remember_stderr_line(stderr_lines, line)
                             events.put((tag, line + "\n"))
                     else:
                         events.put((tag, text))
                 buf += dec.decode(b"", final=True)
                 if buf:
+                    _remember_stderr_line(stderr_lines, buf)
                     events.put((tag, buf))
             except Exception:
                 pass
@@ -857,7 +945,7 @@ def iter_loop_stream_live(
                     emitted = len(body)
                     meta = _parse_trailer(trailer_part)
                     rc = proc.wait(timeout=5) if proc.poll() is None else int(proc.returncode or 0)
-                    yield from _finish_stream(pending, emitted, notes, meta, rc)
+                    yield from _finish_stream(pending, emitted, notes, meta, rc, stderr_lines)
                     return
                 safe = len(pending) - len(marker)
                 if safe > emitted:
@@ -869,7 +957,7 @@ def iter_loop_stream_live(
                     yield StreamEvent(type="delta", text=piece)
 
             rc = proc.wait(timeout=5) if proc.poll() is None else int(proc.returncode or 0)
-            yield from _finish_stream(pending, emitted, notes, None, rc)
+            yield from _finish_stream(pending, emitted, notes, None, rc, stderr_lines)
         finally:
             if proc.poll() is None:
                 _kill()

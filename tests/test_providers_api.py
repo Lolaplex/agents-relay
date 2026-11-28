@@ -151,7 +151,13 @@ class TestProviderWriteApi(unittest.TestCase):
 
     def test_env_acp_row_overridable_by_file_manifest(self):
         with patch.dict(
-            os.environ, {"AGENTS_ACP_CMD_CURSOR": "cursor agent --acp"}, clear=False
+            os.environ,
+            {
+                "AGENTS_ACP_CMD": "cursor agent --acp",
+                "AGENTS_ACP_CMD_CURSOR": "cursor agent --acp",
+                "AGENTS_ACP_NAME": "cursor",
+            },
+            clear=False,
         ):
             from agents_relay.acp import ensure_acp_manifest
 
@@ -174,6 +180,10 @@ class TestProviderWriteApi(unittest.TestCase):
             status, _ = self.srv.request("DELETE", "/v1/providers/acp.cursor")
             self.assertEqual(status, 200)
             self.assertEqual(acp_agent_cmd("acp.cursor"), "cursor agent --acp")
+            status, data = self.srv.request("GET", "/v1/providers")
+            row = self._row(data["providers"], "acp.cursor")
+            self.assertIsNotNone(row)
+            self.assertEqual(row["source"], "env")
 
     def test_delete_unknown_404(self):
         status, _ = self.srv.request("DELETE", "/v1/providers/nope.nothing")

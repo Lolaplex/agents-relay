@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import itertools
 import json
+import ntpath
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -575,21 +577,103 @@ def _acp_env(workdir: str = "") -> dict[str, str] | None:
     return out
 
 
+def _windows_registry_paths() -> list[str]:
+    if os.name != "nt":
+        return []
+    try:
+        import winreg
+    except ImportError:
+        return []
+    values: list[str] = []
+    roots = (
+        (winreg.HKEY_CURRENT_USER, "Environment"),
+        (
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+        ),
+    )
+    for root, subkey in roots:
+        try:
+            with winreg.OpenKey(root, subkey) as key:
+                value, _kind = winreg.QueryValueEx(key, "Path")
+        except OSError:
+            continue
+        if isinstance(value, str) and value.strip():
+            values.append(ntpath.expandvars(value))
+    return values
+
+
+def _fallback_cli_dirs() -> list[str]:
+    candidates: list[str] = []
+    if os.name == "nt":
+        local = os.environ.get("LOCALAPPDATA", "").strip()
+        profile = os.environ.get("USERPROFILE", "").strip()
+        appdata = os.environ.get("APPDATA", "").strip()
+        if local:
+            candidates.append(os.path.join(local, "devin", "cli", "bin"))
+        if profile:
+            candidates.append(os.path.join(profile, ".local", "bin"))
+        if appdata:
+            candidates.append(os.path.join(appdata, "npm"))
+        if local:
+            candidates.append(os.path.join(local, "cursor-agent"))
+    else:
+        candidates = [
+            os.path.join(os.path.expanduser("~"), ".local", "bin"),
+            os.path.join(os.sep, "opt", "homebrew", "bin"),
+            os.path.join(os.sep, "usr", "local", "bin"),
+        ]
+    out: list[str] = []
+    for path in candidates:
+        try:
+            if os.path.isdir(path):
+                out.append(path)
+        except OSError:
+            continue
+    return out
+
+
+def _exe_abspath(path: str) -> str:
+    """Absolutize relative hits without rewriting absolute paths."""
+    if os.path.isabs(path) or ntpath.isabs(path):
+        return path
+    return os.path.abspath(path)
+
+
+def resolve_agent_exe(cmd: str) -> str | None:
+    """Resolve an agent executable against live PATH, registry PATH, and CLI dirs."""
+    raw = (cmd or "").strip().strip('"').strip("'")
+    if not raw:
+        return None
+    direct = os.path.expandvars(os.path.expanduser(raw))
+    if os.path.isfile(direct):
+        return _exe_abspath(direct)
+    hit = shutil.which(raw)
+    if hit:
+        return _exe_abspath(hit)
+    if os.name == "nt":
+        live_path = os.pathsep.join(_windows_registry_paths())
+        if live_path:
+            hit = shutil.which(raw, path=live_path)
+            if hit:
+                return _exe_abspath(hit)
+    fallback_path = os.pathsep.join(_fallback_cli_dirs())
+    if fallback_path:
+        hit = shutil.which(raw, path=fallback_path)
+        if hit:
+            return _exe_abspath(hit)
+    return None
+
+
 def _resolve_spawn_argv(argv: list[str]) -> list[str]:
-    """Windows: npm-style ``*.cmd``/``*.bat`` shims need cmd.exe to run.
-
-    CreateProcess (shell=False) only executes PE binaries — ``devin`` ships
-    ``devin.cmd`` → WinError 2 without this wrap.
-    """
-    if os.name != "nt" or not argv:
+    """Resolve the agent binary; wrap Windows ``*.cmd``/``*.bat`` shims."""
+    if not argv:
         return argv
-    import shutil
-
-    exe = shutil.which(argv[0])
+    exe = resolve_agent_exe(argv[0])
     if not exe:
         raise FileNotFoundError(f"agent command not on PATH: {argv[0]}")
     argv = [exe] + argv[1:]
-    if exe.lower().endswith((".cmd", ".bat")):
+    if os.name == "nt" and exe.lower().endswith((".cmd", ".bat")):
         return ["cmd.exe", "/c"] + argv
     return argv
 
@@ -982,7 +1066,16 @@ def run_acp_turn(
     key = session or f"ses_acp_{uuid.uuid4().hex[:12]}"
     state_path = state_dir / f"{key}.json"
     stored = read_json(state_path) or {}
-    conn = _AgentConn(agent_argv, cwd=workdir or None, env=_acp_env(workdir=workdir))
+    try:
+        conn = _AgentConn(agent_argv, cwd=workdir or None, env=_acp_env(workdir=workdir))
+    except (FileNotFoundError, OSError) as exc:
+        detail = " ".join(str(exc).split()) or exc.__class__.__name__
+        sys.stderr.write(f"ACP error: {detail}\n")
+        return 1
+    except Exception as exc:
+        detail = " ".join(str(exc).split()) or exc.__class__.__name__
+        sys.stderr.write(f"ACP error: agent startup failed: {detail}\n")
+        return 1
     try:
         init = conn.request(
             "initialize",

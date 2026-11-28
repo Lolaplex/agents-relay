@@ -761,16 +761,23 @@ def _event_payload(entry: dict[str, Any], event: Any) -> dict[str, Any] | None:
         }
     if event.type == "delta":
         return {"type": "delta", "text": event.text}
+    if event.type == "error":
+        text = event.text or "turn failed"
+        return {"type": "error", "text": text, "error": text}
     if event.type == "trailer":
         if event.session:
             entry["meta"]["session"] = event.session
-        return {
+        payload = {
             "type": "trailer",
             "session": event.session,
             "user_id": event.user_id,
             "alias": event.alias,
             "returncode": event.returncode,
         }
+        error = str((getattr(event, "data", None) or {}).get("error") or "")
+        if error:
+            payload["error"] = error
+        return payload
     return {"type": "error", "text": event.text or "turn failed"}
 
 
