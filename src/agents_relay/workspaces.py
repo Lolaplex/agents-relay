@@ -10,6 +10,8 @@ from pathlib import Path
 from agents_workspace import Host, Workspace
 from agents_workspace.workspace import _slug, _valid_id
 
+from .read_cache import relay_read_cache
+
 
 WS_PERSONA_FIELDS = frozenset(
     {
@@ -25,6 +27,10 @@ WS_PERSONA_FIELDS = frozenset(
 )
 
 
+def invalidate_workspace_read_cache() -> None:
+    relay_read_cache.invalidate("workspaces")
+
+
 def list_workspaces() -> list[Workspace]:
     host = Host.from_env()
     items = host.list_workspaces()
@@ -37,7 +43,9 @@ def list_workspaces() -> list[Workspace]:
 def create_workspace(label: str = "", ws_id: str = "") -> Workspace:
     """Create by explicit id (preferred) or by label slug."""
     host = Host.from_env()
-    return host.create(ws_id or _slug(label), label=label)
+    ws = host.create(ws_id or _slug(label), label=label)
+    invalidate_workspace_read_cache()
+    return ws
 
 
 def get_workspace(ws_id: str) -> Workspace:
@@ -141,6 +149,7 @@ def patch_workspace(ws_id: str, payload: dict) -> dict:
                 fn(ws_id)
             except Exception:  # noqa: BLE001
                 pass
+    invalidate_workspace_read_cache()
     return row
 
 
@@ -204,12 +213,14 @@ def create_persona(ws: Workspace, persona_id: str, body: dict | None = None) -> 
         existing.update(updates)
         manifest.write_text(
             json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        invalidate_workspace_read_cache()
         return existing
     data = dict(updates)
     data["id"] = persona_id
     pdir.mkdir(parents=True, exist_ok=True)
     manifest.write_text(
         json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    invalidate_workspace_read_cache()
     return data
 
 
@@ -223,12 +234,14 @@ def delete_persona(ws: Workspace, persona_id: str, *, hard: bool = False) -> Pat
         return None
     if hard:
         shutil.rmtree(pdir)
+        invalidate_workspace_read_cache()
         return pdir
     trash = Path(ws.personas) / ".trash"
     trash.mkdir(exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     dst = trash / f"{persona_id}-{stamp}"
     shutil.move(str(pdir), str(dst))
+    invalidate_workspace_read_cache()
     return dst
 
 
@@ -454,6 +467,7 @@ def delete_session(ws: Workspace, persona: str, session_id: str) -> bool:
         tombstone_session(ws, session_id)
     except Exception:  # noqa: BLE001 - tombstone best-effort on top
         pass
+    invalidate_workspace_read_cache()
     return True
 
 
@@ -472,4 +486,6 @@ def create_session(ws: Workspace, persona: str, *, user: str = "",
         workdir=workdir,
         new_session=True,
     )
-    return res.session.to_dict()
+    row = res.session.to_dict()
+    invalidate_workspace_read_cache()
+    return row

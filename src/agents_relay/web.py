@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import RelayConfig
-from .turn import TurnParams, iter_loop_stream_live
+from .turn import TurnParams, iter_loop_stream_live, turn_directive_error
 
 log = logging.getLogger("agents_relay.web")
 
@@ -606,6 +606,10 @@ def handle_chat_stream(handler: BaseHTTPRequestHandler, body: dict) -> bool:
     is (or stays) running — False on a validation 400 so lease holders
     can release (agents-relay#44)."""
     config = handler._cfg()  # type: ignore[attr-defined]
+    directive_error = turn_directive_error(body)
+    if directive_error:
+        handler._write_json({"ok": False, "error": directive_error}, 400)  # type: ignore[attr-defined]
+        return False
     text = str(body.get("text") or "").strip()
     raw_attachments = body.get("attachments")
     if not text and not raw_attachments:
@@ -690,6 +694,8 @@ def handle_chat_stream(handler: BaseHTTPRequestHandler, body: dict) -> bool:
         project=str(body.get("project") or "").strip(),
         workspace=ws_ref,
         workdir=str(body.get("workdir") or "").strip(),
+        turn_mode=str(body.get("turn_mode") or "").strip(),
+        reasoning=str(body.get("reasoning") or "").strip(),
         attachments=attach_paths,
     )
 
@@ -749,6 +755,16 @@ def _event_payload(entry: dict[str, Any], event: Any) -> dict[str, Any] | None:
             "duration_ms": d.get("duration_ms"),
             "result_preview": str(d.get("result_preview") or ""),
             "error": d.get("error"),
+        }
+    if event.type == "tier":
+        d = getattr(event, "data", None) or {}
+        tier = str(d.get("tier") or event.text or "")
+        if not tier:
+            return None
+        return {
+            "type": "tier",
+            "tier": tier,
+            "mode": str(d.get("mode") or ""),
         }
     if event.type == "usage":
         d = getattr(event, "data", None) or {}

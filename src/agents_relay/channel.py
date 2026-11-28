@@ -390,6 +390,12 @@ class ChannelHub:
                     and self._ws_handler(device_id, kind, payload))
                 if accepted:
                     try:
+                        from .workspaces import invalidate_workspace_read_cache
+
+                        invalidate_workspace_read_cache()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
                         from .events import emit_event
 
                         emit_event(
