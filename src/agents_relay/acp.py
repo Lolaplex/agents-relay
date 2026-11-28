@@ -604,33 +604,40 @@ def _windows_registry_paths() -> list[str]:
 
 
 def _fallback_cli_dirs() -> list[str]:
-    candidates: list[Path] = []
+    candidates: list[str] = []
     if os.name == "nt":
         local = os.environ.get("LOCALAPPDATA", "").strip()
         profile = os.environ.get("USERPROFILE", "").strip()
         appdata = os.environ.get("APPDATA", "").strip()
         if local:
-            candidates.append(Path(local) / "devin" / "cli" / "bin")
+            candidates.append(os.path.join(local, "devin", "cli", "bin"))
         if profile:
-            candidates.append(Path(profile) / ".local" / "bin")
+            candidates.append(os.path.join(profile, ".local", "bin"))
         if appdata:
-            candidates.append(Path(appdata) / "npm")
+            candidates.append(os.path.join(appdata, "npm"))
         if local:
-            candidates.append(Path(local) / "cursor-agent")
+            candidates.append(os.path.join(local, "cursor-agent"))
     else:
         candidates = [
-            Path.home() / ".local" / "bin",
-            Path("/opt/homebrew/bin"),
-            Path("/usr/local/bin"),
+            os.path.join(os.path.expanduser("~"), ".local", "bin"),
+            os.path.join(os.sep, "opt", "homebrew", "bin"),
+            os.path.join(os.sep, "usr", "local", "bin"),
         ]
     out: list[str] = []
     for path in candidates:
         try:
-            if path.is_dir():
-                out.append(str(path))
+            if os.path.isdir(path):
+                out.append(path)
         except OSError:
             continue
     return out
+
+
+def _exe_abspath(path: str) -> str:
+    """Absolutize relative hits without rewriting absolute paths."""
+    if os.path.isabs(path) or ntpath.isabs(path):
+        return path
+    return os.path.abspath(path)
 
 
 def resolve_agent_exe(cmd: str) -> str | None:
@@ -640,21 +647,21 @@ def resolve_agent_exe(cmd: str) -> str | None:
         return None
     direct = os.path.expandvars(os.path.expanduser(raw))
     if os.path.isfile(direct):
-        return os.path.abspath(direct)
+        return _exe_abspath(direct)
     hit = shutil.which(raw)
     if hit:
-        return os.path.abspath(hit)
+        return _exe_abspath(hit)
     if os.name == "nt":
         live_path = os.pathsep.join(_windows_registry_paths())
         if live_path:
             hit = shutil.which(raw, path=live_path)
             if hit:
-                return os.path.abspath(hit)
+                return _exe_abspath(hit)
     fallback_path = os.pathsep.join(_fallback_cli_dirs())
     if fallback_path:
         hit = shutil.which(raw, path=fallback_path)
         if hit:
-            return os.path.abspath(hit)
+            return _exe_abspath(hit)
     return None
 
 
