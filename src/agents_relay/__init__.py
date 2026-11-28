@@ -1,4 +1,4 @@
-"""HTTP + Telegram relay to runner.loop."""
+"""HTTP + Telegram + Discord relay to runner.loop."""
 
 from importlib.metadata import PackageNotFoundError, version
 

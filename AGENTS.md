@@ -1,6 +1,6 @@
 # agents-relay
 
-Stdlib-only relay: HTTP `/v1/turn`, `/v1/inject`, and optional Telegram long-poll. Spawns `runner.loop` per turn; no `~/.agents` writes.
+Stdlib-first relay: HTTP `/v1/turn`, `/v1/inject`, optional Telegram long-poll, and optional Discord Gateway. Spawns `runner.loop` per turn; no `~/.agents` writes. Core runtime stays stdlib + agents-workspace; the Discord extra lazily uses `websocket-client`.
 
 ## Commands
 
@@ -9,12 +9,14 @@ python -m agents_relay --help-json
 agents-relay serve
 agents-relay send --user <chat_id> --text "hello"
 agents-relay inject --user <chat_id> --text "hello"
-agents-relay approve --user <chat_id> --timeout 300  # JSON request on stdin
+agents-relay discord-send --user <channel_id> --text "hello"
+agents-relay discord-inject --user <channel_id> --text "hello"
+agents-relay approve --user <chat_id> --timeout 300  # JSON request on stdin; --telegram/--discord disambiguate
 ```
 
-Env: `LOOP_CMD`, `LOOP_PROVIDER`, `RELAY_SECRET` (fallback `GATEWAY_SECRET`), `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_CHAT_IDS`, `AGENTS_RELAY_ALLOW_ANYONE`, `AGENTS_RELAY_APPROVER`, `AGENTS_RELAY_DIR` (legacy `AGENTS_RELAY_STATE`), `AGENTS_RELAY_ATTACH_DIR`, `AGENTS_RELAY_VISION` (`auto`/`on`/`off`), `AGENTS_RELAY_MAX_JOBS`, `AGENTS_RELAY_MAX_JOBS_PER_CHAT`, `RELAY_HOST`, `RELAY_PORT`, `TELEGRAM_POLL_TIMEOUT`, `AGENTS_RELAY_WEB_DIR`, `AGENTS_RELAY_TURN_TIMEOUT` (secs, default 900). `GET /v1/discover` scans the tailnet for `klanker serve` health probes (server-side mirror of the desktop scan).
+Env: `LOOP_CMD`, `LOOP_PROVIDER`, `RELAY_SECRET` (fallback `GATEWAY_SECRET`), `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_CHAT_IDS`, `DISCORD_BOT_TOKEN`, `DISCORD_ALLOWED_CHANNEL_IDS`, `DISCORD_ALLOWED_USER_IDS`, `DISCORD_REQUIRE_MENTION`, `DISCORD_APPROVER`, `AGENTS_RELAY_ALLOW_ANYONE`, `AGENTS_RELAY_APPROVER`, `AGENTS_RELAY_DIR` (legacy `AGENTS_RELAY_STATE`), `AGENTS_RELAY_ATTACH_DIR`, `AGENTS_RELAY_VISION` (`auto`/`on`/`off`), `AGENTS_RELAY_MAX_JOBS`, `AGENTS_RELAY_MAX_JOBS_PER_CHAT`, `RELAY_HOST`, `RELAY_PORT`, `TELEGRAM_POLL_TIMEOUT`, `AGENTS_RELAY_WEB_DIR`, `AGENTS_RELAY_TURN_TIMEOUT` (secs, default 900). `GET /v1/discover` scans the tailnet for `klanker serve` health probes (server-side mirror of the desktop scan).
 
-Telegram `serve` refuses an empty allowlist unless `AGENTS_RELAY_ALLOW_ANYONE=1`. Approval and inbox files go under `AGENTS_RELAY_DIR` (default `<ws>/relay`). Poll commands: `/jobs`, `/stop`, `/stop <id>`.
+Telegram `serve` refuses an empty allowlist unless `AGENTS_RELAY_ALLOW_ANYONE=1`. Discord `serve` refuses empty channel or user allowlists unless `AGENTS_RELAY_ALLOW_ANYONE=1` because channel ids are not user identity. Approval and inbox files go under `AGENTS_RELAY_DIR` (default `<ws>/relay`). Chat commands: `/jobs`, `/stop`, `/stop <id>`, `/persona`, `/workspace`, `/model`.
 
 Handoffs: `POST .../inbox/<task>/handoff` moves task ownership (peer policy enforced by `agents_workspace.inbox`); `?wake=1` also runs it detached as `routine:handoff:<task>` and writes `done`/`failed` + `reply_summary` back. `GET /v1/workspaces/<ws>/inbox` is the team feed (per-persona counts + recent handoffs).
 
