@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .read_cache import cache_key, host_dir_key, relay_read_cache
 from .state import read_json, write_json_atomic
 
 _NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
@@ -177,10 +178,23 @@ _ACP_AGENT_CANDIDATES = (
 )
 
 
-def acp_agent_candidates() -> list[dict[str, Any]]:
-    """Curated ACP CLI detection rows; read-only and secret-free."""
+_AGENT_DETECT_TTL_SEC = 30.0
+
+
+def _resolve_agent_exe_cached(binary: str, *, refresh: bool = False) -> str | None:
     from .acp import resolve_agent_exe
 
+    key = cache_key("provider-agent-exe", host_dir_key(), binary)
+    return relay_read_cache.get_or_load(
+        key,
+        _AGENT_DETECT_TTL_SEC,
+        lambda: resolve_agent_exe(binary),
+        refresh=refresh,
+    )
+
+
+def acp_agent_candidates(*, refresh: bool = False) -> list[dict[str, Any]]:
+    """Curated ACP CLI detection rows; read-only and secret-free."""
     try:
         from runner.providers import list_providers
 
@@ -194,7 +208,7 @@ def acp_agent_candidates() -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for spec in _ACP_AGENT_CANDIDATES:
         row = dict(spec)
-        resolved = resolve_agent_exe(str(spec["binary"]))
+        resolved = _resolve_agent_exe_cached(str(spec["binary"]), refresh=refresh)
         row["installed"] = bool(resolved)
         row["resolved_path"] = resolved
         row["configured"] = str(spec["provider_name"]) in configured
@@ -226,6 +240,8 @@ def set_provider_secret(key_env: str, value: str) -> dict[str, Any]:
     if not secret_val:
         raise ProviderError(400, "secret value is required")
     write_secret(name, secret_val, scope="host")
+    relay_read_cache.invalidate("providers")
+    relay_read_cache.invalidate("provider-agent-exe")
     return {"key_env": name, "configured": True}
 
 
@@ -287,6 +303,8 @@ def create_provider(body: dict[str, Any]) -> dict[str, Any]:
     row = dict(manifest)
     row["source"] = "file"
     row["configurable"] = True
+    relay_read_cache.invalidate("providers")
+    relay_read_cache.invalidate("provider-agent-exe")
     return row
 
 
@@ -304,6 +322,8 @@ def delete_provider(name: str) -> None:
     cache = acp_models_cache_path(name)
     if cache.is_file():
         cache.unlink()
+    relay_read_cache.invalidate("providers")
+    relay_read_cache.invalidate("provider-agent-exe")
 
 
 def acp_models_cache_clear(name: str) -> None:

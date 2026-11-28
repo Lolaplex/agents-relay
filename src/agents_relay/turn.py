@@ -19,7 +19,9 @@ from .config import RelayConfig
 
 LOOP_TRAILER_MARKER = "---agents-loop-trailer---"
 SIDEBAND_PREFIX = "__KLANKER_EVT__ "
-STRUCTURED_EVENT_TYPES = frozenset({"thought", "tool_start", "tool_end", "usage"})
+STRUCTURED_EVENT_TYPES = frozenset({"thought", "tool_start", "tool_end", "usage", "tier"})
+TURN_MODES = frozenset({"auto", "fast", "agent", "deep"})
+REASONING_LEVELS = frozenset({"auto", "off", "low", "medium", "high"})
 _STREAM_READ = 4096
 _BATCH_MAX = 256
 _BATCH_WAIT = 0.03
@@ -68,6 +70,8 @@ class TurnParams:
     project: str = ""
     workspace: str = ""
     workdir: str = ""
+    turn_mode: str = ""
+    reasoning: str = ""
     deliver: str = "buffered"
     attachments: tuple[str, ...] = ()
 
@@ -115,6 +119,21 @@ def parse_loop_stdout(stdout: str) -> dict[str, Any]:
     }
 
 
+def turn_directive_error(body: dict[str, Any]) -> str:
+    """Validation error for wire turn directives, else ``""``."""
+    for key, allowed in (
+        ("turn_mode", TURN_MODES),
+        ("reasoning", REASONING_LEVELS),
+    ):
+        raw = body.get(key)
+        if raw is None or raw == "":
+            continue
+        value = str(raw).strip() if isinstance(raw, str) else ""
+        if not value or value not in allowed:
+            return f"invalid {key}: {raw!r}"
+    return ""
+
+
 def turn_params_from_body(body: dict[str, Any]) -> TurnParams:
     return TurnParams(
         channel=str(body.get("channel") or "http"),
@@ -129,6 +148,8 @@ def turn_params_from_body(body: dict[str, Any]) -> TurnParams:
         project=str(body.get("project") or ""),
         workspace=str(body.get("workspace") or ""),
         workdir=str(body.get("workdir") or "").strip(),
+        turn_mode=str(body.get("turn_mode") or "").strip(),
+        reasoning=str(body.get("reasoning") or "").strip(),
     )
 
 
@@ -267,12 +288,26 @@ def _is_acp_agent_provider(provider: str) -> bool:
     )
 
 
+def _is_runner_loop_cmd(argv: list[str]) -> bool:
+    """True for the harness loop entrypoint, not acp-run/custom wrappers."""
+    items = [str(part) for part in argv]
+    for idx, item in enumerate(items[:-1]):
+        if item == "-m" and items[idx + 1] == "runner.loop":
+            return True
+    return any(
+        item.replace("\\", "/").endswith("runner/loop.py")
+        for item in items
+    )
+
+
 def build_loop_argv(params: TurnParams, config: RelayConfig) -> list[str]:
     provider, model = _resolve_provider_and_model(params, config)
     argv = list(config.loop_cmd)
-    if _is_acp_agent_provider(provider):
+    acp_agent = _is_acp_agent_provider(provider)
+    if acp_agent:
         # Foreign ACP agent drives the turn; model maps to a config option.
         argv = [sys.executable, "-m", "agents_relay", "acp-run"]
+    runner_loop = (not acp_agent) and _is_runner_loop_cmd(argv)
     argv.extend(
         [
             "--channel",
@@ -290,6 +325,10 @@ def build_loop_argv(params: TurnParams, config: RelayConfig) -> list[str]:
     )
     if model:
         argv.extend(["--model", model])
+    if runner_loop and params.turn_mode:
+        argv.extend(["--turn-mode", params.turn_mode])
+    if runner_loop and params.reasoning:
+        argv.extend(["--reasoning", params.reasoning])
     if params.session:
         argv.extend(["--session", params.session])
     if params.user_id:
@@ -331,6 +370,10 @@ def prepare_loop(params: TurnParams, config: RelayConfig) -> tuple[TurnParams, l
         notes.append(notice)
         message = f"{message}\n\n{notice}".strip() if message else notice
     extra = vision_env(config, active=active, provider=provider)
+    if params.turn_mode:
+        extra["HARNESS_TURN_MODE"] = params.turn_mode
+    if params.reasoning:
+        extra["HARNESS_REASONING"] = params.reasoning
     if prepared.allow_root:
         extra["AGENTS_WORKDIR_ALLOW"] = prepared.allow_root
     updated = replace(
@@ -526,6 +569,8 @@ def run_loop_turn(
     project: str = "",
     workspace: str = "",
     workdir: str = "",
+    turn_mode: str = "",
+    reasoning: str = "",
     timeout_sec: int = 600,
     interrupt_file: str = "",
 ) -> LoopTurnResult:
@@ -542,6 +587,8 @@ def run_loop_turn(
         project=project,
         workspace=workspace,
         workdir=workdir,
+        turn_mode=turn_mode,
+        reasoning=reasoning,
         deliver="buffered",
     )
     cfg = config or RelayConfig.from_env()

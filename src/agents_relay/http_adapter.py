@@ -25,7 +25,14 @@ from . import __version__
 from .a2a import handle_a2a_mail, list_peers
 from .config import RelayConfig
 from .loop_client import LoopTurnResult, run_loop_turn
-from .turn import iter_loop_stream, resolve_workspace_id, turn_params_from_body, valid_id
+from .read_cache import cache_key, host_dir_key, relay_read_cache
+from .turn import (
+    iter_loop_stream,
+    resolve_workspace_id,
+    turn_directive_error,
+    turn_params_from_body,
+    valid_id,
+)
 from .web import (
     cookie_from_header,
     handle_chat_stop,
@@ -66,6 +73,8 @@ _ENVELOPE_KEYS = frozenset({
     "model",
     "persona",
     "project",
+    "turn_mode",
+    "reasoning",
 })
 
 
@@ -135,7 +144,7 @@ def _auth_context(handler: BaseHTTPRequestHandler) -> dict:
     Device callers carry device_id, role (host|client|ws_member) and
     the ws allowlist — ws_member can only touch workspaces in it.
     """
-    ctx = {"kind": "", "device_id": "", "role": "",
+    ctx = {"kind": "", "device_id": "", "role": "", "user": "",
            "allowlist": frozenset()}
     expected = getattr(handler, "relay_secret", "") or ""
     auth_header = (handler.headers.get("Authorization") or "").strip()
@@ -174,9 +183,41 @@ def _auth_context(handler: BaseHTTPRequestHandler) -> dict:
             pass
     if isinstance(cfg, RelayConfig) and web_enabled(cfg):
         raw = cookie_from_header(handler.headers.get("Cookie") or "")
-        if raw and verify_cookie(cfg, raw):
-            ctx["kind"] = "cookie"
+        if raw:
+            user = verify_cookie(cfg, raw) or ""
+            if user:
+                ctx["kind"] = "cookie"
+                ctx["user"] = user
     return ctx
+
+
+def _cache_caller_scope(ctx: dict) -> str:
+    """Secret-free caller dimension for cache keys."""
+    kind = str(ctx.get("kind") or "anon")
+    if kind == "device":
+        allow = ",".join(sorted(str(w) for w in (ctx.get("allowlist") or ())))
+        return "|".join((
+            kind,
+            str(ctx.get("role") or ""),
+            str(ctx.get("device_id") or ""),
+            allow,
+        ))
+    if kind == "cookie":
+        return f"cookie|{ctx.get('user') or ''}"
+    return kind
+
+
+def _refresh_requested(query_params: dict[str, str]) -> bool:
+    return str((query_params or {}).get("refresh") or "").strip() == "1"
+
+
+def _invalidate_provider_reads() -> None:
+    relay_read_cache.invalidate("providers")
+    relay_read_cache.invalidate("provider-agent-exe")
+
+
+def _invalidate_workspace_reads() -> None:
+    relay_read_cache.invalidate("workspaces")
 
 
 def _ws_allowed(ctx: dict, ws_id: str) -> bool:
@@ -613,7 +654,7 @@ def _sse_event(payload: dict) -> bytes:
 
 # Kwargs accepted by loop_client.run_loop_turn beyond the core turn fields.
 # turn_hook callables (e.g. telegram inbound) may not accept them.
-_OPTIONAL_TURN_KWARGS = ("attachments", "provider", "model", "persona", "project", "workdir", "extra_env")
+_OPTIONAL_TURN_KWARGS = ("attachments", "provider", "model", "persona", "project", "workdir", "turn_mode", "reasoning", "extra_env")
 
 
 _LOG_SECRET_RE = re.compile(r"([?&](?:token|secret|code|pair)=)([^&\s]+)", re.IGNORECASE)
@@ -1305,6 +1346,10 @@ class TurnHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path, query_params = _parse_query(self.path)
+        if path.startswith("/v1/providers"):
+            _invalidate_provider_reads()
+        if path.startswith("/v1/workspaces"):
+            _invalidate_workspace_reads()
         if self._gate_ws_member("POST", path, query_params):
             return
 
@@ -1893,6 +1938,7 @@ class TurnHandler(BaseHTTPRequestHandler):
                     {"ok": False, **out},
                     int(out.get("status") or 409))
                 return
+            _invalidate_workspace_reads()
             try:
                 from .events import emit_event
 
@@ -2201,6 +2247,10 @@ class TurnHandler(BaseHTTPRequestHandler):
             if _ws_member_body_denied(ctx, body):
                 self.send_error(403, "ws_member cannot set workdir/policy fields")
                 return
+            directive_error = turn_directive_error(body)
+            if directive_error:
+                self.send_error(400, directive_error)
+                return
             if remote_turn_dispatch is not None and remote_turn_dispatch(
                     self, path, body):
                 return
@@ -2342,6 +2392,10 @@ class TurnHandler(BaseHTTPRequestHandler):
             if _ws_member_body_denied(ctx, body):
                 self.send_error(403, "ws_member cannot set workdir/policy fields")
                 return
+            directive_error = turn_directive_error(body)
+            if directive_error:
+                self.send_error(400, directive_error)
+                return
             if remote_turn_dispatch is not None and remote_turn_dispatch(
                     self, path, body):
                 return
@@ -2385,6 +2439,11 @@ class TurnHandler(BaseHTTPRequestHandler):
         if _ws_member_body_denied(ctx, body):
             self.send_error(403, "ws_member cannot set workdir/policy fields")
             return
+        if path == "/v1/turn":
+            directive_error = turn_directive_error(body)
+            if directive_error:
+                self.send_error(400, directive_error)
+                return
         if path == "/v1/turn" and remote_turn_dispatch is not None:
             # Fail loud, not silent local fallback: a bound session that
             # errors mid-proxy must not run the turn twice
@@ -2426,7 +2485,7 @@ class TurnHandler(BaseHTTPRequestHandler):
                 "user_id": user_id,
                 "new_session": new_session,
             }
-            for key in ("provider", "model", "persona", "project", "workspace", "workdir"):
+            for key in ("provider", "model", "persona", "project", "workspace", "workdir", "turn_mode", "reasoning"):
                 val = str(body.get(key) or "").strip()
                 if val:
                     turn_kwargs[key] = val
@@ -3306,7 +3365,18 @@ class TurnHandler(BaseHTTPRequestHandler):
                 return
             from .workspaces import list_workspaces, workspace_row
 
-            rows = [workspace_row(ws) for ws in list_workspaces()]
+            refresh = _refresh_requested(query_params)
+            key = cache_key(
+                "workspaces",
+                host_dir_key(),
+                _cache_caller_scope(self._auth_ctx()),
+            )
+
+            def _load_workspaces() -> list[dict]:
+                return [workspace_row(ws) for ws in list_workspaces()]
+
+            rows = relay_read_cache.get_or_load(
+                key, 5.0, _load_workspaces, refresh=refresh)
             self._write_json({"ok": True, "workspaces": rows}, 200)
             return
         if path == "/v1/personas":
@@ -3393,7 +3463,7 @@ class TurnHandler(BaseHTTPRequestHandler):
             try:
                 from .providers_api import acp_agent_candidates
 
-                rows = acp_agent_candidates()
+                rows = acp_agent_candidates(refresh=_refresh_requested(query_params))
             except Exception as exc:
                 self.send_error(500, f"agent detection failed: {exc}")
                 return
@@ -3405,7 +3475,21 @@ class TurnHandler(BaseHTTPRequestHandler):
                 return
             try:
                 from .providers_api import provider_rows
-                rows = provider_rows(self._cfg())
+
+                refresh = _refresh_requested(query_params)
+                key = cache_key(
+                    "providers",
+                    host_dir_key(),
+                    str(query_params.get("workspace") or ""),
+                    _cache_caller_scope(self._auth_ctx()),
+                    str(getattr(cfg, "state_dir", "") or ""),
+                )
+                rows = relay_read_cache.get_or_load(
+                    key,
+                    15.0,
+                    lambda: provider_rows(self._cfg(), refresh=refresh),
+                    refresh=refresh,
+                )
             except Exception as exc:
                 self.send_error(500, f"providers unavailable: {exc}")
                 return
@@ -3444,6 +3528,7 @@ class TurnHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_error(500, f"probe failed: {exc}")
                 return
+            _invalidate_provider_reads()
             self._write_json({"ok": True, "provider": probe_parts[3], **out}, 200)
             return
         if path == "/v1/favorites":
@@ -3800,6 +3885,10 @@ class TurnHandler(BaseHTTPRequestHandler):
 
     def do_PATCH(self) -> None:
         path, query_params = _parse_query(self.path)
+        if path.startswith("/v1/providers"):
+            _invalidate_provider_reads()
+        if path.startswith("/v1/workspaces"):
+            _invalidate_workspace_reads()
         if self._gate_ws_member("PATCH", path, query_params):
             return
         parts = path.split("/")
@@ -3871,6 +3960,10 @@ class TurnHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:
         path, query_params = _parse_query(self.path)
+        if path.startswith("/v1/providers"):
+            _invalidate_provider_reads()
+        if path.startswith("/v1/workspaces"):
+            _invalidate_workspace_reads()
         if self._gate_ws_member("DELETE", path, query_params):
             return
         parts = path.split("/")
@@ -4057,6 +4150,7 @@ class TurnHandler(BaseHTTPRequestHandler):
                 code = 409 if "selected workspace" in msg else 400
                 self.send_error(code, msg)
                 return
+            _invalidate_workspace_reads()
             _emit_relay_event("workspace.changed", {"action": "delete", "workspace": ws_id}, workspace=ws_id)
             self._write_json({"ok": True, "workspace": ws_id,
                               "archived": str(out)}, 200)

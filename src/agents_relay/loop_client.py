@@ -79,6 +79,8 @@ def run_loop_turn(
     project: str = "",
     workspace: str = "",
     workdir: str = "",
+    turn_mode: str = "",
+    reasoning: str = "",
     interrupt_file: str = "",
     extra_env: dict[str, str] | None = None,
 ) -> LoopTurnResult:
@@ -96,6 +98,8 @@ def run_loop_turn(
         project=project,
         workspace=workspace,
         workdir=workdir,
+        turn_mode=turn_mode,
+        reasoning=reasoning,
         deliver="buffered",
         attachments=tuple(attachments or ()),
     )
