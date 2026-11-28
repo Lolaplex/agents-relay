@@ -804,6 +804,8 @@ def _drive_run(run: str, entry: dict[str, Any], params: Any, config: Any) -> Non
     so a client disconnect can never close it (closing it would kill the
     turn's process tree in its ``finally``).
     """
+    saw_output = False
+    saw_terminal = False
     try:
         _publish(entry, {"type": "start", "run": run})
         for note in entry.pop("pending_notes", []) or []:
@@ -811,7 +813,13 @@ def _drive_run(run: str, entry: dict[str, Any], params: Any, config: Any) -> Non
         for event in iter_loop_stream_live(params, config, cancel=entry["cancel"]):
             payload = _event_payload(entry, event)
             if payload is not None:
+                if payload.get("type") == "delta":
+                    saw_output = True
+                if payload.get("type") in ("trailer", "error"):
+                    saw_terminal = True
                 _publish(entry, payload)
+        if not saw_terminal and not saw_output and not entry["cancel"].is_set():
+            _publish(entry, {"type": "error", "text": "turn ended before completing"})
     except Exception as exc:  # noqa: BLE001
         log.exception("web turn failed (run %s)", run)
         _publish(entry, {"type": "error", "text": str(exc) or exc.__class__.__name__})

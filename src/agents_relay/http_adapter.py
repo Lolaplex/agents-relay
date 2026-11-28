@@ -2206,6 +2206,42 @@ class TurnHandler(BaseHTTPRequestHandler):
             self._write_json({"ok": True, **out}, 200)
             return
 
+        if path == "/v1/providers/hidden":
+            if not _check_secret(self, self.relay_secret, query_params,
+                                 allow_device=False):
+                self.send_error(401, "unauthorized")
+                return
+            body = self._read_json()
+            if body is None:
+                return
+            from .providers_api import (
+                ProviderError,
+                restore_hidden_providers,
+                set_provider_hidden,
+            )
+
+            try:
+                if body.get("restore_all"):
+                    hidden_list = restore_hidden_providers()
+                    action_meta: dict[str, Any] = {"action": "restore_hidden"}
+                else:
+                    target_name = str(body.get("name") or "").strip()
+                    hide_flag = bool(body.get("hidden", True))
+                    hidden_list = set_provider_hidden(target_name, hide_flag)
+                    action_meta = {
+                        "action": "hide" if hide_flag else "unhide",
+                        "provider": target_name,
+                    }
+            except ProviderError as exc:
+                self.send_error(exc.status, exc.message)
+                return
+            except Exception as exc:
+                self.send_error(500, f"provider hide failed: {exc}")
+                return
+            _emit_relay_event("provider.changed", action_meta)
+            self._write_json({"ok": True, "hidden": hidden_list}, 200)
+            return
+
         if path == "/v1/favorites":
             if not _check_secret(self, self.relay_secret, query_params):
                 self.send_error(401, "unauthorized")
@@ -3474,26 +3510,33 @@ class TurnHandler(BaseHTTPRequestHandler):
                 self.send_error(401, "unauthorized")
                 return
             try:
-                from .providers_api import provider_rows
+                from .providers_api import hidden_providers, provider_rows
 
                 refresh = _refresh_requested(query_params)
+                include_hidden = str(query_params.get("include_hidden") or "").strip().lower() in ("1", "true", "yes")
                 key = cache_key(
                     "providers",
                     host_dir_key(),
                     str(query_params.get("workspace") or ""),
                     _cache_caller_scope(self._auth_ctx()),
                     str(getattr(cfg, "state_dir", "") or ""),
+                    "all" if include_hidden else "visible",
                 )
                 rows = relay_read_cache.get_or_load(
                     key,
                     15.0,
-                    lambda: provider_rows(self._cfg(), refresh=refresh),
+                    (
+                        (lambda: provider_rows(self._cfg(), refresh=refresh, include_hidden=True))
+                        if include_hidden
+                        else (lambda: provider_rows(self._cfg(), refresh=refresh))
+                    ),
                     refresh=refresh,
                 )
+                hidden_list = hidden_providers()
             except Exception as exc:
                 self.send_error(500, f"providers unavailable: {exc}")
                 return
-            self._write_json({"ok": True, "providers": rows}, 200)
+            self._write_json({"ok": True, "providers": rows, "hidden": hidden_list}, 200)
             return
         if path == "/v1/host":
             if not _check_secret(self, self.relay_secret, query_params,
