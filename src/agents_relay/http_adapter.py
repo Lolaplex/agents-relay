@@ -75,6 +75,9 @@ _ENVELOPE_KEYS = frozenset({
     "project",
     "turn_mode",
     "reasoning",
+    "acp_mode",
+    "thought_level",
+    "speed",
 })
 
 
@@ -654,7 +657,7 @@ def _sse_event(payload: dict) -> bytes:
 
 # Kwargs accepted by loop_client.run_loop_turn beyond the core turn fields.
 # turn_hook callables (e.g. telegram inbound) may not accept them.
-_OPTIONAL_TURN_KWARGS = ("attachments", "provider", "model", "persona", "project", "workdir", "turn_mode", "reasoning", "extra_env")
+_OPTIONAL_TURN_KWARGS = ("attachments", "provider", "model", "persona", "project", "workdir", "turn_mode", "reasoning", "acp_mode", "thought_level", "speed", "extra_env")
 
 
 _LOG_SECRET_RE = re.compile(r"([?&](?:token|secret|code|pair)=)([^&\s]+)", re.IGNORECASE)
@@ -905,11 +908,26 @@ def _emit_relay_event(kind: str, payload: dict[str, Any] | None = None, *, works
         pass
 
 
+def _relay_host_label() -> str:
+    """Hub host display label for pairing responses; empty when unavailable."""
+    try:
+        from agents_workspace import Host
+
+        label_fn = getattr(Host.from_env(), "host_label", None)
+        return str(label_fn() or "").strip() if callable(label_fn) else ""
+    except Exception:  # noqa: BLE001 - pairing still works without host metadata
+        return ""
+
+
 # ws-share hooks (klanker#145): the host app (klanker serve) wires these
 # at boot. ws_invite_auth gates invite minting (owner check);
 # ws_grant_hook applies the membership grant on ws-mode redeem.
 ws_invite_auth = None   # fn(device_id, ws_id) -> bool
 ws_grant_hook = None    # fn(device_id, ws_id, granted_by) -> None
+# Spoke-side guest invite proxy (klanker wires it when the workspace lives
+# on the hub): fn(ws_id, ttl_sec) -> proxied response dict, or None to fall
+# back to local minting.
+ws_invite_proxy_fn: Callable[[str, int], dict | None] | None = None
 # session:host remote exec (klanker#145 R5): wired by klanker serve —
 # fn(handler, path, body) -> bool, True when the request was proxied to
 # the session's bound host via the hub channel.
@@ -975,14 +993,55 @@ def _ws_hosts_payload(ws, ctx: dict, spoke_hosts_fn=None) -> dict:
             hub_map = spoke_hosts_fn(str(ws.id))
         except Exception:  # noqa: BLE001 - relay failure falls through
             hub_map = None
-        if isinstance(hub_map, dict) and hub_map:
+        if isinstance(hub_map, dict):
             out = dict(hub_map)
-            out.update({"ok": True, "workspace": ws.id,
-                        "hub_offline": False})
-            hs = [h for h in (out.get("hosts") or [])
-                  if isinstance(h, dict)]
+            out.update({
+                "ok": True,
+                "workspace": ws.id,
+                # The hub knows whether the relayed map is live; a spoke
+                # must not paint a healthy link red nor a dead link green.
+                "hub_offline": bool(hub_map.get("hub_offline", False)),
+            })
+            hub_self_device_id = str(
+                hub_map.get("self_device_id") or "").strip()
+            hs: list[dict] = []
+            seen: dict[str, int] = {}
+            for raw in out.get("hosts") or []:
+                if not isinstance(raw, dict):
+                    continue
+                h = dict(raw)
+                did = str(h.get("device_id") or "")
+                if did:
+                    if did in seen:
+                        # One logical host, one row — duplicate device rows
+                        # must not multiply in the picker.
+                        if h.get("self"):
+                            hs[seen[did]]["self"] = True
+                        continue
+                    seen[did] = len(hs)
+                hs.append(h)
+
+            def _matches_local_self(row: dict) -> bool:
+                did = str(row.get("device_id") or "")
+                return bool(
+                    (self_id and did == self_id)
+                    or (hub_self_device_id and did == hub_self_device_id)
+                )
+
+            matched_self = any(_matches_local_self(h) for h in hs)
             for h in hs:
-                h["self"] = str(h.get("device_id") or "") == self_id
+                # Prefer the hub-supplied caller id when present: on a spoke
+                # the hub device id and local host_id are the same machine,
+                # never two distinct picker rows.
+                h["self"] = (
+                    _matches_local_self(h)
+                    if matched_self else bool(h.get("self"))
+                )
+                if h["self"]:
+                    h["online"] = True
+                    h["status"] = "online"
+                    if self_label and not str(h.get("label") or "").strip():
+                        h["label"] = self_label
             # the local caller still gets its own self row — it is not
             # part of the hub's member map (agents-relay#45)
             if self_id and not any(h["self"] for h in hs):
@@ -1039,8 +1098,13 @@ def _ws_hosts_payload(ws, ctx: dict, spoke_hosts_fn=None) -> dict:
                       if connected or is_self else "offline",
             "leases": leases.get(did) or [],
         })
+    sync_policy = str(getattr(ws, "sync_policy", "") or "")
     if links:
         hub_offline = False  # this process is serving devices — it IS a hub
+    elif sync_policy not in ("synced", "shared"):
+        # A local workspace never depends on a hub link; stored hub
+        # credentials for OTHER workspaces must not paint it offline.
+        hub_offline = False
     else:
         try:
             from .channel_client import _load_hubs
@@ -1052,11 +1116,62 @@ def _ws_hosts_payload(ws, ctx: dict, spoke_hosts_fn=None) -> dict:
             hub_offline = False
     return {
         "ok": True, "workspace": ws.id,
-        "sync_policy": str(getattr(ws, "sync_policy", "") or ""),
+        "sync_policy": sync_policy,
         "owner": owner, "default_host": default,
         "hub_offline": hub_offline,
         "hosts": hosts,
     }
+
+
+def _hub_peers_payload() -> dict:
+    """Public hub+host-device peer map for paired compute nodes.
+
+    Only role=host rows are peers: ws_member guests are workspace-scoped
+    credentials and must never become enumerable infrastructure rows.
+    Tokens stay in the vault and are never part of this payload.
+    """
+    host_id = ""
+    host_label = ""
+    try:
+        from agents_workspace import Host
+
+        host = Host.from_env()
+        host_id = str(host.host_id() or "").strip()
+        label_fn = getattr(host, "host_label", None)
+        if callable(label_fn):
+            host_label = str(label_fn() or "").strip()
+    except Exception:  # noqa: BLE001 - peer rows still render without host metadata
+        pass
+    hub_row = {
+        "device_id": host_id,
+        "host_id": host_id,
+        "label": host_label or host_id or "hub",
+        "role": "hub",
+        "online": True,
+        "via": "hub",
+    }
+    from .channel import hub as _channel_hub
+    from .devices import list_public
+
+    ch = _channel_hub()
+    peers = [dict(hub_row)]
+    seen = {host_id} if host_id else set()
+    for row in list_public():
+        if str(row.get("role") or "") != "host":
+            continue
+        did = str(row.get("id") or "")
+        if not did or did in seen:
+            continue
+        seen.add(did)
+        peers.append({
+            "device_id": did,
+            "host_id": str(row.get("host_id") or ""),
+            "label": str(row.get("label") or row.get("host_id") or did),
+            "role": "host",
+            "online": bool(ch.is_connected(did)),
+            "via": "channel",
+        })
+    return {"ok": True, "hub": hub_row, "peers": peers}
 
 
 def _turn_lease_conflict(handler, body: dict) -> bool:
@@ -1437,6 +1552,29 @@ class TurnHandler(BaseHTTPRequestHandler):
             if not valid_id(ws_id):
                 self.send_error(400, f"invalid workspace id: {ws_id!r}")
                 return
+            try:
+                ttl_sec = int(body.get("ttl_sec", 60))
+            except (TypeError, ValueError):
+                ttl_sec = 60
+            if device_id == "__admin__" and ws_invite_proxy_fn is not None:
+                try:
+                    proxied = ws_invite_proxy_fn(ws_id, ttl_sec)
+                except Exception as exc:  # noqa: BLE001 - proxy failure must be a clean API error
+                    self._write_json(
+                        {"ok": False, "error": f"invite proxy failed: {exc}"},
+                        502,
+                    )
+                    return
+                if isinstance(proxied, dict):
+                    if proxied.get("error") and not proxied.get("ok", True):
+                        try:
+                            status = int(proxied.get("status") or 502)
+                        except (TypeError, ValueError):
+                            status = 502
+                        self._write_json(proxied, status)
+                        return
+                    self._write_json(proxied, 200)
+                    return
             if ws_grant_hook is None or ws_invite_auth is None:
                 self.send_error(503, "workspace invites not configured")
                 return
@@ -1485,7 +1623,8 @@ class TurnHandler(BaseHTTPRequestHandler):
                     return
                 cookie_val = issue_cookie(cfg)
                 payload = json.dumps(
-                    {"ok": True, "mode": "web", "host_id": entry.get("host_id", "")}
+                    {"ok": True, "mode": "web", "host_id": entry.get("host_id", ""),
+                     "host_label": _relay_host_label()}
                 ).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -1500,6 +1639,9 @@ class TurnHandler(BaseHTTPRequestHandler):
             ws_id = str(entry.get("ws") or "")
             granted_by = str(entry.get("granted_by") or "")
             label = str(body.get("label") or "").strip()
+            client_host_id = str(body.get("client_host_id") or "").strip()
+            device_host_id = client_host_id or str(entry.get("host_id") or "")
+            host_label = _relay_host_label()
             if entry["mode"] == "ws":
                 # Re-verify at redeem time (agents-relay#42): the inviter
                 # may have been revoked or lost ownership since the code
@@ -1530,6 +1672,12 @@ class TurnHandler(BaseHTTPRequestHandler):
                 if ctx.get("kind") == "device" and ctx.get("device_id"):
                     did = str(ctx["device_id"])
                     try:
+                        from .devices import update_device
+
+                        # Reused ws memberships still carry the spoke's real
+                        # identity; older rows minted before client_host_id
+                        # are healed in place without rotating credentials.
+                        update_device(did, label=label, host_id=device_host_id)
                         ws_grant_hook(did, ws_id, granted_by)
                         from .devices import add_allowlist
 
@@ -1542,6 +1690,7 @@ class TurnHandler(BaseHTTPRequestHandler):
                     self._write_json(
                         {"ok": True, "mode": "ws", "ws": ws_id,
                          "host_id": entry.get("host_id", ""),
+                         "host_label": host_label,
                          "granted_by": granted_by,
                          "device_id": did, "token": "",
                          "reused": True,
@@ -1580,7 +1729,7 @@ class TurnHandler(BaseHTTPRequestHandler):
                         updated = update_device(
                             did,
                             label=label,
-                            host_id=str(entry.get("host_id") or ""),
+                            host_id=device_host_id,
                             role="host" if current_role == "ws_member" else "",
                             allowlist=[] if current_role == "ws_member" else None,
                         )
@@ -1596,6 +1745,7 @@ class TurnHandler(BaseHTTPRequestHandler):
                     self._write_json(
                         {"ok": True, "mode": "remote", "ws": "",
                          "host_id": entry.get("host_id", ""),
+                         "host_label": host_label,
                          "granted_by": granted_by,
                          "device_id": did, "token": "",
                          "reused": True,
@@ -1618,7 +1768,7 @@ class TurnHandler(BaseHTTPRequestHandler):
                 # mode=remote pairs a compute node (role=host).
                 dev = mint_device(
                     label=label or self.address_string(),
-                    host_id=entry.get("host_id", ""),
+                    host_id=device_host_id,
                     role="ws_member" if entry["mode"] == "ws" else "host",
                     allowlist=[ws_id] if entry["mode"] == "ws" else None,
                 )
@@ -1645,6 +1795,7 @@ class TurnHandler(BaseHTTPRequestHandler):
                     "ok": True,
                     "mode": entry["mode"],
                     "host_id": entry.get("host_id", ""),
+                    "host_label": host_label,
                     "ws": ws_id,
                     "granted_by": entry.get("granted_by", ""),
                     "device_id": dev["device_id"],
@@ -2521,7 +2672,7 @@ class TurnHandler(BaseHTTPRequestHandler):
                 "user_id": user_id,
                 "new_session": new_session,
             }
-            for key in ("provider", "model", "persona", "project", "workspace", "workdir", "turn_mode", "reasoning"):
+            for key in ("provider", "model", "persona", "project", "workspace", "workdir", "turn_mode", "reasoning", "acp_mode", "thought_level", "speed"):
                 val = str(body.get(key) or "").strip()
                 if val:
                     turn_kwargs[key] = val
@@ -3641,6 +3792,19 @@ class TurnHandler(BaseHTTPRequestHandler):
 
             hb = float(getattr(self.server, "events_heartbeat_sec", 25.0))
             handle_hub_stream(self, did, since=max(0, since), heartbeat_sec=hb)
+            return
+        if path == "/v1/hub/peers":
+            if not _check_secret(self, self.relay_secret, query_params):
+                self.send_error(401, "unauthorized")
+                return
+            ctx = self._auth_ctx()
+            if ctx.get("kind") == "device" and ctx.get("role") != "host":
+                self.send_error(403, "hub peers are host-device only")
+                return
+            if ctx.get("kind") not in ("admin", "cookie", "device"):
+                self.send_error(401, "unauthorized")
+                return
+            self._write_json(_hub_peers_payload(), 200)
             return
         if path == "/v1/hub/devices":
             if not _check_secret(self, self.relay_secret, query_params,

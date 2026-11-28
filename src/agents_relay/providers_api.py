@@ -455,6 +455,11 @@ def probe_provider(config: Any, name: str) -> dict[str, Any]:
             "detail": f"{len(models)} model(s)" if models else "agent reachable",
             "models": models,
             "modes": info.get("modes") or [],
+            "thought_level": info.get("thought_level") or "",
+            "thought_levels": info.get("thought_levels") or [],
+            "speed": info.get("speed") or "",
+            "speeds": info.get("speeds") or [],
+            "config_options": info.get("config_options") or [],
             "auth_methods": info.get("auth_methods") or [],
         }
     if kind in ("echo", "scripted"):

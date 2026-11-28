@@ -408,7 +408,7 @@ class TestHubUrlNormalization(_W6Base):
     def test_connect_hub_matches_normalized_existing_link(self):
         captured = {}
 
-        def fake_redeem(hub_url, cred, *, label="", bearer=""):
+        def fake_redeem(hub_url, cred, *, label="", bearer="", client_host_id=""):
             captured["hub_url"] = hub_url
             captured["bearer"] = bearer
             return {"ok": True, "mode": "remote", "host_id": "h1",

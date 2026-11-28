@@ -855,17 +855,40 @@ def acp_provider_name() -> str:
     return f"acp.{name}"
 
 
+def _acp_probe_defaults() -> dict[str, Any]:
+    """Fresh probe row shape — lists must never be shared between rows."""
+    return {
+        "model": "", "models": [],
+        "mode": "", "modes": [],
+        "thought_level": "", "thought_levels": [],
+        "speed": "", "speeds": [],
+        "config_options": [],
+        "auth_methods": [], "auth_required": False,
+    }
+
+
+def _normalize_acp_probe(data: dict[str, Any]) -> dict[str, Any]:
+    """Merge a live/cached probe into the current config-option shape."""
+    out = _acp_probe_defaults()
+    if isinstance(data, dict):
+        out.update(data)
+    for key in ("models", "modes", "thought_levels", "speeds",
+                "config_options", "auth_methods"):
+        if not isinstance(out.get(key), list):
+            out[key] = []
+    for key in ("model", "mode", "thought_level", "speed"):
+        out[key] = str(out.get(key) or "")
+    return out
+
+
 def probe_acp_agent(
     agent_argv: list[str], timeout: float = 20, provider: str = ""
 ) -> dict[str, Any]:
-    """Spawn the agent briefly; collect its model/mode config options.
+    """Spawn the agent briefly; collect its config options.
 
     Surfaces ``auth_methods``/``auth_required``/``error`` so the UI can
     show the real connect path instead of a silently empty model list."""
-    out: dict[str, Any] = {
-        "model": "", "models": [], "mode": "", "modes": [],
-        "auth_methods": [], "auth_required": False,
-    }
+    out: dict[str, Any] = _acp_probe_defaults()
     conn = _AgentConn(agent_argv, env=_acp_env())
     try:
         init = conn.request(
@@ -909,12 +932,19 @@ def probe_acp_agent(
             return out
         for opt in (res.get("result") or {}).get("configOptions") or []:
             oid = str(opt.get("id") or "")
-            if oid not in out:
-                continue
-            out[oid] = str(opt.get("currentValue") or "")
-            out[oid + "s"] = [
+            values = [
                 str(v.get("value")) for v in opt.get("options") or [] if v.get("value")
             ]
+            out["config_options"].append({
+                "id": oid,
+                "name": str(opt.get("name") or oid),
+                "category": str(opt.get("category") or ""),
+                "current": str(opt.get("currentValue") or ""),
+                "options": values,
+            })
+            if oid in ("model", "mode", "thought_level", "speed"):
+                out[oid] = str(opt.get("currentValue") or "")
+                out[oid + "s"] = values
         return out
     finally:
         conn.close()
@@ -944,7 +974,7 @@ def _read_acp_models_cache(path: Path) -> dict[str, Any]:
     """Read a probe cache, treating persisted errors as stale misses."""
     cached = read_json(path) or {}
     if "error" not in cached:
-        return cached
+        return _normalize_acp_probe(cached) if cached else {}
     try:
         path.unlink()
     except OSError:
@@ -960,26 +990,30 @@ def acp_agent_info(
     name = name or acp_provider_name().split(".", 1)[1]
     path = acp_models_cache_path(f"acp.{name}", config)
     cached = _read_acp_models_cache(path)
-    if cached.get("models") and not refresh and (
+    if (cached.get("models") or cached.get("config_options")) and not refresh and (
         time.time() - float(cached.get("ts") or 0) < _ACP_INFO_TTL
     ):
         return cached
     cmd = acp_agent_cmd(provider)
     if not cmd:
-        return {"error": "AGENTS_ACP_CMD unset", "model": "", "models": []}
+        return {**_acp_probe_defaults(), "error": "AGENTS_ACP_CMD unset"}
     import shlex
 
     try:
-        data = probe_acp_agent(
+        data = _normalize_acp_probe(probe_acp_agent(
             shlex.split(cmd, posix=(os.name != "nt")), provider=provider
-        )
+        ))
         data["ts"] = time.time()
         if "error" not in data:
             path.parent.mkdir(parents=True, exist_ok=True)
             write_json_atomic(path, data)
         return data
     except Exception as exc:
-        return {"error": str(exc), "model": "", "models": [], "ts": time.time()}
+        return {
+            **_acp_probe_defaults(),
+            "error": str(exc),
+            "ts": time.time(),
+        }
 
 
 def acp_provider_rows(config: RelayConfig, refresh: bool = False) -> list[dict[str, Any]]:
@@ -1024,7 +1058,9 @@ def acp_provider_rows(config: RelayConfig, refresh: bool = False) -> list[dict[s
             info = acp_agent_info(config, name, refresh=True)
         else:
             info = _read_acp_models_cache(acp_models_cache_path(name, config))
-        for key in ("model", "models", "mode", "modes", "error",
+        for key in ("model", "models", "mode", "modes",
+                    "thought_level", "thought_levels", "speed", "speeds",
+                    "config_options", "error",
                     "auth_methods", "auth_required"):
             if info.get(key):
                 row[key] = info[key]
@@ -1076,6 +1112,9 @@ def run_acp_turn(
     deliver: str = "stream",
     model: str = "",
     provider: str = "",
+    acp_mode: str = "",
+    thought_level: str = "",
+    speed: str = "",
 ) -> int:
     """One loop-shaped turn against a foreign ACP agent.
 
@@ -1152,14 +1191,21 @@ def run_acp_turn(
             stored["acpSessionId"] = acp_sid
             write_json_atomic(state_path, stored)
 
-        if model:
+        for config_id, value in (
+            ("model", model),
+            ("mode", acp_mode),
+            ("thought_level", thought_level),
+            ("speed", speed),
+        ):
+            if not value:
+                continue
             res = conn.request(
                 "session/set_config_option",
-                {"sessionId": acp_sid, "configId": "model", "value": model},
+                {"sessionId": acp_sid, "configId": config_id, "value": value},
             )
             if "error" in res:
                 sys.stderr.write(
-                    f"acp set model {model!r} failed: {res['error']} — agent default stays\n"
+                    f"acp set {config_id} {value!r} failed: {res['error']} — agent default stays\n"
                 )
 
         buffered: list[str] = []
@@ -1229,4 +1275,16 @@ def acp_loop_main(args: Any, config: RelayConfig) -> int:
         deliver="buffered" if getattr(args, "deliver", "stream") == "buffered" else "stream",
         model=str(getattr(args, "model", "") or "").strip(),
         provider=provider,
+        acp_mode=(
+            str(getattr(args, "acp_mode", "") or "").strip()
+            or os.environ.get("AGENTS_ACP_MODE", "").strip()
+        ),
+        thought_level=(
+            str(getattr(args, "thought_level", "") or "").strip()
+            or os.environ.get("AGENTS_ACP_THOUGHT_LEVEL", "").strip()
+        ),
+        speed=(
+            str(getattr(args, "speed", "") or "").strip()
+            or os.environ.get("AGENTS_ACP_SPEED", "").strip()
+        ),
     )

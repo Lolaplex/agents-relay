@@ -244,9 +244,12 @@ def build_parser() -> argparse.ArgumentParser:
     acp_run_p.add_argument("--workdir", default="")
     acp_run_p.add_argument("--deliver", default="stream", choices=["stream", "buffered"])
     acp_run_p.add_argument("--new-session", action="store_true")
+    acp_run_p.add_argument("--acp-mode", default="")
+    acp_run_p.add_argument("--thought-level", default="")
+    acp_run_p.add_argument("--speed", default="")
     for ignored in (
         "--user", "--user-id", "--channel", "--complete", "--provider",
-        "--model", "--project", "--persona",
+        "--model", "--project", "--persona", "--turn-mode", "--reasoning",
     ):
         acp_run_p.add_argument(ignored, nargs="?", const="", default="")
     acp_run_p.add_argument("--attach", action="append", default=[])
