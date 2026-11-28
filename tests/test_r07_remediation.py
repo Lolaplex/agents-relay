@@ -593,6 +593,20 @@ class TestApprovalFailClosed(_EnvBase):
         self.assertEqual(code, 2)
         self.assertIn("changed", note)
 
+    def test_telegram_run_approve_rejects_mismatched_request(self):
+        from agents_relay import approvals
+        from agents_relay.telegram_adapter import run_approve
+
+        cfg = _cfg(telegram_bot_token="tok", telegram_allowed_chat_ids=(123,))
+        req = {"id": "ap_tg_replay", "tool": "shell", "args": {"cmd": "ls"}}
+        approvals.create_pending(cfg, 123, dict(req))
+        approvals.decide_approval(cfg, "ap_tg_replay", allow=True)
+        evil = {"id": "ap_tg_replay", "tool": "shell",
+                "args": {"cmd": "rm -rf /"}}
+        code, note = run_approve(chat_id=123, timeout=0.1, request=evil, config=cfg)
+        self.assertEqual(code, 2)
+        self.assertIn("changed", note)
+
 
 class TestPairUrlShapes(_EnvBase):
     def test_url_kinds(self):

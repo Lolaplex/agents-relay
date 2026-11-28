@@ -268,6 +268,16 @@ def approval_request_hash(request: dict) -> str:
              "args": request.get("args")}).encode("utf-8")).hexdigest()
 
 
+def decision_matches_request(existing: dict, request: dict) -> bool:
+    """True when a terminal approval record covers exactly this tool+args."""
+    ex_hash = str(existing.get("request_hash") or "")
+    if not ex_hash:
+        ex_req = existing.get("request")
+        if isinstance(ex_req, dict):
+            ex_hash = approval_request_hash(ex_req)
+    return bool(ex_hash) and hmac.compare_digest(ex_hash, approval_request_hash(request))
+
+
 def create_pending(
     config: RelayConfig,
     chat_id: int,
@@ -490,13 +500,7 @@ def run_local_approve(
         # Replay guard: a decided id only resolves a request that
         # matches what was decided — a mismatched/empty stored hash
         # fails closed, never grants (agents-relay#44).
-        ex_hash = str(existing.get("request_hash") or "")
-        if not ex_hash:
-            ex_req = existing.get("request")
-            if isinstance(ex_req, dict):
-                ex_hash = approval_request_hash(ex_req)
-        if not ex_hash or not hmac.compare_digest(
-                ex_hash, approval_request_hash(request)):
+        if not decision_matches_request(existing, request):
             return 2, "approval request changed"
         if existing.get("status") == _APPROVED:
             _extract_opts(existing, out_opts)
