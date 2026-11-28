@@ -863,7 +863,7 @@ class StateDirTests(unittest.TestCase):
         ), warnings.catch_warnings(record=True) as seen:
             warnings.simplefilter("always")
             out = resolve_state_dir()
-        self.assertTrue(str(out).startswith(str(host)), out)
+        self.assertTrue(os.path.normcase(str(out)).startswith(os.path.normcase(str(host))), out)
         self.assertTrue(out.is_dir())
         self.assertTrue(any("agents-workspace migrate" in str(w.message) for w in seen))
 
@@ -1082,6 +1082,6 @@ class TestTurnWorkspaceWorkdir(unittest.TestCase):
                 host.update_workspace("demo", workdir=str(Path(tmp) / "cfg"))
                 env = workspace_env("demo", str(Path(tmp) / "explicit"))
                 self.assertEqual(
-                    env["AGENTS_WORKDIR"],
-                    str(Path(tmp) / "explicit"),
+                    os.path.normcase(env["AGENTS_WORKDIR"]),
+                    os.path.normcase(str(Path(tmp) / "explicit")),
                 )
