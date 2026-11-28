@@ -22,6 +22,8 @@ SIDEBAND_PREFIX = "__KLANKER_EVT__ "
 STRUCTURED_EVENT_TYPES = frozenset({"thought", "tool_start", "tool_end", "usage", "tier"})
 TURN_MODES = frozenset({"auto", "fast", "agent", "deep"})
 REASONING_LEVELS = frozenset({"auto", "off", "low", "medium", "high"})
+ACP_OPTION_KEYS = ("acp_mode", "thought_level", "speed")
+ACP_OPTION_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _STREAM_READ = 4096
 _BATCH_MAX = 256
 _BATCH_WAIT = 0.03
@@ -72,6 +74,9 @@ class TurnParams:
     workdir: str = ""
     turn_mode: str = ""
     reasoning: str = ""
+    acp_mode: str = ""
+    thought_level: str = ""
+    speed: str = ""
     deliver: str = "buffered"
     attachments: tuple[str, ...] = ()
 
@@ -131,6 +136,13 @@ def turn_directive_error(body: dict[str, Any]) -> str:
         value = str(raw).strip() if isinstance(raw, str) else ""
         if not value or value not in allowed:
             return f"invalid {key}: {raw!r}"
+    for key in ACP_OPTION_KEYS:
+        raw = body.get(key)
+        if raw is None or raw == "":
+            continue
+        value = str(raw).strip() if isinstance(raw, str) else ""
+        if not ACP_OPTION_RE.fullmatch(value):
+            return f"invalid {key}: {raw!r}"
     return ""
 
 
@@ -150,6 +162,9 @@ def turn_params_from_body(body: dict[str, Any]) -> TurnParams:
         workdir=str(body.get("workdir") or "").strip(),
         turn_mode=str(body.get("turn_mode") or "").strip(),
         reasoning=str(body.get("reasoning") or "").strip(),
+        acp_mode=str(body.get("acp_mode") or "").strip(),
+        thought_level=str(body.get("thought_level") or "").strip(),
+        speed=str(body.get("speed") or "").strip(),
     )
 
 
@@ -329,6 +344,12 @@ def build_loop_argv(params: TurnParams, config: RelayConfig) -> list[str]:
         argv.extend(["--turn-mode", params.turn_mode])
     if runner_loop and params.reasoning:
         argv.extend(["--reasoning", params.reasoning])
+    if acp_agent and params.acp_mode:
+        argv.extend(["--acp-mode", params.acp_mode])
+    if acp_agent and params.thought_level:
+        argv.extend(["--thought-level", params.thought_level])
+    if acp_agent and params.speed:
+        argv.extend(["--speed", params.speed])
     if params.session:
         argv.extend(["--session", params.session])
     if params.user_id:
@@ -374,6 +395,12 @@ def prepare_loop(params: TurnParams, config: RelayConfig) -> tuple[TurnParams, l
         extra["HARNESS_TURN_MODE"] = params.turn_mode
     if params.reasoning:
         extra["HARNESS_REASONING"] = params.reasoning
+    if params.acp_mode:
+        extra["AGENTS_ACP_MODE"] = params.acp_mode
+    if params.thought_level:
+        extra["AGENTS_ACP_THOUGHT_LEVEL"] = params.thought_level
+    if params.speed:
+        extra["AGENTS_ACP_SPEED"] = params.speed
     if prepared.allow_root:
         extra["AGENTS_WORKDIR_ALLOW"] = prepared.allow_root
     updated = replace(
@@ -571,6 +598,9 @@ def run_loop_turn(
     workdir: str = "",
     turn_mode: str = "",
     reasoning: str = "",
+    acp_mode: str = "",
+    thought_level: str = "",
+    speed: str = "",
     timeout_sec: int = 600,
     interrupt_file: str = "",
 ) -> LoopTurnResult:
@@ -589,6 +619,9 @@ def run_loop_turn(
         workdir=workdir,
         turn_mode=turn_mode,
         reasoning=reasoning,
+        acp_mode=acp_mode,
+        thought_level=thought_level,
+        speed=speed,
         deliver="buffered",
     )
     cfg = config or RelayConfig.from_env()

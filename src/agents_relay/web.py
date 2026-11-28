@@ -696,6 +696,9 @@ def handle_chat_stream(handler: BaseHTTPRequestHandler, body: dict) -> bool:
         workdir=str(body.get("workdir") or "").strip(),
         turn_mode=str(body.get("turn_mode") or "").strip(),
         reasoning=str(body.get("reasoning") or "").strip(),
+        acp_mode=str(body.get("acp_mode") or "").strip(),
+        thought_level=str(body.get("thought_level") or "").strip(),
+        speed=str(body.get("speed") or "").strip(),
         attachments=attach_paths,
     )
 

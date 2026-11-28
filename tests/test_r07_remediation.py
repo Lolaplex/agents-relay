@@ -477,7 +477,7 @@ class TestConnectHubReuse(_EnvBase):
     def test_reuse_grant_keeps_device_id(self):
         captured = {}
 
-        def fake_redeem(hub_url, cred, *, label="", bearer=""):
+        def fake_redeem(hub_url, cred, *, label="", bearer="", client_host_id=""):
             captured["bearer"] = bearer
             captured["label"] = label
             return {"ok": True, "mode": "remote", "host_id": "h1",

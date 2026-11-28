@@ -90,14 +90,30 @@ def _store_hubs(rows: dict) -> None:
     write_json_atomic(_hubs_path(), {"hubs": rows})
 
 
+def _local_host_identity() -> tuple[str, str]:
+    """Local ``(host_id, host_label)``; empty pair when the host is unavailable."""
+    try:
+        from agents_workspace import Host
+
+        host = Host.from_env()
+        host_id = str(host.host_id() or "").strip()
+        label_fn = getattr(host, "host_label", None)
+        host_label = str(label_fn() or "").strip() if callable(label_fn) else ""
+        return host_id, host_label
+    except Exception:  # noqa: BLE001 - pairing must not die on host metadata
+        return "", ""
+
+
 def redeem_device(hub_url: str, credential: str, *, label: str = "",
-                  bearer: str = "") -> dict:
+                  bearer: str = "", client_host_id: str = "") -> dict:
     """POST /v1/pair/redeem on the hub -> device credentials (agents-relay#40).
 
     ``bearer`` re-auths an already-paired device (grant reuse); ``label``
-    is forwarded so the minted device row is not anonymous
-    (agents-relay#44). A reuse response carries ``token == ""`` — the
-    existing vault entry stays authoritative (`reused: True`)."""
+    defaults to this host's label and is forwarded so the minted device row
+    is not anonymous (agents-relay#44). ``client_host_id`` defaults to this
+    host's canonical id so the hub does not mistake its own id for the
+    spoke's. A reuse response carries ``token == ""`` — the existing vault
+    entry stays authoritative (`reused: True`)."""
     base = hub_url.strip().rstrip("/")
     if not base.startswith(("http://", "https://")):
         raise ValueError("hub_url must be an http(s) origin")
@@ -105,11 +121,15 @@ def redeem_device(hub_url: str, credential: str, *, label: str = "",
                "User-Agent": "agents-relay/device"}
     if bearer.strip():
         headers["Authorization"] = f"Bearer {bearer.strip()}"
+    local_host_id, local_label = _local_host_identity()
+    eff_label = label.strip() or local_label
+    eff_host_id = client_host_id.strip() or local_host_id
     req = urllib.request.Request(
         f"{base}/v1/pair/redeem",
         data=json.dumps({"token": credential.strip(),
                          "code": credential.strip(),
-                         "label": label}).encode(),
+                         "label": eff_label,
+                         "client_host_id": eff_host_id}).encode(),
         headers=headers,
         method="POST",
     )
@@ -134,7 +154,8 @@ def redeem_device(hub_url: str, credential: str, *, label: str = "",
     return body
 
 
-def connect_hub(hub_url: str, credential: str, *, label: str = "") -> dict:
+def connect_hub(hub_url: str, credential: str, *, label: str = "",
+                hub_label: str = "") -> dict:
     """Redeem + persist the hub record; returns the stored row.
 
     Reconnecting a hub already linked in ``hubs.json`` re-sends the
@@ -150,19 +171,32 @@ def connect_hub(hub_url: str, credential: str, *, label: str = "") -> dict:
         if _normalize_hub_url(str(row.get("hub_url") or "")) == base:
             prev_id, prev_row = hid, row
             break
-    res = redeem_device(base, credential, label=label,
-                        bearer=hub_token(prev_id) if prev_id else "")
+    local_host_id, local_label = _local_host_identity()
+    spoke_label = label.strip() or local_label
+    res = redeem_device(
+        base,
+        credential,
+        label=spoke_label,
+        bearer=hub_token(prev_id) if prev_id else "",
+        client_host_id=local_host_id,
+    )
     hub_id = str(res.get("host_id") or "").strip() or urllib.parse.urlparse(
         base).hostname or "hub"
     if prev_id and prev_id != hub_id:
         rows.pop(prev_id, None)  # migrate the stored link under the new id
     device_id = str(res.get("device_id") or "") or str(
         prev_row.get("device_id") or "")
+    resolved_hub_label = (
+        (hub_label or "").strip()
+        or str(res.get("host_label") or "").strip()
+        or str(prev_row.get("label") or "").strip()
+        or urllib.parse.urlparse(base).hostname
+        or hub_id
+    )
     rows[hub_id] = {
         "hub_url": base,
         "device_id": device_id,
-        "label": label or str(prev_row.get("label") or "")
-                 or res.get("host_id") or hub_id,
+        "label": resolved_hub_label,
         "last_seq": int(prev_row.get("last_seq") or 0),
         "connected_at": int(time.time()),
     }
@@ -171,6 +205,7 @@ def connect_hub(hub_url: str, credential: str, *, label: str = "") -> dict:
     if token:
         write_secret(_secret_key(hub_id), token, scope="host")
     return {"hub_id": hub_id, "ws": res.get("ws") or "",
+            "hub_label": resolved_hub_label,
             "reused": not token, **rows[hub_id]}
 
 

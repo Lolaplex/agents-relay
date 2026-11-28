@@ -81,6 +81,9 @@ def run_loop_turn(
     workdir: str = "",
     turn_mode: str = "",
     reasoning: str = "",
+    acp_mode: str = "",
+    thought_level: str = "",
+    speed: str = "",
     interrupt_file: str = "",
     extra_env: dict[str, str] | None = None,
 ) -> LoopTurnResult:
@@ -100,6 +103,9 @@ def run_loop_turn(
         workdir=workdir,
         turn_mode=turn_mode,
         reasoning=reasoning,
+        acp_mode=acp_mode,
+        thought_level=thought_level,
+        speed=speed,
         deliver="buffered",
         attachments=tuple(attachments or ()),
     )
